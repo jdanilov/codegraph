@@ -6,7 +6,7 @@
  * file saved in the editor bumps `dataVersion` and the canvas reconciles. The
  * hook deliberately reports a *new model object* rather than mutating in place
  * — the canvas controller diffs it against what is mounted and keeps the user's
- * expansion, pins and camera (`setModel(model, sameProject)`).
+ * current root, selection and zoom (`setModel(model, sameProject)`).
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 

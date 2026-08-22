@@ -3,7 +3,7 @@
  *
  * Three kinds of entry live in one list, in a deliberate order:
  *
- *  1. **Project** — the default expansion, always first;
+ *  1. **Project** — the whole graph from its root, always first;
  *  2. **Changes** — everything uncommitted, plus what it impacts;
  *  3. saved **question cards**, newest first.
  *

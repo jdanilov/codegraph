@@ -1,7 +1,7 @@
 /**
  * Minimal selection readout.
  *
- * Phase B left this as a stub (name / kind / file); phase C fills the body with
+ * Phase B left this as a stub (name / kind / file); phase C filled the body with
  * the real info panel (`GET /api/node/:id`: contained nodes, in/out edges,
  * source, editor jump) through `renderDetail` on `<GraphCanvas>`. The selection
  * lifecycle, positioning and dismissal are unchanged — only the frame grew: a
@@ -72,7 +72,8 @@ export function SelectionCard({ node, onClose, children }: SelectionCardProps) {
       )}
 
       <p className="mt-3 shrink-0 text-[10px] leading-relaxed text-muted">
-        Shift+click a node to expand or collapse it. Drag to pin, wobble to release.
+        Click a directory arc to open it, double-click a file to see its symbols, and use the centre
+        circle or the breadcrumb to come back up.
       </p>
     </Card>
   );

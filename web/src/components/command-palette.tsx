@@ -1,10 +1,10 @@
 /**
  * Cmd/Ctrl+P — fuzzy jump to any node in the graph.
  *
- * The canvas only mounts the slice the user has expanded, so search is the ONLY
+ * The disk only draws the rings below the current root, so search is the ONLY
  * way to reach a symbol buried twelve directories deep. Picking a result
- * therefore doesn't just select: it expands the node's ancestors, moves the
- * camera onto it and opens its info panel (`CanvasController.reveal`).
+ * therefore doesn't just select: it re-roots the disk so the node's arc is on
+ * screen and opens its info panel (`CanvasController.reveal`).
  *
  * Queries go to `GET /api/search` (FTS + a camel-infix sweep server-side), one
  * in flight at a time, with the previous request aborted — a fast typist would

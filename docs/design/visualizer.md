@@ -18,7 +18,7 @@ item without updating this file in the same commit.
 | DB access | Server owns one `CodeGraph` instance (writer); auto-starts `watch()` so the graph stays live; frontend **polls** `/api/status` and refetches on version change |
 | Indexing | The UI MAY trigger `codegraph index` (`POST /api/index`, spawned as a subprocess); un-indexed root shows an "index now" screen |
 | Frontend | Vite + React + TypeScript + Tailwind + shadcn/ui, `web/` directory, single root `package.json` (frontend deps in devDependencies, **no npm workspaces**) |
-| Graph rendering | **sigma.js (WebGL)**; budget ≤2k simultaneously visible nodes |
+| Graph rendering | **canvas 2D**, hand-rolled (no rendering dependency); budget ≤2k simultaneously drawn arcs. *(Phase E: was sigma.js/WebGL — the force layout it drove was rejected, see "Visual language" below.)* |
 | Build | `npm run build` also builds `web/` → `dist/ui-web/`, served statically; git-URL installs build it via the existing `prepare` hook |
 | Question box | Floor: raw text → explore (deterministic, always works). Optional: LLM refine (Anthropic API, key entered in UI settings) |
 | Persistence | Cards + UI state: `.codegraph/ui/` in the project (gitignored). User prefs (editor command, API key): `~/.codegraph/ui.json` |
@@ -28,27 +28,51 @@ item without updating this file in the same commit.
 
 ## Visual language (locked)
 
-- **Backbone = `contains`, drawn as structure, never as an edge list.** Each
-  directory/file/symbol is a circle. A collapsed parent shows its children as
-  small satellites hugging it (atom/nucleus). Shift+click expands: the child
-  moves away along a **straight** line; shift+click again collapses.
-- **Non-contains edges are slightly curved lines**; backbone lines are straight.
+*Rewritten in phase E. The original force-directed backbone (circles,
+satellites, shift+click expansion, a 120° wedge, pin/wobble) was built in phase
+B, reviewed on a real 13.8k-node project, and rejected: wobbly, spatially
+chaotic, visually overwhelming. It is gone — there is no second canvas mode.*
+
+- **The disk IS the structure.** The whole `contains` backbone is drawn as a
+  radial **sunburst**: the *current root* fills the centre circle, and every
+  ring outward is one level below it. There is no expand/collapse; there is
+  navigation.
+- **Angle ∝ size.** A directory/file/symbol's angular extent is its share of the
+  **LoC** among its siblings, and siblings are ordered **largest first**. A
+  directory weighs the sum of its children; a file weighs its line count; a
+  symbol weighs its span (a symbol never inflates its file).
+- **Minimum sliver + tail aggregation.** No arc is ever thinner than the
+  clickable floor. A parent that cannot hold all its children at that floor
+  draws the largest ones and folds the rest into a single `+N smaller` arc.
+- **Bounded depth.** Rings are capped from the current root; deeper levels are
+  reached by re-rooting, not by growing the disk.
+- **Deterministic.** The layout is a pure function of (graph, current root). No
+  simulation, no pinning, no relaxation — **nothing moves unless the user
+  navigates**.
+- **Navigation**: click a directory arc to re-root into it; click a file or
+  symbol arc to select it (opens the info panel); double-click anything with
+  children to drill into it; the centre circle and the breadcrumb go back up.
+- **Edges are hidden at rest** and drawn as **hierarchically bundled curves**
+  (Holten: routed along the hierarchy through the deepest shared ancestor,
+  straightened by β). They appear for the hovered arc's subtree, the current
+  selection, or the active card's `edgeRefs`. An endpoint that is not rendered
+  attaches to its deepest visible ancestor arc — the centre when it is outside
+  the current root's subtree entirely.
 - **Provenance renders**: parsed edges solid, `provenance:'heuristic'` edges
   **dashed**, tooltip shows `metadata.synthesizedBy` + the wiring site.
 - **Edge-kind toggles**: calls / imports / references / extends / instantiates
-  (contains is never toggleable — it IS the backbone).
-- **Node encoding**: color = switchable mode (① node kind ② layer — derived
+  (contains is never toggleable — it IS the disk).
+- **Arc encoding**: fill colour = switchable mode (① node kind ② layer — derived
   from filename layer suffixes, read from the project's `plugins.layer-chain`
-  config when present, else hidden); size = LoC for files/dirs (aggregate),
-  span length for symbols; border style reserved.
-- **Layout**: radial from the project root, growing **left-to-right in a ~120°
-  wedge**. Expanded children are force-laid on the RIGHT of the parent, never
-  the left, pre-ordered vertically by name (A top → Z bottom). Dragging pins a
-  node; a quick wobble drag unpins it.
-- **Hover** shows a node's edges; **click** opens the info panel.
-- **Auto-expansion for a card/view**: expand every ancestor of the result
-  nodes; leave siblings collapsed.
-- **URL = state**: expanded set + active card encoded in the URL.
+  config when present, else hidden). Size is the angle, so it is no longer a
+  colour concern. Labels are drawn along the arc, and only on arcs wide enough
+  to read.
+- **Hover** shows an arc's tooltip and bundles its subtree's edges; **click**
+  opens the info panel.
+- **Card / view activation**: re-root to the deepest node containing every
+  result node, glow the results and dim the rest, bundle the result edges.
+  Changes view: hot rim on changed arcs, warm rim on impacted ones.
+- **URL = state**: current root + active card encoded in the URL.
 
 ## HTTP API (contract)
 
@@ -99,33 +123,34 @@ open. Later phases and the client can rely on them:
 The canvas implemented in phase B pins down details the visual language left
 open. Phase C/D can rely on them:
 
-- **Sigma's y axis points UP on screen.** The layout therefore gives the FIRST
-  child (A) the most POSITIVE angle so it lands at the top. Anything that
-  computes positions must use the same convention or the graph renders Z→A.
-- **Initial view** is the root EXPANDED with every top-level directory
-  collapsed, so the first paint is already a wedge of atoms rather than a
-  single blob.
-- **Mount budget split.** Of the ≤2k budget, at most 1,200 are force-laid
-  "primaries"; the rest are satellites, allocated fair-share across collapsed
-  parents with a per-parent cap. A parent whose children were elided shows
-  `+N` in its label, and the toolbar reports `capped`.
-- **Shift+click on a satellite** expands it *and* every ancestor, so a drill-in
-  from a collapsed atom is one click. Collapsing removes the whole subtree from
-  the expansion set.
-- **The hover rule** for edges: a relation whose far endpoint is inside a
-  collapsed subtree is drawn, only while hovering, against the nearest MOUNTED
-  ancestor of that endpoint. Without it a collapsed directory reads as
-  unconnected. These lifted edges never persist past the hover.
+- ~~**Sigma's y axis points UP on screen.** The layout therefore gives the FIRST
+  child (A) the most POSITIVE angle so it lands at the top.~~ **SUPERSEDED by
+  phase E** — canvas 2D's y axis points DOWN, and the sunburst starts at 12
+  o'clock (`-π/2`) growing clockwise.
+- ~~**Initial view** is the root EXPANDED with every top-level directory
+  collapsed.~~ **SUPERSEDED by phase E** — the initial view is the project root
+  at the centre of the disk; there is no expansion set.
+- ~~**Mount budget split** (1,200 force-laid primaries + satellites,
+  fair-shared per collapsed parent).~~ **SUPERSEDED by phase E** — the ≤2k
+  budget is arcs, bounded per ring by the minimum sliver and per parent by the
+  slot cap.
+- ~~**Shift+click on a satellite** expands it *and* every ancestor.~~
+  **SUPERSEDED by phase E** — there is no expansion; a click re-roots.
+- **The hover rule** for edges survives phase E in spirit: a relation whose far
+  endpoint is not rendered is drawn against the deepest VISIBLE ancestor of that
+  endpoint, so a folded subtree never reads as unconnected. Edges are still only
+  drawn on demand (hover / selection / card).
 - **Edge-kind chips** are the contract's five in the contract's order, followed
   by any other non-`contains` kind actually present in the payload (e.g.
   `implements`, `overrides`) — an edge that is drawn is always toggleable.
-- **Camera framing.** A custom bounding box is pinned at the first fit so
-  sigma never re-normalizes the coordinate frame when the graph grows; without
-  it every expansion yanks the viewport. After an expansion the camera zooms
-  OUT only, and only when the new family doesn't fit.
+- ~~**Camera framing.** A custom bounding box is pinned at the first fit so
+  sigma never re-normalizes the coordinate frame.~~ **SUPERSEDED by phase E** —
+  the disk is always fitted to the free viewport space; zoom and pan are user
+  gestures and `fit` resets them.
 - **Phase C mount point**: `<GraphCanvas renderDetail={…} onSelect={…} />`.
   `renderDetail(node)` replaces the stub body of the floating selection card;
-  `onSelect` publishes the canvas selection to the shell.
+  `onSelect` publishes the canvas selection to the shell. **Unchanged in phase
+  E**, along with `onController` and `onViewChange`.
 
 ### Phase C clarifications (additive — no contract item changed)
 
@@ -244,6 +269,60 @@ The questions/changes layer fixes the shapes the table left open:
   highlights the result, and frames it; **Project** restores the default
   expansion. A node opened while Changes is active shows its **diff** first.
 
+### Phase E clarifications (the sunburst — replaces phase B's representation)
+
+Phase E swapped the representation and rewrote "Visual language" above. The
+numbers and shapes it pins down:
+
+- **Geometry.** Start angle `-π/2` (12 o'clock), clockwise, canvas y down.
+  Centre disk radius 62; ring *n* thickness `max(30, 56 - 4(n-1))` with a 2-unit
+  gap; at most **6 rings** from the current root, so the outer radius is 348
+  layout units. The disk is scaled to fit the viewport minus a 372px left
+  gutter (the floating card column) and always centred in what is left.
+- **Thresholds.** Minimum arc **1.1°** (the clickable floor — it also bounds a
+  full circle at ~327 arcs). A parent renders at most **96** children
+  individually before folding (a full circle of 327 slivers reads as a comb).
+  A file or symbol only grows a ring of its own children when its wedge is
+  **≥ 6°**; a re-rooted file owns the full circle, so its symbols always show.
+  Any arc needs **≥ 3×** the minimum (or a single child) before it drills at
+  all. Labels need **38px of arc length**, an **11px ring thickness**, and at
+  least 5 legible characters after truncation — otherwise the arc stays bare and
+  the hover tooltip carries the name. On this repository (12.9k nodes) the
+  project root draws 278 arcs across 5 rings in ~18ms, ~10 of them labelled.
+- **Aggregation is by FIT, not by share.** A child is folded into the parent's
+  `+N smaller` arc only when it does not fit at the minimum sliver. A share
+  threshold was tried and is wrong: 40 equally-sized files in a 6° wedge are all
+  below any fixed share, so the entire directory folded into one arc even though
+  four of them fit. Folded children are still reachable — ⌘P re-roots onto the
+  node itself, and clicking a `+N` arc re-roots onto its parent.
+- **Reveal (`⌘P`) semantics.** Re-root to the node's **parent** and select it;
+  if the node still has no arc (it was folded), re-root onto the **node itself**
+  — the centre disk always renders the root, so ⌘P can reach anything.
+- **Edge bundling.** Control points are the arc centroids along
+  `source → … → deepest shared ancestor → … → target`, straightened by
+  **β = 0.85**, drawn as a uniform cubic B-spline with tripled endpoints
+  (hand-rolled: the sampled points are also the tooltip's hit test). Budget: 500
+  edges per hover/selection/card, 4,000 nodes scanned per subtree.
+- **Hover has two independent channels.** The arc hover (tooltip + bundling) is
+  never stolen by the edge hover; otherwise hovering an arc reveals an edge
+  under the cursor, which drops the arc hover, which hides the edge, forever.
+- **URL state** is now `{ r: rootId, c: cardId, m: colorMode, k: edgeKinds }` in
+  the same `#<version><base64url>` envelope. A phase D hash (`e: expandedIds`,
+  no `r`) still opens: the shell re-roots to the deepest node those ids have in
+  common. `e` is never written any more.
+- **`CanvasController` surface.** `setRoot(id, animate?)` / `getRoot()` /
+  `rootUp()` / `focusNodes(ids)` are the navigation API; `reveal`,
+  `setHighlight`, `setSelected`, `setColorMode`, `setEdgeKinds`,
+  `enabledEdgeKinds`, `fitView`, `destroy` keep their phase C/D meaning.
+  `getExpanded()`/`setExpanded()` remain as compatibility shims — the former
+  returns `{root}`, the latter re-roots to the deepest common ancestor of the
+  ids it is handed. `frameNodes` is gone; `focusNodes` replaces it.
+- **Removed dependencies**: `sigma`, `@sigma/edge-curve`, `graphology`,
+  `graphology-types`. Nothing was added — the arcs, the curved labels and the
+  β-spline are ~40 lines of canvas 2D each, which is the house preference (cf.
+  the hand-rolled TOML writer) and keeps the frontend dependency-free beyond
+  React/Tailwind.
+
 Standing views (always-present cards, client-side): **Project** (whole graph)
 and **Changes** (`/api/changes`, refreshed on `dataVersion` change).
 
@@ -258,12 +337,16 @@ paths, line spans, user note) to paste into an agent prompt. Client-side only.
    from `/api/graph`), full build wiring.
 2. **B — canvas**: sigma.js backbone, atom/expand/collapse, wedge force
    layout, pin/unpin, hover edges, curved-vs-straight + solid-vs-dashed,
-   color modes, edge-kind toggles.
+   color modes, edge-kind toggles. *(Representation replaced in phase E; the
+   colour modes, edge chips and provenance rendering survived.)*
 3. **C — panels**: node info panel, source full/diff, editor jump, Cmd+P
    fuzzy search, settings UI.
 4. **D — questions + changes**: cards, explore/ask endpoints (structured
    explore refactor), Changes view with badges + impact radius,
    auto-expansion, feedback export, URL state.
+5. **E — sunburst**: replace the force canvas with the radial disk +
+   hierarchical edge bundling (canvas 2D, no rendering dependency); re-root
+   navigation, breadcrumb, arc labels, rims/glow, root-based URL state.
 
 ## House rules for every phase
 

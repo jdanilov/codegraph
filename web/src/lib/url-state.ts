@@ -1,10 +1,8 @@
 /**
  * URL = state.
  *
- * The contract asks for the expanded set + the active card to live in the URL,
- * so a view can be copied into a message and reopened exactly as it was. The
- * expansion set is the awkward part: it is a list of node ids (long, repetitive
- * strings) and can run to hundreds of entries.
+ * The contract asks for the view + the active card to live in the URL, so a
+ * view can be copied into a message and reopened exactly as it was.
  *
  * **Format** — `#<version><payload>`:
  *
@@ -12,16 +10,18 @@
  *   - `#0<base64url>` — the same JSON, uncompressed, for a browser without
  *     `CompressionStream` (or when compression somehow grew the payload).
  *
- * The JSON is `{ e: string[], c: string|null, m: 'kind'|'layer', k: string[] }`
- * — expanded ids, active card id, colour mode, enabled edge kinds. Keys are
- * one letter because they are repeated in every URL and the payload is what we
- * are trying to keep small.
+ * The JSON is `{ r: string|null, c: string|null, m: 'kind'|'layer', k: string[] }`
+ * — the sunburst's **root** node id, the active card id, the colour mode and
+ * the enabled edge kinds. Keys are one letter because they are repeated in
+ * every URL.
  *
- * **Degradation** — a URL is capped at {@link MAX_HASH_CHARS}. Over the cap,
- * the expansion set is dropped (it is the only unbounded field) and the rest —
- * the active card, colour mode, edge toggles — still travels; the card then
- * re-derives its own expansion when it is applied, which is the same result for
- * every card-driven view. Nothing ever silently produces a broken URL.
+ * **Backward tolerance (phase E).** Before the sunburst the view was an
+ * *expansion set* stored under `e`, which could run to hundreds of ids. An old
+ * link must never break, so `e` is still read: the shell re-roots to the
+ * deepest node those ids have in common, which is the closest honest
+ * translation of "this is what I had open". `e` is never written any more, and
+ * the payload is now small enough that {@link MAX_HASH_CHARS} is academic — the
+ * cap stays as a guard rather than a degradation path.
  */
 import type { ColorMode } from '@/graph/palette';
 
@@ -29,13 +29,17 @@ import type { ColorMode } from '@/graph/palette';
 export const MAX_HASH_CHARS = 6000;
 
 export interface UrlState {
-  expanded: string[];
+  /** Sunburst root; `null` when the URL predates phase E. */
+  root: string | null;
+  /** Phase D's expansion set, read-only — a legacy link's best-effort root. */
+  legacyExpanded: string[];
   cardId: string | null;
   colorMode: ColorMode;
   edgeKinds: string[] | null;
 }
 
 interface Encoded {
+  r?: string | null;
   e?: string[];
   c?: string | null;
   m?: string;
@@ -43,17 +47,17 @@ interface Encoded {
 }
 
 /** Encode state into a hash string (including the leading `#`). */
-export async function encodeUrlState(state: UrlState): Promise<string> {
+export async function encodeUrlState(state: Omit<UrlState, 'legacyExpanded'>): Promise<string> {
   const full: Encoded = {
-    e: state.expanded,
+    r: state.root,
     c: state.cardId,
     m: state.colorMode,
     ...(state.edgeKinds ? { k: state.edgeKinds } : {}),
   };
   const hash = await pack(full);
   if (hash.length <= MAX_HASH_CHARS) return hash;
-  // Too long: drop the expansion set, keep everything else meaningful.
-  return pack({ ...full, e: [] });
+  // Nothing here is unbounded any more; the edge-kind list is the only list.
+  return pack({ ...full, k: undefined });
 }
 
 /** Decode a hash string; anything unreadable is treated as "no state". */
@@ -70,7 +74,10 @@ export async function decodeUrlState(hash: string): Promise<UrlState | null> {
         : new TextDecoder().decode(bytes);
     const parsed = JSON.parse(json) as Encoded;
     return {
-      expanded: Array.isArray(parsed.e) ? parsed.e.filter((id) => typeof id === 'string') : [],
+      root: typeof parsed.r === 'string' ? parsed.r : null,
+      legacyExpanded: Array.isArray(parsed.e)
+        ? parsed.e.filter((id) => typeof id === 'string')
+        : [],
       cardId: typeof parsed.c === 'string' ? parsed.c : null,
       colorMode: parsed.m === 'layer' ? 'layer' : 'kind',
       edgeKinds: Array.isArray(parsed.k) ? parsed.k.filter((k) => typeof k === 'string') : null,

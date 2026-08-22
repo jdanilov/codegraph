@@ -5,19 +5,23 @@
  * every other surface floats on top of it (contract: "minimal + light
  * futuristic; graph is the background; code panels / views float on top").
  *
- * Phase D adds the question layer and makes the view addressable:
+ * Phase D added the question layer and made the view addressable; phase E
+ * swapped the representation underneath it for a sunburst, which changes what
+ * "apply a card to the canvas" means:
  *
  *  - **Cards.** Two standing views (Project, Changes) plus saved question
- *    cards. Activating one is a single gesture on the canvas: expand exactly
- *    the ancestors of its result nodes (collapsing everything else), select
- *    nothing, halo the result, and frame it.
+ *    cards. Activating one re-roots the disk onto the deepest node containing
+ *    every result, selects nothing, glows the result (dimming the rest) and
+ *    bundles the result's edges.
  *  - **Changes.** `GET /api/changes` refreshed whenever `dataVersion` moves
- *    while the view is active — changed nodes wear a hot halo, impacted ones a
+ *    while the view is active — changed arcs wear a hot rim, impacted ones a
  *    warm one, and a node opened from here shows its diff first.
  *  - **Feedback export.** The active view plus the current selection, rendered
  *    as markdown to paste into an agent prompt.
- *  - **URL = state.** Expanded set, active card, colour mode and edge toggles
- *    live in the hash (see `lib/url-state.ts`), restored on load.
+ *  - **URL = state.** Current root, active card, colour mode and edge toggles
+ *    live in the hash (see `lib/url-state.ts`), restored on load. A phase D
+ *    link carrying an expansion set still opens — it re-roots to what those
+ *    ids have in common.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Search, Settings as SettingsIcon } from 'lucide-react';
@@ -34,10 +38,9 @@ import { GraphCanvas } from '@/components/graph/graph-canvas';
 import { NodePanel } from '@/components/graph/node-panel';
 import { StatusPanel } from '@/components/graph/status-panel';
 import type { CanvasController } from '@/graph/canvas-controller';
-import type { GraphModel, ModelNode } from '@/graph/model';
+import { ROOT_ID, type GraphModel, type ModelNode } from '@/graph/model';
 import type { ColorMode } from '@/graph/palette';
 import { useGraphData } from '@/graph/use-graph-data';
-import { initialExpansion } from '@/graph/view';
 import {
   askQuestion,
   exploreQuery,
@@ -130,28 +133,22 @@ export default function App() {
     });
   }, []);
 
-  /** Expand exactly the ancestors of `ids`, collapsing everything else. */
-  const expandTo = useCallback((controller: CanvasController, graph: GraphModel, ids: string[]) => {
-    const ancestors = new Set<string>();
-    for (const id of ids) {
-      if (!graph.nodes.has(id)) continue;
-      for (const ancestor of graph.ancestors(id)) ancestors.add(ancestor);
-    }
-    controller.setExpanded(ancestors);
-  }, []);
-
+  /**
+   * Put a card's answer on the disk: glow the results, bundle their edges, and
+   * re-root onto the deepest node that contains them all (the controller works
+   * that out — a spread-out answer stays at the project root).
+   */
   const applyResult = useCallback(
     (result: ExploreResult | undefined) => {
       const controller = controllerRef.current;
       if (!controller || !model) return;
       const ids = result?.nodeIds ?? [];
-      expandTo(controller, model, ids);
       controller.setHighlight({ nodes: ids, edges: result?.edgeRefs ?? [] });
       controller.setSelected(null);
       setSelectedNode(null);
-      controller.frameNodes(ids);
+      controller.focusNodes(ids);
     },
-    [model, expandTo]
+    [model]
   );
 
   const applyChanges = useCallback(
@@ -159,13 +156,12 @@ export default function App() {
       const controller = controllerRef.current;
       if (!controller || !model) return;
       const changed = payload.changedNodes.map((node) => node.id);
-      expandTo(controller, model, changed);
       controller.setHighlight({ changed, impacted: payload.impactedNodeIds });
       controller.setSelected(null);
       setSelectedNode(null);
-      controller.frameNodes(changed);
+      controller.focusNodes(changed);
     },
-    [model, expandTo]
+    [model]
   );
 
   const activate = useCallback(
@@ -175,7 +171,7 @@ export default function App() {
       if (!controller || !model) return;
 
       if (id === PROJECT_VIEW_ID) {
-        controller.setExpanded(initialExpansion(model));
+        controller.setRoot(ROOT_ID);
         controller.setHighlight(null);
         controller.setSelected(null);
         setSelectedNode(null);
@@ -268,9 +264,9 @@ export default function App() {
 
       const cardId = state.cardId ?? PROJECT_VIEW_ID;
       setActiveId(cardId);
-      // The card's highlight is restored, but NOT its expansion: the URL's own
-      // expanded set is what the user actually had open, which may be wider or
-      // narrower than the card's ancestors.
+      // The card's highlight is restored, but NOT its root: the URL's own root
+      // is where the user actually was, which may be deeper or shallower than
+      // where the card would land.
       if (cardId === CHANGES_VIEW_ID) {
         void loadChanges().then((payload) => {
           if (payload) {
@@ -285,12 +281,14 @@ export default function App() {
         if (result) controller.setHighlight({ nodes: result.nodeIds, edges: result.edgeRefs });
       }
 
-      if (state.expanded.length > 0) controller.setExpanded(state.expanded);
-      else if (cardId === PROJECT_VIEW_ID) controller.setExpanded(initialExpansion(model));
+      // A phase E link names its root outright; a phase D one carries the old
+      // expansion set, which `setExpanded` translates into the closest root.
+      if (state.root) controller.setRoot(state.root, false);
+      else if (state.legacyExpanded.length > 0) controller.setExpanded(state.legacyExpanded);
     });
   }, [model, loadChanges]);
 
-  /** Debounced hash write; the canvas fires a view change on every expansion. */
+  /** Debounced hash write; the canvas fires a view change on every re-root. */
   const scheduleUrlUpdate = useCallback(() => {
     if (!restoredRef.current) return;
     if (urlTimer.current !== null) window.clearTimeout(urlTimer.current);
@@ -299,7 +297,7 @@ export default function App() {
       const controller = controllerRef.current;
       if (!controller) return;
       void encodeUrlState({
-        expanded: [...controller.getExpanded()],
+        root: controller.getRoot(),
         cardId: activeRef.current,
         colorMode,
         edgeKinds: controller.enabledEdgeKinds(),
@@ -323,7 +321,7 @@ export default function App() {
   // ------------------------------------------------------------ commands ---
 
   // Cmd/Ctrl+P opens the palette. Captured on the window because the canvas is
-  // a WebGL surface with no focusable children to hang a handler on.
+  // a bitmap surface with no focusable children to hang a handler on.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 'p') {

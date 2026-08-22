@@ -1,56 +1,69 @@
 /**
- * The sigma.js canvas: everything imperative about the graph view.
+ * The sunburst canvas: everything imperative about the graph view.
  *
- * React owns the floating panels; this class owns the WebGL surface. Keeping
- * them apart matters — the layout writes 1,200 node positions per animation
- * frame, and routing that through React state would cost more than the render.
- * The controller pushes a small summary back up (`onViewChange`) and React
- * pushes user intent down (`setColorMode`, `setEdgeKinds`, `setSelected`).
+ * React owns the floating panels; this class owns one `<canvas>` and draws the
+ * whole disk into it with the 2D context. There is **no simulation** — the
+ * layout is a pure function of (model, current root), so a redraw is a redraw
+ * and nothing on screen ever drifts. That is the point: the force layout this
+ * replaced was spatially unstable, which made a 13k-node project unreadable.
  *
  * What lives here:
  *
- *  - the graphology instance holding ONLY the mounted slice (`view.ts`);
- *  - the animation loop that runs `WedgeLayout` until it settles;
- *  - hover / drag / wobble-unpin / shift+click-expand interaction;
- *  - the reducers that dim everything but the hovered node's neighbourhood.
+ *  - the current **root** (the centre of the disk) and the layout computed from
+ *    it (`sunburst.ts`);
+ *  - painting: arcs, rims, curved labels, the centre disk, bundled edges;
+ *  - hit testing (ring-indexed for arcs, polyline distance for edges);
+ *  - navigation: click a directory to re-root, click the centre to go up,
+ *    double-click anything to drill into it, `reveal(id)` for ⌘P;
+ *  - the persistent highlight a card / the Changes view drives.
+ *
+ * Edges are **hidden at rest**. They appear for the hovered arc's subtree, the
+ * current selection, or the active card's `edgeRefs` — bundled along the
+ * hierarchy so a hundred relations read as one rope (`bundling.ts`).
  */
-import { MultiGraph } from 'graphology';
-import Sigma from 'sigma';
-import type { EdgeDisplayData, NodeDisplayData } from 'sigma/types';
+import {
+  bundleControlPoints,
+  bundleCurve,
+  distanceToPolyline,
+} from './bundling';
+import { DIRECTORY_KIND, ROOT_ID, type GraphModel, type ModelEdge, type ModelNode } from './model';
+import { colorForEdgeKind, colorForNode, type ColorMode } from './palette';
+import {
+  AGGREGATE_KIND,
+  MAX_ARCS,
+  MAX_RADIUS,
+  arcAt,
+  computeSunburst,
+  deepestCommonAncestor,
+  initialRoot,
+  type Point,
+  type SunburstArc,
+  type SunburstLayout,
+} from './sunburst';
 
-import {
-  CURVATURE_ATTRIBUTE,
-  CURVED_EDGE_TYPE,
-  DASHED_EDGE_TYPE,
-  createCurvedEdgeProgram,
-  createDashedEdgeProgram,
-} from './dashed-edge-program';
-import { drawNodeHover } from './hover-renderer';
-import { WedgeLayout } from './layout';
-import { ROOT_ID, type GraphModel, type ModelEdge, type ModelNode } from './model';
-import {
-  BACKBONE_COLOR,
-  BACKBONE_SATELLITE_COLOR,
-  colorForEdgeKind,
-  colorForNode,
-  type ColorMode,
-} from './palette';
-import { computeMountedView, initialExpansion, toggleExpansion, type MountedView } from './view';
+export interface BreadcrumbEntry {
+  id: string;
+  name: string;
+}
 
 export interface ViewSummary {
-  mounted: number;
-  primaries: number;
-  satellites: number;
+  /** Arcs currently rendered. */
+  arcs: number;
+  /** Rings rendered outward from the current root. */
+  rings: number;
+  /** True when depth, budget or the sliver floor folded something away. */
+  truncated: boolean;
+  /** Bundled relations currently drawn (0 at rest — edges are on demand). */
   visibleEdges: number;
-  hiddenByBudget: boolean;
-  /** Kinds (or layers) present in the mounted slice — drives the legend. */
+  /** Kinds (or layers) present in the disk — drives the legend. */
   presentColorKeys: string[];
-  expandedCount: number;
-  pinnedCount: number;
-  /** Every non-contains kind in the graph, contract kinds first. */
+  /** Every non-`contains` kind in the graph, contract kinds first. */
   edgeKinds: string[];
-  /** The subset currently drawn — the controller owns this, not React. */
+  /** The subset currently drawable — the controller owns this, not React. */
   enabledKinds: string[];
+  /** Project root → … → current root. */
+  breadcrumb: BreadcrumbEntry[];
+  zoom: number;
 }
 
 export interface EdgeTooltip {
@@ -65,6 +78,20 @@ export interface EdgeTooltip {
   line?: number;
 }
 
+/** Hover readout for an arc: what it is, how big, and what it hides. */
+export interface ArcTooltip {
+  x: number;
+  y: number;
+  name: string;
+  path: string;
+  kind: string;
+  layer?: string;
+  /** LoC for directories and files, span length for symbols. */
+  loc: number;
+  aggregate: boolean;
+  hiddenChildren: number;
+}
+
 /**
  * What a card (or the Changes view) asks the canvas to light up.
  *
@@ -73,13 +100,13 @@ export interface EdgeTooltip {
  * is "you edited this", `impacted` is "this depends on what you edited".
  */
 export interface CanvasHighlight {
-  /** Result nodes of a card — drawn with an accent halo, labels forced. */
+  /** Result nodes of a card — glowed, everything else dimmed. */
   nodes?: Iterable<string>;
   /** Result edges, matched to model edges by (source, target, kind). */
   edges?: Iterable<{ source: string; target: string; kind: string }>;
-  /** Nodes with uncommitted edits — hot halo. */
+  /** Nodes with uncommitted edits — hot rim. */
   changed?: Iterable<string>;
-  /** Nodes within the impact radius of a change — warm halo. */
+  /** Nodes within the impact radius of a change — warm rim. */
   impacted?: Iterable<string>;
 }
 
@@ -87,167 +114,164 @@ export interface CanvasCallbacks {
   onSelect(node: ModelNode | null): void;
   onViewChange(summary: ViewSummary): void;
   onEdgeTooltip(tooltip: EdgeTooltip | null): void;
+  onArcTooltip(tooltip: ArcTooltip | null): void;
 }
 
-const BACKBONE_PREFIX = 'bb|';
-const RELATION_PREFIX = 'rel|';
-/** Edge revealed only while hovering, because one endpoint is collapsed away. */
-const LIFTED_PREFIX = 'lift|';
-/**
- * Halo ring drawn *behind* a highlighted node.
- *
- * A ring is a second, larger, translucent circle at the same position — which
- * sigma draws with the node program it already has, so highlighting costs no
- * custom WebGL program and no new dependency. Halo nodes are never interactive
- * targets: every pointer handler maps them back to the node they hug.
- */
-const HALO_PREFIX = 'halo|';
+// ------------------------------------------------------------- constants ---
 
-/** Halo fills: hot for changed, warm for impacted, accent for a card result. */
-const HALO_CHANGED = 'rgba(248, 113, 113, 0.30)';
-const HALO_IMPACTED = 'rgba(251, 191, 96, 0.22)';
-const HALO_RESULT = 'rgba(103, 232, 249, 0.26)';
+/** Widest the disk is allowed to grow, and the gutter the panels occupy. */
+const VIEW_PADDING = 36;
+const PANEL_GUTTER = 372;
+const GUTTER_MIN_WIDTH = 900;
 
-/** How much bigger than the node itself each halo is drawn. */
-const HALO_SCALE = 2.1;
+const ZOOM_MIN = 0.5;
+const ZOOM_MAX = 8;
 
-/** Simulation frames run before the very first paint, so load looks instant. */
-const WARMUP_TICKS = 240;
+/** Re-root transition. Short on purpose: navigation, not decoration. */
+const TRANSITION_MS = 260;
 
-/** Wobble detector: reversals needed, and the window they must happen in. */
-const WOBBLE_REVERSALS = 3;
-const WOBBLE_WINDOW_MS = 800;
-const WOBBLE_MIN_SWING = 6;
+/** Relations assembled for one hover / selection / card. */
+const EDGE_BUDGET = 500;
+/** Nodes walked when collecting a subtree's relations. */
+const NODE_SCAN_CAP = 4000;
 
-interface NodeAttributes {
-  x: number;
-  y: number;
-  size: number;
-  color: string;
-  label: string | null;
-  type?: string;
-  zIndex: number;
-  satellite: boolean;
-  expandable: boolean;
-  expanded: boolean;
-}
+/** Pointer slop before a drag stops counting as a click. */
+const DRAG_SLOP = 4;
 
-interface EdgeAttributes {
-  size: number;
-  color: string;
-  type: string;
-  curvature?: number;
-  kind: string;
-  modelKey?: string;
-  backbone: boolean;
+/** Arc must be this long (screen px) before it earns a label. */
+const LABEL_MIN_ARC_PX = 38;
+const LABEL_MIN_THICKNESS_PX = 11;
+/** A truncation that leaves fewer than this many characters is not a label. */
+const LABEL_MIN_CHARS = 5;
+
+const BACKGROUND = '#080b12';
+const AGGREGATE_FILL = '#46516a';
+const RIM_CHANGED = '#f87171';
+const RIM_IMPACTED = '#fbbf24';
+const GLOW_RESULT = '#67e8f9';
+const CENTRE_FILL = 'rgba(24, 33, 52, 0.92)';
+const CENTRE_STROKE = 'rgba(140, 165, 205, 0.45)';
+
+interface DrawnEdge {
+  edge: ModelEdge;
+  points: Point[];
 }
 
 export class CanvasController {
-  private readonly graph = new MultiGraph<NodeAttributes, EdgeAttributes>();
-  private readonly layout = new WedgeLayout();
-  private readonly sigma: Sigma<NodeAttributes, EdgeAttributes>;
+  private readonly container: HTMLElement;
+  private readonly canvas: HTMLCanvasElement;
+  private readonly ctx: CanvasRenderingContext2D;
   private readonly callbacks: CanvasCallbacks;
+  private readonly resizeObserver: ResizeObserver;
 
   private model: GraphModel | null = null;
-  private expanded = new Set<string>();
-  private view: MountedView = { nodes: [], byId: new Map(), truncated: false };
+  private rootId = ROOT_ID;
+  private layout: SunburstLayout | null = null;
+
   private colorMode: ColorMode = 'kind';
   private enabledKinds = new Set<string>();
 
-  private hovered: string | null = null;
-  private highlightNodes = new Set<string>();
-  private highlightEdges = new Set<string>();
   private selected: string | null = null;
+  private hoveredKey: string | null = null;
+  private hoveredEdgeKey: string | null = null;
 
-  /** Persistent highlight from the active card / Changes view (not hover). */
   private resultNodes = new Set<string>();
   private changedNodes = new Set<string>();
   private impactedNodes = new Set<string>();
-  /** Model-edge keys of the active card's edges, for the persistent boost. */
   private resultEdges = new Set<string>();
 
-  private dragId: string | null = null;
-  private dragMoved = false;
-  private dragSamples: Array<{ t: number; x: number }> = [];
-  private suppressClick = false;
+  /** Arc keys the result/changed sets resolve to — recomputed per layout. */
+  private resultArcs = new Set<string>();
+  private changedArcs = new Set<string>();
+  private impactedArcs = new Set<string>();
 
+  private drawnEdges: DrawnEdge[] = [];
+  private edgesDirty = true;
+  /** Edge count the last summary reported, so a redraw doesn't re-emit. */
+  private emittedEdges = -1;
+
+  private width = 0;
+  private height = 0;
+  private zoom = 1;
+  private panX = 0;
+  private panY = 0;
+
+  private transitionStart = 0;
+  private transitionFrom = 1;
+  /** When the root last changed — guards the double-click drill-in. */
+  private rootChangedAt = -Infinity;
   private frame: number | null = null;
-  private pendingReveal: string | null = null;
-  /** A node the camera should centre on once the layout settles (Cmd+P). */
-  private pendingFocus: string | null = null;
-  /** A whole result set the camera should frame once the layout settles. */
-  private pendingFrame: string[] | null = null;
-  private pendingRevealAt = 0;
-  private fitted = false;
   private disposed = false;
 
+  private dragging = false;
+  private dragMoved = false;
+  private dragX = 0;
+  private dragY = 0;
+  private suppressClick = false;
+
   constructor(container: HTMLElement, callbacks: CanvasCallbacks) {
+    this.container = container;
     this.callbacks = callbacks;
-    this.sigma = new Sigma<NodeAttributes, EdgeAttributes>(this.graph, container, {
-      // The wedge is meaningful: never let sigma re-frame the graph when it
-      // grows, or every expansion would yank the user's viewport.
-      autoRescale: true,
-      enableEdgeEvents: true,
-      renderEdgeLabels: false,
-      minEdgeThickness: 1.2,
-      labelColor: { color: '#dbe4f2' },
-      labelFont: 'ui-sans-serif, system-ui, sans-serif',
-      labelSize: 11,
-      labelWeight: '500',
-      labelDensity: 0.7,
-      labelGridCellSize: 70,
-      labelRenderedSizeThreshold: 7,
-      defaultEdgeType: 'line',
-      defaultDrawNodeHover: drawNodeHover,
-      edgeProgramClasses: {
-        [CURVED_EDGE_TYPE]: createCurvedEdgeProgram<NodeAttributes, EdgeAttributes>(),
-        [DASHED_EDGE_TYPE]: createDashedEdgeProgram<NodeAttributes, EdgeAttributes>(),
-      },
-      nodeReducer: (node, data) => this.reduceNode(node, data),
-      edgeReducer: (edge, data) => this.reduceEdge(edge, data),
-    });
+
+    this.canvas = document.createElement('canvas');
+    this.canvas.style.position = 'absolute';
+    this.canvas.style.inset = '0';
+    this.canvas.style.width = '100%';
+    this.canvas.style.height = '100%';
+    this.canvas.style.display = 'block';
+    container.appendChild(this.canvas);
+
+    const ctx = this.canvas.getContext('2d');
+    if (!ctx) throw new Error('2D canvas context unavailable');
+    this.ctx = ctx;
+
+    this.resizeObserver = new ResizeObserver(() => this.resize());
+    this.resizeObserver.observe(container);
+    this.resize();
     this.bindEvents();
   }
 
   // ---------------------------------------------------------------- data ---
 
   /**
-   * Install a model. On a re-index (`sameProject`) the expansion set, pins and
-   * camera are preserved — the contract requires liveness not to cost the user
-   * their place.
+   * Install a model. On a re-index (`sameProject`) the current root, selection
+   * and zoom are preserved — liveness must not cost the user their place.
    */
   setModel(model: GraphModel, sameProject: boolean): void {
     const previous = this.model;
     this.model = model;
 
     if (!previous || !sameProject) {
-      this.expanded = initialExpansion(model);
+      this.rootId = initialRoot(model);
       this.enabledKinds = new Set(model.edgeKinds);
-      this.fitted = false;
       this.selected = null;
+      this.zoom = 1;
+      this.panX = 0;
+      this.panY = 0;
     } else {
-      this.expanded = new Set([...this.expanded].filter((id) => model.nodes.has(id)));
+      if (!model.nodes.has(this.rootId)) this.rootId = initialRoot(model);
       // A brand-new edge kind arriving mid-session should be visible, not
       // silently off; kinds that vanished are simply dropped.
       const known = new Set(previous.edgeKinds);
       for (const kind of model.edgeKinds) if (!known.has(kind)) this.enabledKinds.add(kind);
       this.enabledKinds = new Set([...this.enabledKinds].filter((k) => model.edgeKinds.includes(k)));
-      this.layout.retainPins((id) => model.nodes.has(id));
       if (this.selected && !model.nodes.has(this.selected)) this.selected = null;
     }
-    this.sync(!previous || !sameProject);
+    this.rebuildLayout();
   }
 
   setColorMode(mode: ColorMode): void {
     if (this.colorMode === mode) return;
     this.colorMode = mode;
-    this.repaintNodes();
+    this.requestDraw();
     this.emitSummary();
   }
 
   setEdgeKinds(kinds: Iterable<string>): void {
     this.enabledKinds = new Set(kinds);
-    this.sync(false);
+    this.edgesDirty = true;
+    this.requestDraw();
+    this.emitSummary();
   }
 
   enabledEdgeKinds(): string[] {
@@ -256,63 +280,79 @@ export class CanvasController {
 
   setSelected(id: string | null): void {
     this.selected = id;
-    this.sigma.refresh({ skipIndexation: true });
+    this.edgesDirty = true;
+    this.requestDraw();
   }
 
-  /** Shift+click, also reachable from a keyboard shortcut later. */
-  toggle(id: string): void {
-    if (!this.model) return;
-    const next = toggleExpansion(this.model, this.expanded, id);
-    if (next.size === this.expanded.size && [...next].every((v) => this.expanded.has(v))) return;
-    const expanding = next.has(id) && !this.expanded.has(id);
-    this.expanded = next;
-    this.sync(false);
-    if (expanding) {
-      // Deferred until the simulation settles: measuring the new family while
-      // its members are still travelling would zoom to a box that no longer
-      // exists by the time the animation lands.
-      this.pendingReveal = id;
-      this.pendingRevealAt = performance.now();
+  // ---------------------------------------------------------- navigation ---
+
+  getRoot(): string {
+    return this.rootId;
+  }
+
+  /**
+   * Re-root the disk. The centre becomes `id`, rings grow outward from it.
+   *
+   * A node with no children can still be the root — the centre disk names it —
+   * which is what makes `reveal` able to land on any node in the graph.
+   */
+  setRoot(id: string, animate = true): void {
+    const model = this.model;
+    if (!model || !model.nodes.has(id) || id === this.rootId) return;
+    const previousDepth = model.get(this.rootId)?.depth ?? 0;
+    const nextDepth = model.get(id)?.depth ?? 0;
+    this.rootId = id;
+    this.rootChangedAt = performance.now();
+    this.zoom = 1;
+    this.panX = 0;
+    this.panY = 0;
+    this.hoveredKey = null;
+    this.hoveredEdgeKey = null;
+    this.callbacks.onArcTooltip(null);
+    this.callbacks.onEdgeTooltip(null);
+    if (animate) {
+      // Drilling in starts wide and settles; stepping out starts small and
+      // grows. Both are pure opacity + scale on a layout that never moves.
+      this.transitionFrom = nextDepth > previousDepth ? 1.28 : 0.78;
+      this.transitionStart = performance.now();
     }
+    this.rebuildLayout();
+  }
+
+  /** Step one level out — the centre circle and the breadcrumb both do this. */
+  rootUp(): void {
+    const parent = this.model?.get(this.rootId)?.parent;
+    if (parent) this.setRoot(parent);
   }
 
   /**
-   * The current expansion set, copied.
+   * Re-root onto a result set — what a card (or the Changes view) does.
    *
-   * Phase C's Cmd+P and phase D's URL state both need to read and restore what
-   * is open; the set is copied so a caller can't mutate the controller's own
-   * state behind its back.
+   * The disk lands on the deepest node that contains every result, so a card
+   * answering inside one file opens that file's symbol ring and a card spread
+   * across the project stays at the project root.
    */
-  getExpanded(): Set<string> {
-    return new Set(this.expanded);
-  }
-
-  /**
-   * Replace the expansion set wholesale, in ONE re-mount.
-   *
-   * Restoring a saved view by calling `toggle()` per id would re-run the mount
-   * pass (and the camera reveal) once per node; this applies the whole set and
-   * syncs a single time. Ids that no longer exist are dropped, and the root
-   * stays expanded so a restore can never land on an empty canvas.
-   */
-  setExpanded(ids: Iterable<string>): void {
+  focusNodes(ids: Iterable<string>): void {
     const model = this.model;
     if (!model) return;
-    const next = new Set<string>();
-    for (const id of ids) if (model.nodes.has(id)) next.add(id);
-    if (model.childrenOf(ROOT_ID).length > 0) next.add(ROOT_ID);
-    this.expanded = next;
-    this.sync(false);
+    const wanted = [...ids].filter((id) => model.nodes.has(id));
+    if (wanted.length === 0) return;
+    const target = deepestCommonAncestor(model, wanted);
+    if (target === this.rootId) {
+      this.rebuildLayout();
+      return;
+    }
+    this.setRoot(target);
   }
 
   /**
-   * Select a node and bring it on screen — the Cmd+P landing.
+   * Select a node and bring its arc on screen — the ⌘P landing.
    *
-   * Reaching a node buried in a collapsed subtree means expanding every
-   * ancestor of it (never the node itself: opening a directory the user only
-   * wanted to *look at* would dump its whole fan-out on them). The camera move
-   * waits for the layout to settle when the mount changed, otherwise it would
-   * frame a position the node is still travelling away from.
+   * "Visible" means an arc actually exists for it. Re-rooting to its parent is
+   * the normal answer, but a node can still be swallowed by its parent's
+   * `+N smaller` arc (a directory of 900 files), so the fallback re-roots onto
+   * the node ITSELF: the centre disk always renders the root, so ⌘P can reach
+   * anything in the graph.
    */
   reveal(id: string): boolean {
     const model = this.model;
@@ -320,35 +360,49 @@ export class CanvasController {
     const node = model.get(id);
     if (!node) return false;
 
-    const next = new Set(this.expanded);
-    for (const ancestor of model.ancestors(id)) next.add(ancestor);
-    const grew = next.size !== this.expanded.size;
-    if (grew) {
-      this.expanded = next;
-      this.sync(false);
+    const parent = node.parent;
+    if (parent && parent !== this.rootId) this.setRoot(parent);
+    if (!this.layout || (!this.layout.byNode.has(id) && this.rootId !== id)) {
+      this.setRoot(id);
     }
 
     this.selected = id;
-    this.sigma.refresh({ skipIndexation: true });
+    this.edgesDirty = true;
+    this.requestDraw();
     this.callbacks.onSelect(node);
-
-    if (grew) {
-      this.pendingFocus = id;
-      this.pendingRevealAt = performance.now();
-      this.startAnimation();
-    } else {
-      this.focusOn(id);
-    }
     return true;
   }
 
   /**
+   * Compatibility with the phase C/D contract: the URL and the cards used to
+   * speak in terms of an *expansion set*. There is no expansion any more — the
+   * disk has one root — so the set collapses to it, and a set coming back in
+   * (an old URL, a card's ancestor list) re-roots to what it all has in common.
+   */
+  getExpanded(): Set<string> {
+    return new Set([this.rootId]);
+  }
+
+  setExpanded(ids: Iterable<string>): void {
+    const model = this.model;
+    if (!model) return;
+    const wanted = [...ids].filter((id) => model.nodes.has(id));
+    if (wanted.length === 0) {
+      this.setRoot(initialRoot(model), false);
+      return;
+    }
+    const target = deepestCommonAncestor(model, wanted);
+    this.setRoot(target, false);
+  }
+
+  // ------------------------------------------------------------ highlight ---
+
+  /**
    * Install (or clear) the persistent highlight a card drives.
    *
-   * Unlike hover, this survives until another card replaces it — it is the
-   * card's *answer*, drawn on the graph. Ids the model doesn't know are
-   * dropped silently: a card saved before a re-index can name a symbol that no
-   * longer exists, and that must degrade to "fewer halos", never to an error.
+   * Ids the model doesn't know are dropped silently: a card saved before a
+   * re-index can name a symbol that no longer exists, and that must degrade to
+   * "fewer glows", never to an error.
    */
   setHighlight(highlight: CanvasHighlight | null): void {
     const model = this.model;
@@ -371,682 +425,729 @@ export class CanvasController {
         }
       }
     }
-    this.sync(false);
+    this.projectHighlight();
+    this.edgesDirty = true;
+    this.requestDraw();
   }
 
-  /**
-   * Frame a set of nodes — the camera move a card makes after expanding to its
-   * result. Deferred until the layout settles, for the same reason every other
-   * camera move here is: the nodes are still travelling when the mount changes.
-   */
-  frameNodes(ids: Iterable<string>): void {
-    const wanted = [...ids];
-    if (wanted.length === 0) return;
-    this.pendingFrame = wanted;
-    this.pendingRevealAt = performance.now();
-    this.startAnimation();
+  /** Re-fit: reset zoom and pan so the whole disk is on screen. */
+  fitView(): void {
+    this.zoom = 1;
+    this.panX = 0;
+    this.panY = 0;
+    this.requestDraw();
+    this.emitSummary();
   }
 
   destroy(): void {
     this.disposed = true;
     if (this.frame !== null) cancelAnimationFrame(this.frame);
-    this.sigma.kill();
+    this.resizeObserver.disconnect();
+    this.canvas.remove();
   }
 
-  // ------------------------------------------------------------- mounting ---
+  // --------------------------------------------------------------- layout ---
 
-  private sync(resetCamera: boolean): void {
+  private rebuildLayout(): void {
     const model = this.model;
     if (!model) return;
-
-    this.view = computeMountedView(model, this.expanded);
-    this.layout.setView(model, this.view);
-
-    if (!this.fitted) {
-      for (let i = 0; i < WARMUP_TICKS && this.layout.tick(); i++) {
-        /* settle before the first paint */
-      }
-    }
-
-    this.rebuildNodes(model);
-    this.rebuildEdges(model);
-
-    if (!this.fitted || resetCamera) {
-      this.fitToContent();
-      this.fitted = true;
-    }
+    this.layout = computeSunburst(model, this.rootId);
+    this.rootId = this.layout.rootId;
+    this.projectHighlight();
+    this.edgesDirty = true;
+    this.requestDraw();
     this.emitSummary();
-    this.startAnimation();
-  }
-
-  private rebuildNodes(model: GraphModel): void {
-    const wanted = this.view.byId;
-    for (const id of this.graph.nodes()) {
-      if (id.startsWith(HALO_PREFIX)) {
-        const base = id.slice(HALO_PREFIX.length);
-        if (!wanted.has(base) || !this.haloColor(base)) this.graph.dropNode(id);
-        continue;
-      }
-      if (!wanted.has(id)) this.graph.dropNode(id);
-    }
-    for (const mounted of this.view.nodes) {
-      const node = model.get(mounted.id);
-      if (!node) continue;
-      const point = this.layout.positionOf(mounted.id) ?? { x: 0, y: 0 };
-      const attributes: NodeAttributes = {
-        x: point.x,
-        y: point.y,
-        size: this.layout.radiusOf(mounted.id),
-        color: colorForNode(node, this.colorMode, model.layers),
-        label: this.labelFor(node, mounted.satellite, mounted.hiddenChildren),
-        zIndex: mounted.satellite ? 0 : 1,
-        satellite: mounted.satellite,
-        expandable: model.childrenOf(mounted.id).length > 0,
-        expanded: mounted.expanded,
-      };
-      if (this.graph.hasNode(mounted.id)) this.graph.mergeNodeAttributes(mounted.id, attributes);
-      else this.graph.addNode(mounted.id, attributes);
-
-      const halo = this.haloColor(mounted.id);
-      const haloId = `${HALO_PREFIX}${mounted.id}`;
-      if (!halo) continue;
-      const haloAttributes: NodeAttributes = {
-        x: point.x,
-        y: point.y,
-        size: attributes.size * HALO_SCALE,
-        color: halo,
-        label: null,
-        // Behind everything, so a ring never covers the node it belongs to.
-        zIndex: -1,
-        satellite: false,
-        expandable: false,
-        expanded: false,
-      };
-      if (this.graph.hasNode(haloId)) this.graph.mergeNodeAttributes(haloId, haloAttributes);
-      else this.graph.addNode(haloId, haloAttributes);
-    }
-  }
-
-  /** The halo a node currently earns, most urgent first, or null for none. */
-  private haloColor(id: string): string | null {
-    if (this.changedNodes.has(id)) return HALO_CHANGED;
-    if (this.resultNodes.has(id)) return HALO_RESULT;
-    if (this.impactedNodes.has(id)) return HALO_IMPACTED;
-    return null;
-  }
-
-  private labelFor(node: ModelNode, satellite: boolean, hidden: number): string | null {
-    if (satellite) return null;
-    const suffix = hidden > 0 ? ` +${hidden}` : '';
-    return `${node.name}${suffix}`;
   }
 
   /**
-   * Backbone lines (straight) plus every enabled relation whose two endpoints
-   * are BOTH mounted (contract). Relations to a collapsed subtree are not drawn
-   * here — hovering lifts them to the nearest visible ancestor instead.
+   * Map highlighted NODE ids onto the arcs that actually render them.
+   *
+   * A changed symbol inside a collapsed directory has no arc of its own, so its
+   * rim is drawn on the deepest ancestor arc that IS on screen — otherwise a
+   * whole edit would silently vanish when the user zooms out.
    */
-  private rebuildEdges(model: GraphModel): void {
-    const wanted = new Map<string, EdgeAttributes & { source: string; target: string }>();
-
-    for (const mounted of this.view.nodes) {
-      if (!mounted.parentId || !this.view.byId.has(mounted.parentId)) continue;
-      wanted.set(`${BACKBONE_PREFIX}${mounted.id}`, {
-        source: mounted.parentId,
-        target: mounted.id,
-        size: mounted.satellite ? 0.7 : 1.1,
-        color: mounted.satellite ? BACKBONE_SATELLITE_COLOR : BACKBONE_COLOR,
-        type: 'line',
-        kind: 'contains',
-        backbone: true,
-      });
-    }
-
-    const seen = new Set<string>();
-    for (const mounted of this.view.nodes) {
-      for (const edge of model.edgesOf(mounted.id)) {
-        if (seen.has(edge.key)) continue;
-        if (!this.enabledKinds.has(edge.kind)) continue;
-        if (!this.view.byId.has(edge.source) || !this.view.byId.has(edge.target)) continue;
-        if (edge.source === edge.target) continue;
-        seen.add(edge.key);
-        wanted.set(`${RELATION_PREFIX}${edge.key}`, this.relationAttributes(edge));
+  private projectHighlight(): void {
+    this.resultArcs = new Set();
+    this.changedArcs = new Set();
+    this.impactedArcs = new Set();
+    if (!this.layout) return;
+    const project = (ids: Set<string>, into: Set<string>): void => {
+      for (const id of ids) {
+        const arc = this.resolveArc(id);
+        if (arc) into.add(arc.key);
       }
-    }
-
-    for (const key of this.graph.edges()) {
-      if (key.startsWith(LIFTED_PREFIX)) continue;
-      if (!wanted.has(key)) this.graph.dropEdge(key);
-    }
-    for (const [key, attributes] of wanted) {
-      if (this.graph.hasEdge(key)) {
-        this.graph.mergeEdgeAttributes(key, attributes);
-        continue;
-      }
-      const { source, target, ...rest } = attributes;
-      if (!this.graph.hasNode(source) || !this.graph.hasNode(target)) continue;
-      this.graph.addDirectedEdgeWithKey(key, source, target, rest);
-    }
-  }
-
-  private relationAttributes(
-    edge: ModelEdge
-  ): EdgeAttributes & { source: string; target: string } {
-    return {
-      source: edge.source,
-      target: edge.target,
-      // Thin enough to stay quiet, thick enough to actually hover: sigma picks
-      // edges from the rendered thickness, so a 1px line is unclickable.
-      size: edge.heuristic ? 2.4 : 1.8,
-      color: colorForEdgeKind(edge.kind),
-      type: edge.heuristic ? DASHED_EDGE_TYPE : CURVED_EDGE_TYPE,
-      // Opposite directions bend opposite ways so an A↔B pair stays readable.
-      [CURVATURE_ATTRIBUTE]: edge.source < edge.target ? 0.2 : -0.2,
-      kind: edge.kind,
-      modelKey: edge.key,
-      backbone: false,
     };
+    project(this.resultNodes, this.resultArcs);
+    project(this.changedNodes, this.changedArcs);
+    project(this.impactedNodes, this.impactedArcs);
   }
 
-  private repaintNodes(): void {
+  /**
+   * The deepest RENDERED arc standing in for a node.
+   *
+   * `null` means the centre — either the current root itself or something
+   * outside its subtree entirely, which is exactly where such an edge should
+   * appear to leave from.
+   */
+  private resolveArc(id: string): SunburstArc | null {
+    const layout = this.layout;
     const model = this.model;
-    if (!model) return;
-    this.graph.updateEachNodeAttributes((id, attributes) => {
-      const node = model.get(id);
-      if (!node) return attributes;
-      return { ...attributes, color: colorForNode(node, this.colorMode, model.layers) };
-    });
+    if (!layout || !model) return null;
+    const direct = layout.byNode.get(id);
+    if (direct) return direct;
+    const folded = layout.aggregatedInto.get(id);
+    if (folded) return folded;
+    for (const ancestor of model.ancestors(id)) {
+      const arc = layout.byNode.get(ancestor);
+      if (arc) return arc;
+      const aggregate = layout.aggregatedInto.get(ancestor);
+      if (aggregate) return aggregate;
+    }
+    return null;
   }
 
-  // ------------------------------------------------------------ animation ---
+  private resize(): void {
+    const rect = this.container.getBoundingClientRect();
+    this.width = Math.max(1, Math.round(rect.width));
+    this.height = Math.max(1, Math.round(rect.height));
+    const ratio = window.devicePixelRatio || 1;
+    this.canvas.width = Math.round(this.width * ratio);
+    this.canvas.height = Math.round(this.height * ratio);
+    this.requestDraw();
+  }
 
-  private startAnimation(): void {
+  // ------------------------------------------------------------ transform ---
+
+  /**
+   * Where the disk sits with no pan applied.
+   *
+   * Biased right of centre: the cards / status column floats over the left of
+   * the viewport, and a disk centred under it would be half-covered.
+   */
+  private centre(): Point {
+    const gutter = this.width > GUTTER_MIN_WIDTH ? PANEL_GUTTER : 0;
+    const available = Math.max(120, this.width - gutter);
+    return { x: gutter + available / 2, y: this.height / 2 };
+  }
+
+  /** Scale that fits the disk in the space the floating panels leave free. */
+  private fitScale(): number {
+    const gutter = this.width > GUTTER_MIN_WIDTH ? PANEL_GUTTER : 0;
+    const available = Math.max(120, this.width - gutter);
+    const radius = Math.max(60, Math.min(available, this.height) / 2 - VIEW_PADDING);
+    return radius / (this.layout?.maxRadius ?? MAX_RADIUS);
+  }
+
+  private scale(): number {
+    return this.fitScale() * this.zoom;
+  }
+
+  private origin(): Point {
+    const centre = this.centre();
+    return { x: centre.x + this.panX, y: centre.y + this.panY };
+  }
+
+  private toWorld(screenX: number, screenY: number): Point {
+    const origin = this.origin();
+    const scale = this.scale();
+    return { x: (screenX - origin.x) / scale, y: (screenY - origin.y) / scale };
+  }
+
+  // -------------------------------------------------------------- painting ---
+
+  private requestDraw(): void {
     if (this.frame !== null || this.disposed) return;
-    const step = (): void => {
+    this.frame = requestAnimationFrame(() => {
       this.frame = null;
       if (this.disposed) return;
-      const running = this.layout.tick();
-      this.writePositions();
-      const settled = !running || performance.now() - this.pendingRevealAt > 2000;
-      if (this.pendingReveal && settled) {
-        const target = this.pendingReveal;
-        this.pendingReveal = null;
-        this.revealAfterExpand(target);
-      }
-      if (this.pendingFocus && settled) {
-        const target = this.pendingFocus;
-        this.pendingFocus = null;
-        this.focusOn(target);
-      }
-      if (this.pendingFrame && settled) {
-        const targets = this.pendingFrame;
-        this.pendingFrame = null;
-        this.frameNow(targets);
-      }
-      if (running || this.dragId) this.frame = requestAnimationFrame(step);
-    };
-    this.frame = requestAnimationFrame(step);
-  }
-
-  /** One batched attribute update per frame — sigma refreshes once, not 1,200x. */
-  private writePositions(): void {
-    this.graph.updateEachNodeAttributes(
-      (id, attributes) => {
-        // A halo has no layout body of its own; it rides the node it hugs.
-        const point = this.layout.positionOf(
-          id.startsWith(HALO_PREFIX) ? id.slice(HALO_PREFIX.length) : id
-        );
-        if (!point) return attributes;
-        return { ...attributes, x: point.x, y: point.y };
-      },
-      { attributes: ['x', 'y'] }
-    );
-  }
-
-  // ------------------------------------------------------------- viewport ---
-
-  private fitToContent(): void {
-    const bounds = this.layout.bounds();
-    if (!bounds) return;
-    const { width, height } = this.sigma.getDimensions();
-    const padX = Math.max(80, (bounds.maxX - bounds.minX) * 0.08);
-    const padY = Math.max(80, (bounds.maxY - bounds.minY) * 0.08);
-    let minX = bounds.minX - padX;
-    let maxX = bounds.maxX + padX;
-    let minY = bounds.minY - padY;
-    let maxY = bounds.maxY + padY;
-
-    // Match the viewport aspect so sigma's square normalization doesn't crop.
-    const boxWidth = maxX - minX;
-    const boxHeight = maxY - minY;
-    const aspect = width / Math.max(height, 1);
-    if (boxWidth / Math.max(boxHeight, 1) < aspect) {
-      const wanted = boxHeight * aspect;
-      const centre = (minX + maxX) / 2;
-      minX = centre - wanted / 2;
-      maxX = centre + wanted / 2;
-    } else {
-      const wanted = boxWidth / aspect;
-      const centre = (minY + maxY) / 2;
-      minY = centre - wanted / 2;
-      maxY = centre + wanted / 2;
-    }
-
-    // A pinned custom bbox is what keeps the coordinate frame stable across
-    // expansions: without it sigma renormalizes on every mount and the whole
-    // graph visibly jumps sideways every time a directory opens.
-    this.sigma.setCustomBBox({ x: [minX, maxX], y: [minY, maxY] });
-    this.sigma.getCamera().setState({ x: 0.5, y: 0.5, ratio: 1, angle: 0 });
-    this.sigma.refresh();
-  }
-
-  /**
-   * After an expansion, bring the newly revealed family into view.
-   *
-   * Expansion pushes the graph rightward by design, so a fan-out routinely
-   * lands past the viewport edge. Without this the user shift+clicks and sees
-   * nothing happen. It only ever zooms OUT and only when something genuinely
-   * doesn't fit, so it never fights a user who has deliberately zoomed in.
-   */
-  private revealAfterExpand(id: string): void {
-    const visible = (this.model?.childrenOf(id) ?? []).filter((child) =>
-      this.view.byId.has(child)
-    );
-    if (visible.length === 0) return;
-    {
-      const points = [id, ...visible]
-        .map((child) => this.layout.positionOf(child))
-        .filter((point): point is { x: number; y: number } => Boolean(point));
-      if (points.length === 0) return;
-
-      const world = {
-        minX: Math.min(...points.map((p) => p.x)),
-        maxX: Math.max(...points.map((p) => p.x)),
-        minY: Math.min(...points.map((p) => p.y)),
-        maxY: Math.max(...points.map((p) => p.y)),
-      };
-      const topLeft = this.sigma.graphToViewport({ x: world.minX, y: world.minY });
-      const bottomRight = this.sigma.graphToViewport({ x: world.maxX, y: world.maxY });
-      const box = {
-        minX: Math.min(topLeft.x, bottomRight.x),
-        maxX: Math.max(topLeft.x, bottomRight.x),
-        minY: Math.min(topLeft.y, bottomRight.y),
-        maxY: Math.max(topLeft.y, bottomRight.y),
-      };
-
-      const { width, height } = this.sigma.getDimensions();
-      const margin = 80;
-      const scale = Math.max(
-        (box.maxX - box.minX) / Math.max(width - margin * 2, 1),
-        (box.maxY - box.minY) / Math.max(height - margin * 2, 1)
-      );
-      const fits =
-        box.minX >= margin &&
-        box.minY >= margin &&
-        box.maxX <= width - margin &&
-        box.maxY <= height - margin;
-      if (fits) return;
-
-      const camera = this.sigma.getCamera();
-      const centre = this.sigma.viewportToFramedGraph({
-        x: (box.minX + box.maxX) / 2,
-        y: (box.minY + box.maxY) / 2,
-      });
-      // Cap the zoom-out per expansion: a huge fan-out should still leave the
-      // rest of the graph legible rather than shrinking it to dust.
-      const ratio = scale > 1 ? camera.ratio * Math.min(scale, 2.5) : camera.ratio;
-      void camera.animate({ x: centre.x, y: centre.y, ratio }, { duration: 380 });
-    }
-  }
-
-  /**
-   * Centre the camera on one node, zooming IN if the view is far out.
-   *
-   * A node that isn't mounted (the render budget elided it) has no position to
-   * fly to; the selection still stands, the camera simply doesn't move.
-   */
-  private focusOn(id: string): void {
-    const point = this.layout.positionOf(id);
-    if (!point || !this.graph.hasNode(id)) return;
-    const camera = this.sigma.getCamera();
-    const framed = this.sigma.viewportToFramedGraph(this.sigma.graphToViewport(point));
-    // Ratio is inverse zoom in sigma: capping it zooms in on a far-out view
-    // without ever pulling back from one the user deliberately zoomed into.
-    void camera.animate(
-      { x: framed.x, y: framed.y, ratio: Math.min(camera.ratio, 0.5) },
-      { duration: 420 }
-    );
-  }
-
-  /**
-   * Fit the camera around a set of nodes (a card's result).
-   *
-   * Unlike {@link revealAfterExpand} this zooms IN as well as out: the user
-   * asked to look at exactly these nodes, so filling the viewport with them is
-   * the answer. Nodes the render budget elided contribute nothing; if none of
-   * the set is mounted the camera stays where it is rather than flying to the
-   * origin.
-   */
-  private frameNow(ids: string[]): void {
-    const points = ids
-      .map((id) => (this.graph.hasNode(id) ? this.layout.positionOf(id) : null))
-      .filter((point): point is { x: number; y: number } => Boolean(point));
-    if (points.length === 0) return;
-
-    const world = {
-      minX: Math.min(...points.map((p) => p.x)),
-      maxX: Math.max(...points.map((p) => p.x)),
-      minY: Math.min(...points.map((p) => p.y)),
-      maxY: Math.max(...points.map((p) => p.y)),
-    };
-    const topLeft = this.sigma.graphToViewport({ x: world.minX, y: world.minY });
-    const bottomRight = this.sigma.graphToViewport({ x: world.maxX, y: world.maxY });
-    const box = {
-      minX: Math.min(topLeft.x, bottomRight.x),
-      maxX: Math.max(topLeft.x, bottomRight.x),
-      minY: Math.min(topLeft.y, bottomRight.y),
-      maxY: Math.max(topLeft.y, bottomRight.y),
-    };
-
-    const { width, height } = this.sigma.getDimensions();
-    const margin = 120;
-    const camera = this.sigma.getCamera();
-    const scale = Math.max(
-      (box.maxX - box.minX) / Math.max(width - margin * 2, 1),
-      (box.maxY - box.minY) / Math.max(height - margin * 2, 1)
-    );
-    const centre = this.sigma.viewportToFramedGraph({
-      x: (box.minX + box.maxX) / 2,
-      y: (box.minY + box.maxY) / 2,
+      this.draw();
+      if (this.transitionStart > 0) this.requestDraw();
     });
-    // A single node has no extent, so `scale` is 0 — clamp to a sane zoom
-    // instead of dividing the camera ratio down to nothing.
-    const ratio = scale > 0 ? Math.max(camera.ratio * scale, 0.08) : Math.min(camera.ratio, 0.4);
-    void camera.animate({ x: centre.x, y: centre.y, ratio }, { duration: 420 });
   }
 
-  /** Re-fit the whole mounted graph — the "fit" control in the toolbar. */
-  fitView(): void {
-    this.fitToContent();
+  private draw(): void {
+    const ctx = this.ctx;
+    const ratio = window.devicePixelRatio || 1;
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.clearRect(0, 0, this.width, this.height);
+    ctx.fillStyle = BACKGROUND;
+    ctx.fillRect(0, 0, this.width, this.height);
+
+    const layout = this.layout;
+    const model = this.model;
+    if (!layout || !model) return;
+
+    // Re-root transition: pure scale + fade over a layout that never moves.
+    let progress = 1;
+    if (this.transitionStart > 0) {
+      progress = Math.min(1, (performance.now() - this.transitionStart) / TRANSITION_MS);
+      if (progress >= 1) this.transitionStart = 0;
+    }
+    const eased = 1 - Math.pow(1 - progress, 3);
+    const animationScale = this.transitionFrom + (1 - this.transitionFrom) * eased;
+
+    if (this.edgesDirty) this.rebuildEdges();
+
+    const origin = this.origin();
+    const scale = this.scale();
+    ctx.save();
+    ctx.translate(origin.x, origin.y);
+    ctx.scale(scale * animationScale, scale * animationScale);
+    ctx.globalAlpha = progress < 1 ? 0.25 + 0.75 * eased : 1;
+
+    const k = scale * animationScale;
+    this.drawArcs(ctx, layout, model, k);
+    this.drawCentre(ctx, layout, k);
+    this.drawEdges(ctx, k);
+    this.drawLabels(ctx, layout, model, k);
+
+    ctx.restore();
+
+    // The edge count is part of the summary, and it only ever changes here.
+    if (this.drawnEdges.length !== this.emittedEdges) this.emitSummary();
   }
 
-  // -------------------------------------------------------------- reducers --
+  private drawArcs(
+    ctx: CanvasRenderingContext2D,
+    layout: SunburstLayout,
+    model: GraphModel,
+    k: number
+  ): void {
+    const dimming = this.resultArcs.size > 0;
 
-  private reduceNode(id: string, data: NodeAttributes): Partial<NodeDisplayData> {
-    const result: Partial<NodeDisplayData> = { ...data };
-    if (id.startsWith(HALO_PREFIX)) {
-      // Decoration only: never labelled, never highlighted, and dimmed with
-      // its node when a hover pushes the rest of the graph back.
-      result.label = null;
-      if (this.hovered && !this.highlightNodes.has(id.slice(HALO_PREFIX.length))) {
-        result.color = withAlpha(data.color, 0.06);
+    for (const arc of layout.arcs) {
+      const pad = Math.min(0.0022, (arc.a1 - arc.a0) * 0.14);
+      const a0 = arc.a0 + pad;
+      const a1 = arc.a1 - pad;
+      if (a1 <= a0) continue;
+
+      const emphasised =
+        this.resultArcs.has(arc.key) ||
+        this.isUnderHover(arc) ||
+        (this.selected !== null && arc.nodeId === this.selected);
+      let alpha = 0.94 - 0.055 * (arc.ring - 1);
+      if (dimming && !emphasised) alpha *= 0.26;
+      else if (emphasised) alpha = 1;
+
+      ctx.beginPath();
+      ctx.arc(0, 0, arc.r0, a0, a1);
+      ctx.arc(0, 0, arc.r1, a1, a0, true);
+      ctx.closePath();
+      ctx.fillStyle = withAlpha(this.fillFor(arc, model), alpha);
+      ctx.fill();
+
+      // Outlines first, while the annulus is still the current path — the rim
+      // below starts a path of its own and would otherwise be stroked twice.
+      if (this.resultArcs.has(arc.key)) {
+        ctx.strokeStyle = GLOW_RESULT;
+        ctx.lineWidth = 1.6 / k;
+        ctx.stroke();
       }
-      return result;
-    }
-    if (!this.hovered && this.resultNodes.has(id)) result.forceLabel = true;
-    if (id === this.selected) {
-      result.highlighted = true;
-      result.forceLabel = true;
-      result.size = data.size * 1.25;
-    }
-    if (this.hovered) {
-      if (id === this.hovered) {
-        result.highlighted = true;
-        result.forceLabel = true;
-      } else if (!this.highlightNodes.has(id)) {
-        result.color = withAlpha(data.color, 0.16);
-        result.label = null;
-      } else {
-        result.forceLabel = !data.satellite;
+      if (arc.nodeId !== null && arc.nodeId === this.selected) {
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2 / k;
+        ctx.stroke();
+      } else if (arc.key === this.hoveredKey) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+        ctx.lineWidth = 1.4 / k;
+        ctx.stroke();
+      }
+
+      if (this.changedArcs.has(arc.key)) this.strokeRim(ctx, arc, a0, a1, RIM_CHANGED, 2.8 / k);
+      else if (this.impactedArcs.has(arc.key)) {
+        this.strokeRim(ctx, arc, a0, a1, RIM_IMPACTED, 2 / k);
       }
     }
-    return result;
   }
 
-  private reduceEdge(id: string, data: EdgeAttributes): Partial<EdgeDisplayData> {
-    const result: Partial<EdgeDisplayData> = { ...data };
-    const inResult = !data.backbone && !!data.modelKey && this.resultEdges.has(data.modelKey);
-    if (!this.hovered) {
-      if (inResult) {
-        result.size = data.size * 1.9;
-        result.color = withAlpha(data.color, 0.95);
-        result.zIndex = 2;
+  /** Rim on the OUTER boundary: hot for changed, warm for impacted. */
+  private strokeRim(
+    ctx: CanvasRenderingContext2D,
+    arc: SunburstArc,
+    a0: number,
+    a1: number,
+    color: string,
+    lineWidth: number
+  ): void {
+    ctx.beginPath();
+    ctx.arc(0, 0, Math.max(arc.r0, arc.r1 - lineWidth / 2), a0, a1);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.stroke();
+  }
+
+  private drawCentre(ctx: CanvasRenderingContext2D, layout: SunburstLayout, k: number): void {
+    ctx.beginPath();
+    ctx.arc(0, 0, layout.centreRadius - 3, 0, Math.PI * 2);
+    ctx.fillStyle = CENTRE_FILL;
+    ctx.fill();
+    ctx.strokeStyle = this.hoveredKey === CENTRE_KEY ? 'rgba(255,255,255,0.7)' : CENTRE_STROKE;
+    ctx.lineWidth = 1.4 / k;
+    ctx.stroke();
+
+    const canGoUp = Boolean(layout.root.parent);
+    const nameSize = 12.5 / k;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#dbe4f2';
+    ctx.font = `600 ${nameSize}px ui-sans-serif, system-ui, sans-serif`;
+    const label = fitText(ctx, layout.root.name || 'project', (layout.centreRadius - 12) * 2);
+    ctx.fillText(label, 0, canGoUp ? 4 / k : 0);
+    if (canGoUp) {
+      ctx.font = `500 ${9.5 / k}px ui-sans-serif, system-ui, sans-serif`;
+      ctx.fillStyle = 'rgba(190, 205, 230, 0.7)';
+      ctx.fillText('▲ up', 0, -13 / k);
+    }
+  }
+
+  private drawEdges(ctx: CanvasRenderingContext2D, k: number): void {
+    if (this.drawnEdges.length === 0) return;
+    ctx.lineCap = 'round';
+    for (const drawn of this.drawnEdges) {
+      if (drawn.points.length < 2) continue;
+      const hovered = drawn.edge.key === this.hoveredEdgeKey;
+      ctx.beginPath();
+      ctx.moveTo(drawn.points[0]!.x, drawn.points[0]!.y);
+      for (let i = 1; i < drawn.points.length; i++) {
+        ctx.lineTo(drawn.points[i]!.x, drawn.points[i]!.y);
       }
-      return result;
+      const color = colorForEdgeKind(drawn.edge.kind);
+      ctx.strokeStyle = withAlpha(color, hovered ? 0.98 : 0.62);
+      ctx.lineWidth = (hovered ? 2.4 : 1.3) / k;
+      // Provenance: a synthesized (heuristic) relation is dashed, always.
+      if (drawn.edge.heuristic) ctx.setLineDash([6 / k, 4 / k]);
+      else ctx.setLineDash([]);
+      ctx.stroke();
     }
-    if (this.highlightEdges.has(id)) {
-      result.size = data.size * 1.9;
-      result.color = data.backbone ? 'rgba(190, 210, 240, 0.8)' : withAlpha(data.color, 0.95);
-      result.zIndex = 2;
-      return result;
-    }
-    result.color = withAlpha(data.color, data.backbone ? 0.08 : 0.05);
-    return result;
+    ctx.setLineDash([]);
   }
 
-  // ---------------------------------------------------------------- events --
+  private drawLabels(
+    ctx: CanvasRenderingContext2D,
+    layout: SunburstLayout,
+    model: GraphModel,
+    k: number
+  ): void {
+    const dimming = this.resultArcs.size > 0;
+    for (const arc of layout.arcs) {
+      if (dimming && !this.resultArcs.has(arc.key) && arc.key !== this.hoveredKey) continue;
+      this.drawArcLabel(ctx, arc, model, k);
+    }
+  }
+
+  /**
+   * A label follows its arc, one glyph at a time.
+   *
+   * Straight text in a ring is either tiny or crooked; curved text reads at the
+   * ring thickness the arc actually has. Labels on the bottom half are flipped
+   * so they are never upside down, and anything that cannot fit legibly is
+   * simply not drawn — a truncated `sr…` is worse than nothing.
+   */
+  private drawArcLabel(
+    ctx: CanvasRenderingContext2D,
+    arc: SunburstArc,
+    model: GraphModel,
+    k: number
+  ): void {
+    const midRadius = (arc.r0 + arc.r1) / 2;
+    const span = arc.a1 - arc.a0;
+    if (span * midRadius * k < LABEL_MIN_ARC_PX) return;
+    const thicknessPx = (arc.r1 - arc.r0) * k;
+    if (thicknessPx < LABEL_MIN_THICKNESS_PX) return;
+
+    const fontPx = Math.max(9, Math.min(12.5, thicknessPx * 0.34));
+    ctx.font = `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
+    const maxWidth = span * 0.9 * midRadius;
+    const text = fitText(ctx, arc.label, maxWidth);
+    // `ex…` names nothing. Either the label is legible or the arc stays bare
+    // and the hover tooltip carries the name instead.
+    if (!text || (text.endsWith('…') && text.length < LABEL_MIN_CHARS)) return;
+
+    const mid = (arc.a0 + arc.a1) / 2;
+    const flip = Math.sin(mid) > 0;
+    const total = ctx.measureText(text).width;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = readableOn(this.fillFor(arc, model));
+
+    let angle = flip ? mid + total / midRadius / 2 : mid - total / midRadius / 2;
+    for (const character of text) {
+      const step = ctx.measureText(character).width / midRadius;
+      const at = flip ? angle - step / 2 : angle + step / 2;
+      ctx.save();
+      ctx.rotate(at);
+      ctx.translate(midRadius, 0);
+      ctx.rotate(flip ? -Math.PI / 2 : Math.PI / 2);
+      ctx.fillText(character, 0, 0);
+      ctx.restore();
+      angle = flip ? angle - step : angle + step;
+    }
+  }
+
+  private fillFor(arc: SunburstArc, model: GraphModel): string {
+    if (!arc.nodeId) return AGGREGATE_FILL;
+    const node = model.get(arc.nodeId);
+    if (!node) return AGGREGATE_FILL;
+    return colorForNode(node, this.colorMode, model.layers);
+  }
+
+  // ---------------------------------------------------------------- edges ---
+
+  /**
+   * Is this arc the hovered one, or inside its subtree?
+   *
+   * Answered by walking the arc's own parent chain (at most `MAX_RINGS` steps)
+   * rather than expanding the hovered subtree, so it stays O(1) per arc.
+   */
+  private isUnderHover(arc: SunburstArc): boolean {
+    const hovered = this.hoveredKey;
+    if (!hovered || hovered === CENTRE_KEY) return false;
+    const layout = this.layout;
+    if (!layout) return false;
+    let current: SunburstArc | undefined = arc;
+    let guard = 0;
+    while (current && guard++ < 16) {
+      if (current.key === hovered) return true;
+      current = current.parentKey ? layout.byKey.get(current.parentKey) : undefined;
+    }
+    return false;
+  }
+
+  /**
+   * Assemble the relations to draw right now.
+   *
+   * Edges are hidden at rest by design (contract): the disk is the structure,
+   * relations are the answer to a question. Three sources ask for them — the
+   * hovered arc's subtree, the current selection, and the active card's
+   * `edgeRefs` — and each is capped, because a hover over the project root
+   * would otherwise ask for every edge in the graph.
+   */
+  private rebuildEdges(): void {
+    this.edgesDirty = false;
+    this.drawnEdges = [];
+    const model = this.model;
+    const layout = this.layout;
+    if (!model || !layout) return;
+
+    const wanted = new Map<string, ModelEdge>();
+    for (const key of this.resultEdges) {
+      const edge = model.edgeByKey.get(key);
+      if (edge && this.enabledKinds.has(edge.kind)) wanted.set(key, edge);
+      if (wanted.size >= EDGE_BUDGET) break;
+    }
+    if (this.selected) this.collectEdges([this.selected], wanted);
+    if (this.hoveredKey && this.hoveredKey !== CENTRE_KEY) {
+      const arc = layout.byKey.get(this.hoveredKey);
+      if (arc) this.collectEdges(arc.nodeId ? [arc.nodeId] : arc.aggregated, wanted);
+    }
+
+    for (const edge of wanted.values()) {
+      const from = this.resolveArc(edge.source);
+      const to = this.resolveArc(edge.target);
+      if (!from && !to) continue;
+      if (from && to && from.key === to.key) continue;
+      const points = bundleCurve(bundleControlPoints(from, to, layout));
+      if (points.length >= 2) this.drawnEdges.push({ edge, points });
+    }
+  }
+
+  private collectEdges(seeds: string[], into: Map<string, ModelEdge>): void {
+    const model = this.model;
+    if (!model) return;
+    const stack = [...seeds];
+    let scanned = 0;
+    while (stack.length > 0 && scanned < NODE_SCAN_CAP && into.size < EDGE_BUDGET) {
+      const id = stack.pop()!;
+      scanned++;
+      for (const edge of model.edgesOf(id)) {
+        if (into.size >= EDGE_BUDGET) break;
+        if (!this.enabledKinds.has(edge.kind)) continue;
+        if (edge.source === edge.target) continue;
+        into.set(edge.key, edge);
+      }
+      for (const child of model.childrenOf(id)) stack.push(child);
+    }
+  }
+
+  // --------------------------------------------------------------- events ---
 
   private bindEvents(): void {
-    // Every pointer target is normalized through `baseNode`, so a halo ring
-    // behaves exactly like the node it hugs rather than as a phantom object.
-    this.sigma.on('enterNode', ({ node }) => this.setHover(baseNode(node)));
-    this.sigma.on('leaveNode', () => this.setHover(null));
+    this.canvas.addEventListener('pointermove', this.onPointerMove);
+    this.canvas.addEventListener('pointerdown', this.onPointerDown);
+    this.canvas.addEventListener('pointerup', this.onPointerUp);
+    this.canvas.addEventListener('pointercancel', this.onPointerUp);
+    this.canvas.addEventListener('pointerleave', this.onPointerLeave);
+    this.canvas.addEventListener('click', this.onClick);
+    this.canvas.addEventListener('dblclick', this.onDoubleClick);
+    this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
+  }
 
-    this.sigma.on('clickNode', ({ node: clicked, event }) => {
-      if (this.suppressClick) {
-        this.suppressClick = false;
-        return;
-      }
-      const node = baseNode(clicked);
-      const original = event.original as MouseEvent;
-      if (original && original.shiftKey) {
-        this.toggle(node);
-        return;
-      }
-      this.selected = node;
-      this.sigma.refresh({ skipIndexation: true });
-      this.callbacks.onSelect(this.model?.get(node) ?? null);
-    });
+  private pointerPosition(event: PointerEvent | MouseEvent | WheelEvent): Point {
+    const rect = this.canvas.getBoundingClientRect();
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  }
 
-    this.sigma.on('clickStage', () => {
-      if (this.suppressClick) {
-        this.suppressClick = false;
-        return;
-      }
-      this.selected = null;
-      this.sigma.refresh({ skipIndexation: true });
-      this.callbacks.onSelect(null);
-    });
-
-    this.sigma.on('downNode', ({ node, event }) => {
-      this.dragId = baseNode(node);
-      this.dragMoved = false;
-      this.dragSamples = [{ t: performance.now(), x: this.sigma.viewportToGraph(event).x }];
-      this.startAnimation();
-    });
-
-    this.sigma.on('moveBody', ({ event }) => {
-      if (!this.dragId) return;
-      const point = this.sigma.viewportToGraph(event);
-      this.layout.pin(this.dragId, point.x, point.y);
+  private readonly onPointerMove = (event: PointerEvent): void => {
+    const position = this.pointerPosition(event);
+    if (this.dragging) {
+      const dx = position.x - this.dragX;
+      const dy = position.y - this.dragY;
+      if (!this.dragMoved && Math.hypot(dx, dy) < DRAG_SLOP) return;
       this.dragMoved = true;
-      if (this.detectWobble(point.x)) {
-        this.layout.unpin(this.dragId);
-        this.dragId = null;
-        this.suppressClick = true;
-        this.emitSummary();
-        return;
-      }
-      event.preventSigmaDefault();
-      event.original.preventDefault();
-      event.original.stopPropagation();
-    });
-
-    const endDrag = (): void => {
-      if (!this.dragId) return;
-      if (this.dragMoved) this.suppressClick = true;
-      this.dragId = null;
-      this.dragSamples = [];
-      this.emitSummary();
-    };
-    this.sigma.on('upNode', endDrag);
-    this.sigma.on('upStage', endDrag);
-
-    this.sigma.on('enterEdge', ({ edge, event }) => this.showEdgeTooltip(edge, event.x, event.y));
-    this.sigma.on('leaveEdge', () => this.callbacks.onEdgeTooltip(null));
-  }
-
-  /**
-   * "Quick back-and-forth wobble" = at least three direction reversals inside
-   * `WOBBLE_WINDOW_MS`. Deliberately measured on X only: a wobble is a
-   * horizontal shake, and ignoring Y keeps a normal arcing drag from tripping it.
-   */
-  private detectWobble(x: number): boolean {
-    const now = performance.now();
-    this.dragSamples.push({ t: now, x });
-    this.dragSamples = this.dragSamples.filter((sample) => now - sample.t <= WOBBLE_WINDOW_MS);
-    let reversals = 0;
-    let previousDirection = 0;
-    for (let i = 1; i < this.dragSamples.length; i++) {
-      const delta = this.dragSamples[i]!.x - this.dragSamples[i - 1]!.x;
-      if (Math.abs(delta) < WOBBLE_MIN_SWING) continue;
-      const direction = Math.sign(delta);
-      if (previousDirection !== 0 && direction !== previousDirection) reversals++;
-      previousDirection = direction;
-    }
-    if (reversals < WOBBLE_REVERSALS) return false;
-    this.dragSamples = [];
-    return true;
-  }
-
-  private setHover(id: string | null): void {
-    if (this.hovered === id) return;
-    this.dropLiftedEdges();
-    this.hovered = id;
-    this.highlightNodes = new Set();
-    this.highlightEdges = new Set();
-    if (id && this.model) {
-      this.highlightNodes.add(id);
-      for (const key of this.graph.edges(id)) {
-        this.highlightEdges.add(key);
-        this.highlightNodes.add(this.graph.source(key));
-        this.highlightNodes.add(this.graph.target(key));
-      }
-      this.addLiftedEdges(id);
-    }
-    this.sigma.refresh({ skipIndexation: true });
-  }
-
-  /**
-   * Hover rule: a relation whose far end is inside a collapsed subtree is
-   * invisible under the both-endpoints-visible rule, which makes a collapsed
-   * directory look unconnected. On hover we therefore draw it against the
-   * nearest MOUNTED ancestor of the hidden endpoint, so the user sees where the
-   * node reaches even before expanding.
-   */
-  private addLiftedEdges(id: string): void {
-    const model = this.model;
-    if (!model) return;
-    let budget = 160;
-    for (const edge of model.edgesOf(id)) {
-      if (budget <= 0) break;
-      if (!this.enabledKinds.has(edge.kind)) continue;
-      const source = this.nearestMounted(edge.source);
-      const target = this.nearestMounted(edge.target);
-      if (!source || !target || source === target) continue;
-      if (this.view.byId.has(edge.source) && this.view.byId.has(edge.target)) continue;
-      const key = `${LIFTED_PREFIX}${edge.key}|${source}|${target}`;
-      if (this.graph.hasEdge(key)) continue;
-      const { source: _source, target: _target, ...attributes } = this.relationAttributes(edge);
-      this.graph.addDirectedEdgeWithKey(key, source, target, {
-        ...attributes,
-        size: attributes.size * 0.9,
-      });
-      this.highlightEdges.add(key);
-      this.highlightNodes.add(source);
-      this.highlightNodes.add(target);
-      budget--;
-    }
-  }
-
-  private dropLiftedEdges(): void {
-    for (const key of this.graph.edges()) {
-      if (key.startsWith(LIFTED_PREFIX)) this.graph.dropEdge(key);
-    }
-  }
-
-  private nearestMounted(id: string): string | null {
-    if (this.view.byId.has(id)) return id;
-    const model = this.model;
-    if (!model) return null;
-    for (const ancestor of model.ancestors(id)) {
-      if (this.view.byId.has(ancestor)) return ancestor;
-    }
-    return null;
-  }
-
-  private showEdgeTooltip(key: string, x: number, y: number): void {
-    const model = this.model;
-    if (!model) return;
-    const attributes = this.graph.getEdgeAttributes(key);
-    if (attributes.backbone) {
-      this.callbacks.onEdgeTooltip(null);
+      this.panX += dx;
+      this.panY += dy;
+      this.dragX = position.x;
+      this.dragY = position.y;
+      this.requestDraw();
       return;
     }
-    const edge = attributes.modelKey ? model.edge(attributes.modelKey) : undefined;
-    if (!edge) return;
-    const tooltip: EdgeTooltip = {
-      x,
-      y,
-      kind: edge.kind,
-      sourceName: model.get(edge.source)?.name ?? edge.source,
-      targetName: model.get(edge.target)?.name ?? edge.target,
-      heuristic: edge.heuristic,
-    };
-    if (edge.synthesizedBy) tooltip.synthesizedBy = edge.synthesizedBy;
-    if (edge.registeredAt) tooltip.registeredAt = edge.registeredAt;
-    if (edge.line !== undefined) tooltip.line = edge.line;
-    this.callbacks.onEdgeTooltip(tooltip);
+    if (this.transitionStart > 0) return;
+    this.updateHover(position.x, position.y);
+  };
+
+  private readonly onPointerDown = (event: PointerEvent): void => {
+    if (event.button !== 0) return;
+    const position = this.pointerPosition(event);
+    this.dragging = true;
+    this.dragMoved = false;
+    this.dragX = position.x;
+    this.dragY = position.y;
+    // Capture so a pan that leaves the canvas keeps tracking. Both calls are
+    // guarded: releasing a pointer the browser already released throws.
+    try {
+      this.canvas.setPointerCapture(event.pointerId);
+    } catch {
+      /* capture is an optimisation, not a requirement */
+    }
+  };
+
+  private readonly onPointerUp = (event: PointerEvent): void => {
+    if (!this.dragging) return;
+    this.dragging = false;
+    this.suppressClick = this.dragMoved;
+    try {
+      this.canvas.releasePointerCapture(event.pointerId);
+    } catch {
+      /* already released (pointercancel) */
+    }
+  };
+
+  private readonly onPointerLeave = (): void => {
+    this.dragging = false;
+    this.setHover(null, null);
+  };
+
+  private readonly onClick = (event: MouseEvent): void => {
+    if (this.suppressClick) {
+      this.suppressClick = false;
+      return;
+    }
+    // A click landing mid-transition would be hit-tested against the settled
+    // geometry while the user is looking at the animating one. It also makes
+    // the second click of a double-click on a directory re-root twice.
+    if (this.transitionStart > 0) return;
+    const model = this.model;
+    const layout = this.layout;
+    if (!model || !layout) return;
+    const position = this.pointerPosition(event);
+    const world = this.toWorld(position.x, position.y);
+
+    if (Math.hypot(world.x, world.y) <= layout.centreRadius) {
+      this.rootUp();
+      return;
+    }
+
+    const arc = arcAt(layout, world.x, world.y);
+    if (!arc) {
+      this.selected = null;
+      this.edgesDirty = true;
+      this.requestDraw();
+      this.callbacks.onSelect(null);
+      return;
+    }
+
+    if (!arc.nodeId) {
+      // A `+N smaller` arc: re-rooting onto its parent gives the folded
+      // children the full circle. At ring 1 the parent IS the root, so there is
+      // nowhere further to go — ⌘P is the way in, and the tooltip says so.
+      if (arc.parentNodeId !== this.rootId) this.setRoot(arc.parentNodeId);
+      return;
+    }
+
+    const node = model.get(arc.nodeId);
+    if (!node) return;
+    if (node.kind === DIRECTORY_KIND) {
+      this.setRoot(node.id);
+      return;
+    }
+    this.selected = node.id;
+    this.edgesDirty = true;
+    this.requestDraw();
+    this.callbacks.onSelect(node);
+  };
+
+  /** Double-click drills into anything with children — files included. */
+  private readonly onDoubleClick = (event: MouseEvent): void => {
+    const layout = this.layout;
+    const model = this.model;
+    if (!layout || !model) return;
+    // Double-clicking a DIRECTORY already re-rooted on the first click; the
+    // arc now under the cursor belongs to a different level entirely.
+    if (performance.now() - this.rootChangedAt < 450) return;
+    const position = this.pointerPosition(event);
+    const world = this.toWorld(position.x, position.y);
+    const arc = arcAt(layout, world.x, world.y);
+    if (!arc?.nodeId) return;
+    if (model.childrenOf(arc.nodeId).length === 0) return;
+    this.setRoot(arc.nodeId);
+  };
+
+  private readonly onWheel = (event: WheelEvent): void => {
+    event.preventDefault();
+    const position = this.pointerPosition(event);
+    const before = this.toWorld(position.x, position.y);
+    const factor = Math.exp(-event.deltaY * 0.0015);
+    const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, this.zoom * factor));
+    if (next === this.zoom) return;
+    this.zoom = next;
+    // Keep the world point under the cursor pinned to the cursor.
+    const centre = this.centre();
+    const scale = this.scale();
+    this.panX = position.x - before.x * scale - centre.x;
+    this.panY = position.y - before.y * scale - centre.y;
+    this.requestDraw();
+    this.emitSummary();
+  };
+
+  private updateHover(screenX: number, screenY: number): void {
+    const layout = this.layout;
+    if (!layout) return;
+    const world = this.toWorld(screenX, screenY);
+
+    // Edges are only hit-tested among the ones already on screen, and they do
+    // NOT steal the arc hover — otherwise hovering an arc would reveal an edge
+    // under the cursor, drop the arc hover, hide the edge, and loop forever.
+    let edgeKey: string | null = null;
+    if (this.drawnEdges.length > 0) {
+      const tolerance = 5 / this.scale();
+      let best = tolerance;
+      for (const drawn of this.drawnEdges) {
+        const distance = distanceToPolyline(drawn.points, world.x, world.y);
+        if (distance < best) {
+          best = distance;
+          edgeKey = drawn.edge.key;
+        }
+      }
+    }
+
+    const radius = Math.hypot(world.x, world.y);
+    const arcKey =
+      radius <= layout.centreRadius ? CENTRE_KEY : (arcAt(layout, world.x, world.y)?.key ?? null);
+    this.setHover(arcKey, edgeKey, screenX, screenY);
   }
 
-  // ---------------------------------------------------------------- summary --
+  /**
+   * Hover is only published when the TARGET changes, never on every pointer
+   * move: a tooltip that re-renders the React chrome 60 times a second is how
+   * a canvas app ends up feeling slower than the canvas is.
+   */
+  private setHover(arcKey: string | null, edgeKey: string | null, x = 0, y = 0): void {
+    const arcChanged = arcKey !== this.hoveredKey;
+    const edgeChanged = edgeKey !== this.hoveredEdgeKey;
+    if (!arcChanged && !edgeChanged) return;
+    this.hoveredKey = arcKey;
+    this.hoveredEdgeKey = edgeKey;
+    this.canvas.style.cursor = arcKey ? 'pointer' : 'default';
+    if (arcChanged) this.edgesDirty = true;
+    this.emitTooltips(x, y);
+    this.requestDraw();
+  }
+
+  private emitTooltips(x: number, y: number): void {
+    const model = this.model;
+    const layout = this.layout;
+    if (!model || !layout) return;
+
+    if (this.hoveredEdgeKey) {
+      const edge = model.edgeByKey.get(this.hoveredEdgeKey);
+      if (edge) {
+        const tooltip: EdgeTooltip = {
+          x,
+          y,
+          kind: edge.kind,
+          sourceName: model.get(edge.source)?.name ?? edge.source,
+          targetName: model.get(edge.target)?.name ?? edge.target,
+          heuristic: edge.heuristic,
+        };
+        if (edge.synthesizedBy) tooltip.synthesizedBy = edge.synthesizedBy;
+        if (edge.registeredAt) tooltip.registeredAt = edge.registeredAt;
+        if (edge.line !== undefined) tooltip.line = edge.line;
+        this.callbacks.onEdgeTooltip(tooltip);
+        this.callbacks.onArcTooltip(null);
+        return;
+      }
+    }
+    this.callbacks.onEdgeTooltip(null);
+
+    if (!this.hoveredKey || this.hoveredKey === CENTRE_KEY) {
+      this.callbacks.onArcTooltip(null);
+      return;
+    }
+    const arc = layout.byKey.get(this.hoveredKey);
+    if (!arc) {
+      this.callbacks.onArcTooltip(null);
+      return;
+    }
+    const node = arc.nodeId ? model.get(arc.nodeId) : undefined;
+    const tooltip: ArcTooltip = {
+      x,
+      y,
+      name: node?.name ?? arc.label,
+      path: node?.file ?? '',
+      kind: node?.kind ?? AGGREGATE_KIND,
+      loc: arc.weight,
+      aggregate: !arc.nodeId,
+      hiddenChildren: arc.hiddenChildren,
+    };
+    if (node?.layer) tooltip.layer = node.layer;
+    this.callbacks.onArcTooltip(tooltip);
+  }
+
+  // -------------------------------------------------------------- summary ---
 
   private emitSummary(): void {
     const model = this.model;
-    if (!model) return;
+    const layout = this.layout;
+    if (!model || !layout) return;
     const present = new Set<string>();
-    let satellites = 0;
-    for (const mounted of this.view.nodes) {
-      if (mounted.satellite) satellites++;
-      const node = model.get(mounted.id);
+    for (const arc of layout.arcs) {
+      if (!arc.nodeId) continue;
+      const node = model.get(arc.nodeId);
       if (!node) continue;
       present.add(this.colorMode === 'layer' ? (node.layer ?? '') : node.kind);
     }
-    let visibleEdges = 0;
-    for (const key of this.graph.edges()) {
-      if (!key.startsWith(BACKBONE_PREFIX)) visibleEdges++;
-    }
+    this.emittedEdges = this.drawnEdges.length;
     this.callbacks.onViewChange({
-      mounted: this.view.nodes.length,
-      primaries: this.view.nodes.length - satellites,
-      satellites,
-      visibleEdges,
-      hiddenByBudget: this.view.truncated,
+      arcs: layout.arcs.length,
+      rings: layout.rings,
+      truncated: layout.truncated,
+      visibleEdges: this.drawnEdges.length,
       presentColorKeys: [...present],
-      expandedCount: this.expanded.size,
-      pinnedCount: this.layout.pinnedIds().length,
       edgeKinds: [...model.edgeKinds],
       enabledKinds: [...this.enabledKinds],
+      breadcrumb: layout.trail.map((node) => ({ id: node.id, name: node.name })),
+      zoom: this.zoom,
     });
   }
 }
 
-/** A halo's id maps back to the node it decorates; anything else is itself. */
-function baseNode(id: string): string {
-  return id.startsWith(HALO_PREFIX) ? id.slice(HALO_PREFIX.length) : id;
-}
+/** Pseudo arc key for the centre disk, so hover has one vocabulary. */
+const CENTRE_KEY = '@centre';
 
-/** `#rrggbb` → `rgba(...)`, used for the hover dim. */
+/** The render budget, re-exported so the chrome can show `arcs / budget`. */
+export { MAX_ARCS as ARC_BUDGET };
+
+/** `#rrggbb` (or `rgba(...)`) → `rgba(...)` at the given alpha. */
 function withAlpha(color: string, alpha: number): string {
   if (color.startsWith('rgba(')) {
     return color.replace(/rgba\(([^,]+),([^,]+),([^,]+),[^)]+\)/, `rgba($1,$2,$3,${alpha})`);
@@ -1057,4 +1158,27 @@ function withAlpha(color: string, alpha: number): string {
   const g = (value >> 8) & 255;
   const b = value & 255;
   return `rgba(${r},${g},${b},${alpha})`;
+}
+
+/** Dark ink on a bright arc, light ink on a dark one. */
+function readableOn(color: string): string {
+  if (!color.startsWith('#') || color.length !== 7) return '#e6edf7';
+  const value = Number.parseInt(color.slice(1), 16);
+  const r = (value >> 16) & 255;
+  const g = (value >> 8) & 255;
+  const b = value & 255;
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.6 ? '#0b1220' : '#eef4ff';
+}
+
+/**
+ * Longest prefix of `text` that fits `maxWidth`, ellipsised — or `''` when
+ * nothing legible fits (a lone `…` is noise, not information).
+ */
+function fitText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return '';
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let cut = text.length - 1;
+  while (cut > 1 && ctx.measureText(`${text.slice(0, cut)}…`).width > maxWidth) cut--;
+  return cut > 1 ? `${text.slice(0, cut)}…` : '';
 }

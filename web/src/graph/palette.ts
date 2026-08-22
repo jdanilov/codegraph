@@ -2,9 +2,11 @@
  * Colour + size encoding for the canvas.
  *
  * Contract (`docs/design/visualizer.md`, "Visual language"): colour is a
- * switchable MODE — node kind or layer — and size is LoC for directories and
- * files, span length for symbols. Keep the two modes visually distinct: kinds
- * are a hand-picked semantic palette, layers a generated hue ramp.
+ * switchable MODE — node kind or layer — and is applied as the ARC FILL of the
+ * sunburst. Size is not a colour concern any more: an entry's LoC is its
+ * angular extent, which the layout owns (`sunburst.ts`). Keep the two modes
+ * visually distinct: kinds are a hand-picked semantic palette, layers a
+ * generated hue ramp.
  */
 import { DIRECTORY_KIND, type ModelNode } from './model';
 
@@ -140,24 +142,3 @@ export function colorForEdgeKind(kind: string): string {
   return EDGE_COLORS[kind] ?? '#7c8aa0';
 }
 
-/** The backbone (`contains`) is structure, not data — draw it quietly. */
-export const BACKBONE_COLOR = 'rgba(150, 170, 200, 0.34)';
-export const BACKBONE_SATELLITE_COLOR = 'rgba(150, 170, 200, 0.2)';
-
-/**
- * Radius in graph units. Square-root so a 5,000-LoC directory reads as bigger
- * than a 500-LoC one without swallowing the screen.
- */
-export function radiusForNode(node: ModelNode): number {
-  if (node.kind === DIRECTORY_KIND) {
-    return clamp(9 + 2.6 * Math.sqrt(node.weight), 10, 44);
-  }
-  if (node.kind === 'file') {
-    return clamp(6 + 1.5 * Math.sqrt(node.weight), 7, 26);
-  }
-  return clamp(4 + 1.15 * Math.sqrt(node.weight), 4.5, 18);
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}

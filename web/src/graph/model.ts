@@ -2,8 +2,8 @@
  * In-memory model of `GET /api/graph`, indexed for the canvas.
  *
  * The payload is 15k+ nodes on a real project and the renderer budget is 2k, so
- * the model deliberately lives OUTSIDE sigma: it owns the whole graph, and the
- * canvas mounts only the slice the user has expanded (see `view.ts`).
+ * the model deliberately lives OUTSIDE the renderer: it owns the whole graph,
+ * and the canvas draws only the rings below the current root (`sunburst.ts`).
  *
  * Two structures matter here:
  *
@@ -67,7 +67,7 @@ export interface ModelEdge {
   line?: number;
 }
 
-/** Name-first ordering; A ends up at the top of an expanded fan. */
+/** Name-first ordering — a stable tiebreak; the disk sorts by size. */
 function byName(a: ModelNode, b: ModelNode): number {
   const compared = a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
   return compared !== 0 ? compared : a.id.localeCompare(b.id);
