@@ -43,6 +43,25 @@ export interface ResolvedRef {
   confidence: number;
   /** How it was resolved */
   resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path' | 'function-ref';
+  /**
+   * Optional edge-level annotations a resolver may attach to the edge this
+   * reference becomes.
+   *
+   * Exists because a resolver that bridges DYNAMIC dispatch produces an
+   * inference, not an AST fact, and had no way to say so: `provenance` and
+   * `metadata.synthesizedBy` were writable only by the whole-graph synthesizer
+   * passes. An edge that is really a heuristic must be able to admit it
+   * wherever synthesized edges are surfaced — otherwise a guess renders
+   * identically to a parsed call, which is exactly the honesty the synthesized
+   * edge convention exists to preserve.
+   *
+   * `metadata` here is merged UNDER the resolver's own keys (confidence,
+   * resolvedBy, refName), so it can annotate but never overwrite them.
+   */
+  edge?: {
+    provenance?: import('../types').Edge['provenance'];
+    metadata?: Record<string, unknown>;
+  };
 }
 
 /**
@@ -188,6 +207,28 @@ export interface FrameworkExtractionResult {
   nodes: Node[];
   /** Framework-specific unresolved references (e.g. route -> handler) */
   references: UnresolvedRef[];
+  /**
+   * Re-attribute this file's FILE-SCOPE references to the nodes returned above,
+   * by line span. Off by default — today's behavior exactly.
+   *
+   * Why this exists: reference attribution is a stack walked during extraction
+   * (`fromNodeId` = innermost open symbol), and the file node is its floor. A
+   * construct core does not extract — an object literal whose members are the
+   * module's real API, say — opens no frame, so every call inside it is
+   * attributed to the FILE. The graph then says "this file calls X" where the
+   * truth is "this member calls X".
+   *
+   * A resolver that mints nodes for such a construct runs AFTER the walk and
+   * cannot join that stack, so it cannot fix the attribution at the source. It
+   * can only ask for it to be corrected afterwards, which is what this flag
+   * does: refs are MOVED, never copied, so no edge is duplicated and the total
+   * reference count is unchanged.
+   *
+   * Opt-in because it would otherwise silently retarget references for every
+   * existing framework resolver that emits spanned nodes (route nodes and the
+   * like), quietly changing callers/impact for projects that never asked for it.
+   */
+  reattributeFileScopeRefs?: boolean;
 }
 
 /**

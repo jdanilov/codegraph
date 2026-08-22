@@ -6761,6 +6761,10 @@ export function extractFromSource(
     }
   }
 
+  // Nodes from resolvers that asked for file-scope refs inside their spans to
+  // be re-attributed to them. Empty for every resolver that didn't opt in.
+  const reattributionSpans: Node[] = [];
+
   // Framework-specific extraction (routes, middleware, etc.)
   if (frameworkNames && frameworkNames.length > 0) {
     const allResolvers = getAllFrameworkResolvers();
@@ -6774,6 +6778,10 @@ export function extractFromSource(
         const fwResult = fw.extract(filePath, source);
         result.nodes.push(...fwResult.nodes);
         result.unresolvedReferences.push(...fwResult.references);
+        // Opt-in only (see FrameworkExtractionResult.reattributeFileScopeRefs).
+        if (fwResult.reattributeFileScopeRefs && fwResult.nodes.length > 0) {
+          reattributionSpans.push(...fwResult.nodes);
+        }
       } catch (err) {
         result.errors.push({
           message: `Framework extractor '${fw.name}' failed: ${
@@ -6786,5 +6794,48 @@ export function extractFromSource(
     }
   }
 
+  reattributeFileScopeRefs(result, filePath, reattributionSpans);
+
   return result;
+}
+
+/**
+ * Move this file's FILE-SCOPE references onto the innermost opted-in node whose
+ * line span contains them.
+ *
+ * Only refs currently attributed to `file:<path>` are eligible: anything core
+ * already placed on a real symbol was attributed by the extraction stack, which
+ * is strictly better information than a line-span guess. Refs are MOVED, so no
+ * edge is duplicated and the file's reference count is conserved.
+ *
+ * "Innermost" = smallest containing span, so nested constructs attribute to the
+ * nearest enclosing member rather than an outer one. Ties (identical spans) keep
+ * the first node — a resolver emitting two nodes over the same range is already
+ * ambiguous, and picking either consistently beats splitting the refs.
+ *
+ * No-op when no resolver opted in, which is the default for all of them.
+ */
+function reattributeFileScopeRefs(
+  result: ExtractionResult,
+  filePath: string,
+  spans: Node[]
+): void {
+  if (spans.length === 0 || result.unresolvedReferences.length === 0) return;
+
+  const fileNodeId = `file:${filePath}`;
+  // Ascending by span size: the first match is the innermost containing node.
+  const sorted = spans
+    .filter((n) => n.endLine >= n.startLine)
+    .sort((a, b) => a.endLine - a.startLine - (b.endLine - b.startLine));
+  if (sorted.length === 0) return;
+
+  for (const ref of result.unresolvedReferences) {
+    if (ref.fromNodeId !== fileNodeId) continue;
+    for (const node of sorted) {
+      if (ref.line >= node.startLine && ref.line <= node.endLine) {
+        ref.fromNodeId = node.id;
+        break;
+      }
+    }
+  }
 }

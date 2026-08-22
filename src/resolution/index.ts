@@ -1099,7 +1099,15 @@ export class ReferenceResolver {
         kind,
         line: ref.original.line,
         column: ref.original.column,
+        // A resolver that bridged dynamic dispatch can mark its edge as the
+        // inference it is (`provenance:'heuristic'`); everything else stays
+        // undefined, i.e. a plain parsed edge, exactly as before.
+        provenance: ref.edge?.provenance,
         metadata: {
+          // Resolver-supplied annotations go FIRST so the fields below always
+          // win — an edge can be annotated but never have its confidence,
+          // strategy, or refName rewritten out from under the resolver.
+          ...(ref.edge?.metadata ?? {}),
           confidence: ref.confidence,
           resolvedBy: ref.resolvedBy,
           // The ORIGINAL reference text (and kind, when edge-kind promotion
