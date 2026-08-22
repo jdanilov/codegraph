@@ -33,6 +33,7 @@ import { noopPlugin } from './noop';
 import { namespaceProxyPlugin } from './namespace-proxy';
 import { layerChainPlugin } from './layer-chain';
 import { eventBusPlugin } from './event-bus';
+import { objectLiteralMembersPlugin } from './object-literal-members';
 
 /**
  * Every in-tree plugin, in registration order. Appended to the built-in
@@ -43,6 +44,7 @@ export const PLUGIN_RESOLVERS: readonly FrameworkResolver[] = [
   namespaceProxyPlugin,
   layerChainPlugin,
   eventBusPlugin,
+  objectLiteralMembersPlugin,
 ];
 
 export {
@@ -63,3 +65,9 @@ export {
 export { namespaceProxyPlugin, NAMESPACE_PROXY_PLUGIN_NAME } from './namespace-proxy';
 export { layerChainPlugin, LAYER_CHAIN_PLUGIN_NAME } from './layer-chain';
 export { eventBusPlugin, EVENT_BUS_PLUGIN_NAME } from './event-bus';
+export {
+  objectLiteralMembersPlugin,
+  OBJECT_LITERAL_MEMBERS_PLUGIN_NAME,
+  resetObjectLiteralMembersState,
+  type ObjectLiteralMembersOptions,
+} from './object-literal-members';
