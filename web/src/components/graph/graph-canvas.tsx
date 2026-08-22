@@ -7,7 +7,9 @@
  * and 1,000+ position writes per frame — never touches React state.
  *
  * PHASE C: `renderDetail` swaps the stub selection card body for the real info
- * panel, and `onSelect` lets an outer panel follow the canvas selection.
+ * panel, `onSelect` lets an outer panel follow the canvas selection, and
+ * `onController` hands the shell the imperative handle Cmd+P needs to reveal a
+ * node (expand its ancestors, select it, fly the camera to it).
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Crosshair, Layers, Pin } from 'lucide-react';
@@ -44,9 +46,11 @@ export interface GraphCanvasProps {
   /** Rendered inside the selection card; phase C's info panel plugs in here. */
   renderDetail?(node: ModelNode): ReactNode;
   onSelect?(node: ModelNode | null): void;
+  /** Published on mount and nulled on unmount — the shell's imperative handle. */
+  onController?(controller: CanvasController | null): void;
 }
 
-export function GraphCanvas({ model, renderDetail, onSelect }: GraphCanvasProps) {
+export function GraphCanvas({ model, renderDetail, onSelect, onController }: GraphCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const controllerRef = useRef<CanvasController | null>(null);
   const [summary, setSummary] = useState<ViewSummary>(EMPTY_SUMMARY);
@@ -56,6 +60,8 @@ export function GraphCanvas({ model, renderDetail, onSelect }: GraphCanvasProps)
   const lastRoot = useRef<string | null>(null);
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
+  const onControllerRef = useRef(onController);
+  onControllerRef.current = onController;
 
   useEffect(() => {
     const container = containerRef.current;
@@ -69,8 +75,10 @@ export function GraphCanvas({ model, renderDetail, onSelect }: GraphCanvasProps)
       onEdgeTooltip: setTooltip,
     });
     controllerRef.current = controller;
+    onControllerRef.current?.(controller);
     return () => {
       controllerRef.current = null;
+      onControllerRef.current?.(null);
       controller.destroy();
     };
   }, []);

@@ -11,6 +11,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
+import { execFileSync } from 'child_process';
 
 import CodeGraph from '../src/index';
 import { startUiServer, type UiServer } from '../src/ui-server';
@@ -20,8 +21,20 @@ import { mergeSettings, settingsView } from '../src/ui-server/settings';
 
 let projectRoot: string;
 let emptyRoot: string;
+let gitRoot: string;
 let server: UiServer;
 let emptyServer: UiServer;
+let gitServer: UiServer;
+
+/** `mode=diff` needs a real git; skip those cases on a machine without one. */
+const hasGit = (() => {
+  try {
+    execFileSync('git', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+})();
 
 async function getJson(base: string, route: string, init?: RequestInit): Promise<{ status: number; body: any; headers: Headers }> {
   const response = await fetch(`${base}${route}`, init);
@@ -49,14 +62,41 @@ beforeAll(async () => {
 
   emptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-ui-empty-'));
 
+  // A git-backed fixture for `mode=diff`: one committed file with uncommitted
+  // edits near the top and untouched lines further down, plus an untracked one.
+  gitRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-ui-git-'));
+  if (hasGit) {
+    fs.mkdirSync(path.join(gitRoot, 'src'), { recursive: true });
+    const committed = ['export function tracked(): number {', '  return 1;', '}', ''];
+    for (let line = 4; line < 60; line++) committed.push(`// filler ${line}`);
+    fs.writeFileSync(path.join(gitRoot, 'src', 'tracked.ts'), committed.join('\n') + '\n');
+    const git = (...args: string[]): void => {
+      execFileSync('git', args, { cwd: gitRoot, stdio: 'ignore' });
+    };
+    git('init', '-q');
+    git('config', 'user.email', 'test@example.invalid');
+    git('config', 'user.name', 'Test');
+    git('config', 'commit.gpgsign', 'false');
+    git('add', '-A');
+    git('-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'initial');
+
+    const edited = [...committed];
+    edited[1] = '  return 2;';
+    edited.splice(2, 0, '  // a new line');
+    fs.writeFileSync(path.join(gitRoot, 'src', 'tracked.ts'), edited.join('\n') + '\n');
+    fs.writeFileSync(path.join(gitRoot, 'src', 'fresh.ts'), 'export const fresh = 1;\nexport const other = 2;\n');
+  }
+
   server = await startUiServer({ projectRoot, port: 0 });
   emptyServer = await startUiServer({ projectRoot: emptyRoot, port: 0 });
+  gitServer = await startUiServer({ projectRoot: gitRoot, port: 0 });
 }, 120_000);
 
 afterAll(async () => {
   await server?.close();
   await emptyServer?.close();
-  for (const dir of [projectRoot, emptyRoot]) {
+  await gitServer?.close();
+  for (const dir of [projectRoot, emptyRoot, gitRoot]) {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
     } catch {
@@ -168,11 +208,61 @@ describe('GET /api/source', () => {
     expect(body.error.code).toBe('forbidden');
   });
 
-  it('501s diff mode with the contract shape', async () => {
+  it('409s diff mode on a root that is not a git work tree', async () => {
     const { status, body } = await getJson(server.url, '/api/source?file=src/alpha.ts&mode=diff');
-    expect(status).toBe(501);
-    expect(body.error.code).toBe('not_implemented');
+    expect(status).toBe(409);
+    expect(body.error.code).toBe('conflict');
+    // The 409 still carries the diff shape, so a client has one parse path.
+    expect(body.git).toBe(false);
     expect(body.hunks).toEqual([]);
+  });
+});
+
+describe('GET /api/source?mode=diff', () => {
+  it.runIf(hasGit)('returns hunks overlapping the span for a modified file', async () => {
+    const { status, body } = await getJson(gitServer.url, '/api/source?file=src/tracked.ts&start=1&end=6&mode=diff');
+    expect(status).toBe(200);
+    expect(body.mode).toBe('diff');
+    expect(body.git).toBe(true);
+    expect(body.status).toBe('modified');
+    expect(body.hunks.length).toBeGreaterThan(0);
+    const kinds = body.hunks.flatMap((hunk: any) => hunk.lines.map((line: any) => line.type));
+    expect(kinds).toContain('add');
+    expect(kinds).toContain('del');
+    const hunk = body.hunks[0];
+    expect(typeof hunk.oldStart).toBe('number');
+    expect(typeof hunk.newLines).toBe('number');
+  });
+
+  it.runIf(hasGit)('reports the whole span as added for an untracked file', async () => {
+    const { status, body } = await getJson(gitServer.url, '/api/source?file=src/fresh.ts&start=1&end=3&mode=diff');
+    expect(status).toBe(200);
+    expect(body.status).toBe('untracked');
+    expect(body.hunks).toHaveLength(1);
+    expect(body.hunks[0].oldLines).toBe(0);
+    expect(body.hunks[0].lines.every((line: any) => line.type === 'add')).toBe(true);
+  });
+
+  it.runIf(hasGit)('returns no hunks for a span that nothing touched', async () => {
+    const { status, body } = await getJson(
+      gitServer.url,
+      '/api/source?file=src/tracked.ts&start=40&end=60&mode=diff'
+    );
+    expect(status).toBe(200);
+    expect(body.hunks).toEqual([]);
+    expect(body.hunksOutsideSpan).toBeGreaterThan(0);
+  });
+
+  it.runIf(hasGit)('returns every hunk when no span is given', async () => {
+    const { status, body } = await getJson(gitServer.url, '/api/source?file=src/tracked.ts&mode=diff');
+    expect(status).toBe(200);
+    expect(body.hunks.length).toBeGreaterThan(0);
+    expect(body.hunksOutsideSpan).toBe(0);
+  });
+
+  it.runIf(hasGit)('refuses a path that escapes the project root', async () => {
+    const { status } = await getJson(gitServer.url, '/api/source?file=../../etc/hosts&mode=diff');
+    expect(status).toBe(403);
   });
 });
 

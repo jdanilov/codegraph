@@ -56,7 +56,7 @@
     -webkit-font-smoothing: antialiased;
   }
 
-  /* Faint grid: the canvas the graph will be drawn on in phase B. */
+  /* Faint grid: the canvas the graph is drawn on. */
   #root {
     background-image:
       radial-gradient(circle at 20% 0%, color-mix(in oklab, var(--accent) 12%, transparent), transparent 45%),
@@ -64,5 +64,85 @@
       linear-gradient(90deg, var(--border) 1px, transparent 1px);
     background-size: 100% 100%, 48px 48px, 48px 48px;
     background-position: 0 0, -1px -1px, -1px -1px;
+  }
+}
+
+/**
+ * Syntax colours for the source view.
+ *
+ * highlight.js ships dozens of themes as CSS files; none of them are written
+ * against this palette, and importing one would drag a second colour system
+ * into the app. These few rules cover every token class `lib/common` emits and
+ * stay inside the surface's own hues.
+ */
+@layer components {
+  .hljs-code {
+    color: color-mix(in oklab, var(--foreground) 88%, transparent);
+  }
+
+  .hljs-comment,
+  .hljs-quote {
+    color: color-mix(in oklab, var(--muted) 85%, transparent);
+    font-style: italic;
+  }
+
+  .hljs-keyword,
+  .hljs-selector-tag,
+  .hljs-literal,
+  .hljs-doctag,
+  .hljs-meta .hljs-keyword {
+    color: oklch(0.78 0.12 320);
+  }
+
+  .hljs-string,
+  .hljs-regexp,
+  .hljs-template-variable,
+  .hljs-addition {
+    color: oklch(0.83 0.13 145);
+  }
+
+  .hljs-number,
+  .hljs-symbol,
+  .hljs-bullet,
+  .hljs-link {
+    color: oklch(0.82 0.12 60);
+  }
+
+  .hljs-title,
+  .hljs-title.class_,
+  .hljs-title.function_,
+  .hljs-section,
+  .hljs-name,
+  .hljs-selector-id,
+  .hljs-selector-class {
+    color: oklch(0.84 0.11 230);
+  }
+
+  .hljs-attr,
+  .hljs-attribute,
+  .hljs-variable,
+  .hljs-property,
+  .hljs-params,
+  .hljs-template-tag {
+    color: oklch(0.86 0.07 200);
+  }
+
+  .hljs-type,
+  .hljs-built_in,
+  .hljs-class .hljs-title,
+  .hljs-meta {
+    color: oklch(0.83 0.1 90);
+  }
+
+  .hljs-deletion {
+    color: oklch(0.75 0.15 20);
+  }
+
+  .hljs-emphasis {
+    font-style: italic;
+  }
+
+  .hljs-strong {
+    font-weight: 600;
   }
 }

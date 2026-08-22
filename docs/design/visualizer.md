@@ -127,6 +127,61 @@ open. Phase C/D can rely on them:
   `renderDetail(node)` replaces the stub body of the floating selection card;
   `onSelect` publishes the canvas selection to the shell.
 
+### Phase C clarifications (additive — no contract item changed)
+
+The panels implemented in phase C fix the shape of `mode=diff` and the canvas
+handles the shell drives. Phase D can rely on them:
+
+- **`GET /api/source?mode=diff` response shape.** `200` with
+
+  ```jsonc
+  {
+    "file": "src/services/store.ts",
+    "mode": "diff",
+    "startLine": 8, "endLine": 16,   // present only when a span was requested
+    "status": "modified",            // modified | added | deleted | untracked | unchanged
+    "hunks": [
+      {
+        "oldStart": 7, "oldLines": 6,
+        "newStart": 7, "newLines": 8,
+        "heading": "export class ItemStore {",  // git's enclosing-symbol hint, optional
+        "lines": [{ "type": "ctx", "text": "  private items: Item[] = [];" },
+                  { "type": "add", "text": "    // new line" }]   // ctx | add | del
+      }
+    ],
+    "hunksOutsideSpan": 0,   // hunks the file has but the span doesn't touch
+    "binary": false,
+    "truncated": false,
+    "git": true
+  }
+  ```
+
+  Diffs are against `HEAD` (so staged and unstaged changes both show), three
+  context lines, `\ No newline at end of file` markers dropped.
+- **Hunks are filtered by OVERLAP and returned WHOLE.** A hunk is kept when its
+  new-side line range intersects `[start, end]`; it is never trimmed, because
+  cutting lines out of a hunk would invalidate its own `oldStart`/`newStart`
+  accounting. Omitting `start`/`end` returns every hunk in the file. A deleted
+  file's hunks are never span-filtered (there is no new side to filter on).
+- **Untracked file → the whole requested span as one `add` hunk**
+  (`oldStart: 0, oldLines: 0`), which is the truth relative to `HEAD`. A repo
+  with no commits yet reports every file the same way with `status: "added"`.
+- **Non-git root → `409`**, and the body still carries the full diff shape with
+  `git: false` and `hunks: []`, so a client has one parse path for both answers
+  (same principle as phase A's 501 stubs). `403` for a path outside the root,
+  `404` for a missing file.
+- **`CanvasController` additions** (phase D needs all three):
+  `getExpanded(): Set<string>` / `setExpanded(ids)` — read and restore the
+  expansion set, the setter applying the whole set in ONE re-mount — and
+  `reveal(id)`, which expands the node's ancestors (never the node itself),
+  selects it, fires `onSelect`, and animates the camera onto it once the layout
+  settles. `<GraphCanvas onController={…}>` publishes the controller to the
+  shell.
+- **Node panel data.** `/api/node/:id` has no row for a `dirs[]` entry, so
+  directories are answered from the client-side model instead of fetched.
+  The panel renders the `source` block the node payload already carries, so
+  opening one costs a single request.
+
 Standing views (always-present cards, client-side): **Project** (whole graph)
 and **Changes** (`/api/changes`, refreshed on `dataVersion` change).
 

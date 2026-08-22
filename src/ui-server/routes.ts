@@ -34,6 +34,7 @@ import {
   sendNotImplemented,
 } from './http';
 import { initProject, runIndexSubprocess, type IndexEvent } from './indexer';
+import { readSourceDiff } from './diff';
 import { readSourceSpan } from './source';
 import { mergeSettings, readSettings, settingsView, writeSettings } from './settings';
 import type { UiServerState } from './state';
@@ -276,20 +277,14 @@ export class ApiRouter {
       return sendError(res, 400, { code: 'bad_request', message: 'Missing "file" parameter' });
     }
     const mode = queryParam(url, 'mode') ?? 'full';
-    if (mode === 'diff') {
-      return sendNotImplemented(
-        res,
-        'Diff mode is not implemented yet.',
-        { file, mode: 'diff', hunks: [] },
-        'D'
-      );
-    }
-    if (mode !== 'full') {
+    if (mode !== 'full' && mode !== 'diff') {
       return sendError(res, 400, { code: 'bad_request', message: `Unknown mode: ${mode}` });
     }
 
     const start = queryParam(url, 'start') === undefined ? undefined : intParam(url, 'start', 1);
     const end = queryParam(url, 'end') === undefined ? undefined : intParam(url, 'end', 0);
+    if (mode === 'diff') return this.sourceDiff(res, file, start, end);
+
     const result = readSourceSpan(this.state.projectRoot, file, start, end);
     if (result.ok) return sendJson(res, 200, result.span);
 
@@ -303,6 +298,42 @@ export class ApiRouter {
         return sendError(res, 404, { code: 'not_found', message: `No such file: ${file}` });
       case 'too_large':
         return sendError(res, 413, { code: 'payload_too_large', message: 'File is too large to read' });
+      default:
+        return sendError(res, 500, { code: 'internal', message: result.message });
+    }
+  }
+
+  /**
+   * `mode=diff`: hunks versus `HEAD`, filtered to the requested span.
+   *
+   * A project that isn't in git answers `409` — but the body still carries the
+   * contract's diff shape (with `git: false`), so the client can render "no
+   * version control" from the same parse path it uses for a real answer.
+   */
+  private sourceDiff(
+    res: ServerResponse,
+    file: string,
+    start: number | undefined,
+    end: number | undefined
+  ): void {
+    const result = readSourceDiff(this.state.projectRoot, file, start, end);
+    if (result.ok) return sendJson(res, 200, { ...result.diff, git: true });
+
+    switch (result.reason) {
+      case 'outside_root':
+        return sendError(res, 403, {
+          code: 'forbidden',
+          message: 'Path resolves outside the project root',
+        });
+      case 'not_found':
+        return sendError(res, 404, { code: 'not_found', message: `No such file: ${file}` });
+      case 'not_git':
+        return sendError(
+          res,
+          409,
+          { code: 'conflict', message: result.message },
+          { file, mode: 'diff', hunks: [], git: false, status: 'unchanged', hunksOutsideSpan: 0 }
+        );
       default:
         return sendError(res, 500, { code: 'internal', message: result.message });
     }

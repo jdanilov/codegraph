@@ -1,11 +1,12 @@
 /**
  * Minimal selection readout.
  *
- * PHASE C MOUNT POINT — this is the stub the contract asks phase B to leave
- * behind: name / kind / file only. Phase C replaces the body with the real info
- * panel (`GET /api/node/:id`: contained nodes, in/out edges, source, editor
- * jump) by passing `renderDetail` to `<GraphCanvas>`; the selection lifecycle,
- * positioning and dismissal below stay as they are.
+ * Phase B left this as a stub (name / kind / file); phase C fills the body with
+ * the real info panel (`GET /api/node/:id`: contained nodes, in/out edges,
+ * source, editor jump) through `renderDetail` on `<GraphCanvas>`. The selection
+ * lifecycle, positioning and dismissal are unchanged — only the frame grew: a
+ * card carrying a body gets more width and a bounded, scrollable height, since
+ * a source view inside 20rem would be unreadable.
  */
 import { X } from 'lucide-react';
 import type { ReactNode } from 'react';
@@ -13,6 +14,7 @@ import type { ReactNode } from 'react';
 import { Card } from '@/components/ui/card';
 import { DIRECTORY_KIND, type ModelNode } from '@/graph/model';
 import { colorForKind } from '@/graph/palette';
+import { cn } from '@/lib/utils';
 
 export interface SelectionCardProps {
   node: ModelNode;
@@ -24,8 +26,13 @@ export interface SelectionCardProps {
 export function SelectionCard({ node, onClose, children }: SelectionCardProps) {
   const isDirectory = node.kind === DIRECTORY_KIND;
   return (
-    <Card className="pointer-events-auto w-80 p-4">
-      <div className="flex items-start justify-between gap-3">
+    <Card
+      className={cn(
+        'pointer-events-auto flex flex-col p-4',
+        children ? 'max-h-[calc(100vh-10rem)] w-[27rem]' : 'w-80'
+      )}
+    >
+      <div className="flex shrink-0 items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <span
@@ -50,7 +57,9 @@ export function SelectionCard({ node, onClose, children }: SelectionCardProps) {
         </button>
       </div>
 
-      {children ?? (
+      {children ? (
+        <div className="min-h-0 flex-1 overflow-y-auto pr-0.5">{children}</div>
+      ) : (
         <dl className="mt-3 flex flex-col gap-1.5 text-[11px]">
           <Row label={isDirectory ? 'path' : 'file'} value={node.file || '(project root)'} />
           {!isDirectory ? (
@@ -62,7 +71,7 @@ export function SelectionCard({ node, onClose, children }: SelectionCardProps) {
         </dl>
       )}
 
-      <p className="mt-3 text-[10px] leading-relaxed text-muted">
+      <p className="mt-3 shrink-0 text-[10px] leading-relaxed text-muted">
         Shift+click a node to expand or collapse it. Drag to pin, wobble to release.
       </p>
     </Card>

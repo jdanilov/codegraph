@@ -27,7 +27,7 @@ import {
 } from './dashed-edge-program';
 import { drawNodeHover } from './hover-renderer';
 import { WedgeLayout } from './layout';
-import type { GraphModel, ModelEdge, ModelNode } from './model';
+import { ROOT_ID, type GraphModel, type ModelEdge, type ModelNode } from './model';
 import {
   BACKBONE_COLOR,
   BACKBONE_SATELLITE_COLOR,
@@ -131,6 +131,8 @@ export class CanvasController {
 
   private frame: number | null = null;
   private pendingReveal: string | null = null;
+  /** A node the camera should centre on once the layout settles (Cmd+P). */
+  private pendingFocus: string | null = null;
   private pendingRevealAt = 0;
   private fitted = false;
   private disposed = false;
@@ -228,6 +230,72 @@ export class CanvasController {
       this.pendingReveal = id;
       this.pendingRevealAt = performance.now();
     }
+  }
+
+  /**
+   * The current expansion set, copied.
+   *
+   * Phase C's Cmd+P and phase D's URL state both need to read and restore what
+   * is open; the set is copied so a caller can't mutate the controller's own
+   * state behind its back.
+   */
+  getExpanded(): Set<string> {
+    return new Set(this.expanded);
+  }
+
+  /**
+   * Replace the expansion set wholesale, in ONE re-mount.
+   *
+   * Restoring a saved view by calling `toggle()` per id would re-run the mount
+   * pass (and the camera reveal) once per node; this applies the whole set and
+   * syncs a single time. Ids that no longer exist are dropped, and the root
+   * stays expanded so a restore can never land on an empty canvas.
+   */
+  setExpanded(ids: Iterable<string>): void {
+    const model = this.model;
+    if (!model) return;
+    const next = new Set<string>();
+    for (const id of ids) if (model.nodes.has(id)) next.add(id);
+    if (model.childrenOf(ROOT_ID).length > 0) next.add(ROOT_ID);
+    this.expanded = next;
+    this.sync(false);
+  }
+
+  /**
+   * Select a node and bring it on screen — the Cmd+P landing.
+   *
+   * Reaching a node buried in a collapsed subtree means expanding every
+   * ancestor of it (never the node itself: opening a directory the user only
+   * wanted to *look at* would dump its whole fan-out on them). The camera move
+   * waits for the layout to settle when the mount changed, otherwise it would
+   * frame a position the node is still travelling away from.
+   */
+  reveal(id: string): boolean {
+    const model = this.model;
+    if (!model) return false;
+    const node = model.get(id);
+    if (!node) return false;
+
+    const next = new Set(this.expanded);
+    for (const ancestor of model.ancestors(id)) next.add(ancestor);
+    const grew = next.size !== this.expanded.size;
+    if (grew) {
+      this.expanded = next;
+      this.sync(false);
+    }
+
+    this.selected = id;
+    this.sigma.refresh({ skipIndexation: true });
+    this.callbacks.onSelect(node);
+
+    if (grew) {
+      this.pendingFocus = id;
+      this.pendingRevealAt = performance.now();
+      this.startAnimation();
+    } else {
+      this.focusOn(id);
+    }
+    return true;
   }
 
   destroy(): void {
@@ -379,10 +447,16 @@ export class CanvasController {
       if (this.disposed) return;
       const running = this.layout.tick();
       this.writePositions();
-      if (this.pendingReveal && (!running || performance.now() - this.pendingRevealAt > 2000)) {
+      const settled = !running || performance.now() - this.pendingRevealAt > 2000;
+      if (this.pendingReveal && settled) {
         const target = this.pendingReveal;
         this.pendingReveal = null;
         this.revealAfterExpand(target);
+      }
+      if (this.pendingFocus && settled) {
+        const target = this.pendingFocus;
+        this.pendingFocus = null;
+        this.focusOn(target);
       }
       if (running || this.dragId) this.frame = requestAnimationFrame(step);
     };
@@ -495,6 +569,25 @@ export class CanvasController {
       const ratio = scale > 1 ? camera.ratio * Math.min(scale, 2.5) : camera.ratio;
       void camera.animate({ x: centre.x, y: centre.y, ratio }, { duration: 380 });
     }
+  }
+
+  /**
+   * Centre the camera on one node, zooming IN if the view is far out.
+   *
+   * A node that isn't mounted (the render budget elided it) has no position to
+   * fly to; the selection still stands, the camera simply doesn't move.
+   */
+  private focusOn(id: string): void {
+    const point = this.layout.positionOf(id);
+    if (!point || !this.graph.hasNode(id)) return;
+    const camera = this.sigma.getCamera();
+    const framed = this.sigma.viewportToFramedGraph(this.sigma.graphToViewport(point));
+    // Ratio is inverse zoom in sigma: capping it zooms in on a far-out view
+    // without ever pulling back from one the user deliberately zoomed into.
+    void camera.animate(
+      { x: framed.x, y: framed.y, ratio: Math.min(camera.ratio, 0.5) },
+      { duration: 420 }
+    );
   }
 
   /** Re-fit the whole mounted graph — the "fit" control in the toolbar. */
