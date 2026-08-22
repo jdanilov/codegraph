@@ -32,6 +32,7 @@ import type { FrameworkResolver } from '../types';
 import { noopPlugin } from './noop';
 import { namespaceProxyPlugin } from './namespace-proxy';
 import { layerChainPlugin } from './layer-chain';
+import { eventBusPlugin } from './event-bus';
 
 /**
  * Every in-tree plugin, in registration order. Appended to the built-in
@@ -41,6 +42,7 @@ export const PLUGIN_RESOLVERS: readonly FrameworkResolver[] = [
   noopPlugin,
   namespaceProxyPlugin,
   layerChainPlugin,
+  eventBusPlugin,
 ];
 
 export {
@@ -60,3 +62,4 @@ export {
 
 export { namespaceProxyPlugin, NAMESPACE_PROXY_PLUGIN_NAME } from './namespace-proxy';
 export { layerChainPlugin, LAYER_CHAIN_PLUGIN_NAME } from './layer-chain';
+export { eventBusPlugin, EVENT_BUS_PLUGIN_NAME } from './event-bus';
