@@ -37,9 +37,11 @@ export interface NodePanelProps {
   root: string | null;
   /** Select the node and bring it into view on the canvas. */
   onNavigate(id: string): void;
+  /** Which mode the source pane opens in ("diff" from the Changes view). */
+  sourceMode?: 'full' | 'diff';
 }
 
-export function NodePanel({ node, model, root, onNavigate }: NodePanelProps) {
+export function NodePanel({ node, model, root, onNavigate, sourceMode }: NodePanelProps) {
   const [detail, setDetail] = useState<NodeDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -145,11 +147,12 @@ export function NodePanel({ node, model, root, onNavigate }: NodePanelProps) {
             navigation remounts it with clean state instead of reconciling. */}
         {!isDirectory && detail ? (
           <SourceView
-            key={detail.node.id}
+            key={`${detail.node.id}|${sourceMode ?? 'full'}`}
             file={detail.node.file}
             startLine={detail.node.startLine || 1}
             endLine={detail.node.endLine || detail.node.startLine || 1}
             initial={detail.source}
+            initialMode={sourceMode}
           />
         ) : null}
       </div>

@@ -96,6 +96,14 @@ function git(cwd: string, args: string[]): string | null {
   }
 }
 
+/**
+ * Run a git command inside `cwd` — the same bounded, shell-less invocation the
+ * diff path uses, exposed so the changes view can share it (`changes.ts`).
+ */
+export function runGit(cwd: string, args: string[]): string | null {
+  return git(cwd, args);
+}
+
 /** True when `root` sits inside a git work tree. */
 export function isGitWorkTree(root: string): boolean {
   return git(root, ['rev-parse', '--is-inside-work-tree'])?.trim() === 'true';

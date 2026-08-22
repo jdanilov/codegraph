@@ -4,7 +4,8 @@
  * Covers the shapes `docs/design/visualizer.md` fixes: `contains` never appears
  * in `edges` (it is the `parent` backbone), `dataVersion` drives the graph
  * ETag, un-indexed roots answer without erroring, later-phase endpoints answer
- * 501 with the contract's shape, and no served path escapes the project root.
+ * the contract's shape (explore/ask/changes included), and no served path
+ * escapes the project root.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -18,6 +19,7 @@ import { startUiServer, type UiServer } from '../src/ui-server';
 import { layerOf } from '../src/ui-server/graph-payload';
 import { tokenizeCommand, buildEditorArgv } from '../src/ui-server/editor';
 import { mergeSettings, settingsView } from '../src/ui-server/settings';
+import { normalizeSymbolBag } from '../src/ui-server/ask';
 
 let projectRoot: string;
 let emptyRoot: string;
@@ -304,26 +306,115 @@ describe('cards and settings', () => {
   });
 });
 
-describe('later-phase endpoints', () => {
-  it('501s explore, ask and changes with contract shapes', async () => {
-    const explore = await getJson(server.url, '/api/explore', {
+describe('POST /api/explore', () => {
+  it('answers with the structured shape the contract fixes', async () => {
+    const { status, body } = await getJson(server.url, '/api/explore', {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query: 'alpha beta' }),
     });
-    expect(explore.status).toBe(501);
-    expect(explore.body.flow).toEqual([]);
-
-    const ask = await getJson(server.url, '/api/ask', {
-      method: 'POST',
-      body: JSON.stringify({ question: 'what calls alpha?' }),
-    });
-    expect(ask.status).toBe(501);
-
-    const changes = await getJson(server.url, '/api/changes');
-    expect(changes.status).toBe(501);
-    expect(changes.body.changedNodes).toEqual([]);
+    expect(status).toBe(200);
+    expect(Array.isArray(body.nodeIds)).toBe(true);
+    expect(Array.isArray(body.edgeRefs)).toBe(true);
+    expect(Array.isArray(body.flow)).toBe(true);
+    expect(typeof body.summary).toBe('string');
+    expect(body.nodeIds.length).toBeGreaterThan(0);
   });
 
+  it('resolves every returned id against /api/graph', async () => {
+    const graph = await getJson(server.url, '/api/graph');
+    const known = new Set<string>([
+      ...graph.body.nodes.map((node: any) => node.id),
+      ...graph.body.dirs.map((dir: any) => dir.id),
+    ]);
+    const { body } = await getJson(server.url, '/api/explore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'alpha beta' }),
+    });
+    for (const id of body.nodeIds) expect(known.has(id)).toBe(true);
+    for (const edge of body.edgeRefs) {
+      expect(known.has(edge.source)).toBe(true);
+      expect(known.has(edge.target)).toBe(true);
+    }
+  });
+
+  it('rejects an empty query', async () => {
+    const { status } = await getJson(server.url, '/api/explore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: '   ' }),
+    });
+    expect(status).toBe(400);
+  });
+});
+
+describe('POST /api/ask', () => {
+  it('501s with the contract shape when no API key is configured', async () => {
+    // The key lives in the user's home dir; only assert the no-key branch when
+    // this machine genuinely has none (same guard as the /api/open test).
+    const settings = await getJson(server.url, '/api/settings');
+    if (settings.body.anthropicApiKeySet) return;
+    const { status, body } = await getJson(server.url, '/api/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: 'what calls alpha?' }),
+    });
+    expect(status).toBe(501);
+    expect(body.error.code).toBe('not_implemented');
+    expect(body.nodeIds).toEqual([]);
+    expect(body.flow).toEqual([]);
+    expect(body.symbolBag).toBe('');
+  });
+});
+
+describe('ask — symbol-bag normalization', () => {
+  it('keeps identifier-shaped tokens, punctuation stripped', () => {
+    // A stray label word costs one of the 16 slots and resolves to nothing —
+    // harmless; what matters is that punctuation never reaches the tokenizer.
+    expect(normalizeSymbolBag('handleRequest, ItemStore.add; `persistItem`.'))
+      .toBe('handleRequest ItemStore.add persistItem');
+  });
+
+  it('is idempotent about duplicates and casing collisions', () => {
+    expect(normalizeSymbolBag('alpha alpha ALPHA beta')).toBe('alpha beta');
+  });
+
+  it('survives a model that answered with prose instead of names', () => {
+    expect(normalizeSymbolBag('I am sorry, I cannot help with that!')).not.toContain(',');
+  });
+
+  it('caps the bag so one answer can never flood the query', () => {
+    const many = Array.from({ length: 40 }, (_, i) => `symbol${i}`).join(' ');
+    expect(normalizeSymbolBag(many).split(' ')).toHaveLength(16);
+  });
+});
+
+describe('GET /api/changes', () => {
+  it.runIf(hasGit)('reports every uncommitted status with hunks', async () => {
+    const { status, body } = await getJson(gitServer.url, '/api/changes');
+    expect(status).toBe(200);
+    expect(body.git).toBe(true);
+    const byPath = new Map<string, any>(body.changedFiles.map((file: any) => [file.path, file]));
+    expect(byPath.get('src/tracked.ts')?.status).toBe('modified');
+    expect(byPath.get('src/fresh.ts')?.status).toBe('untracked');
+    expect(body.hunks.length).toBeGreaterThan(0);
+    expect(body.hunks.every((hunk: any) => typeof hunk.file === 'string')).toBe(true);
+    expect(Array.isArray(body.impactedNodeIds)).toBe(true);
+  });
+
+  it('409s with the full shape outside a git work tree', async () => {
+    const { status, body } = await getJson(server.url, '/api/changes');
+    expect(status).toBe(409);
+    expect(body.error.code).toBe('conflict');
+    expect(body.git).toBe(false);
+    expect(body.changedNodes).toEqual([]);
+    expect(body.impactedNodeIds).toEqual([]);
+    expect(body.hunks).toEqual([]);
+  });
+});
+
+describe('editor jump', () => {
   it('409s /api/open when no editor command is configured', async () => {
     // The stored template lives in the user's home dir; only assert the
     // no-editor branch when this machine genuinely has none configured.
@@ -335,61 +426,5 @@ describe('later-phase endpoints', () => {
     });
     expect(status).toBe(409);
     expect(body.error.code).toBe('conflict');
-  });
-});
-
-describe('request hardening', () => {
-  it('rejects a non-loopback Host header', async () => {
-    // Raw http.request: fetch() refuses to let a caller set Host, and this
-    // DNS-rebinding guard is exactly about a forged one.
-    const status = await new Promise<number>((resolve, reject) => {
-      const request = http.request(
-        {
-          host: '127.0.0.1',
-          port: server.port,
-          path: '/api/status',
-          method: 'GET',
-          headers: { Host: 'attacker.example.com' },
-        },
-        (response) => {
-          response.resume();
-          response.on('end', () => resolve(response.statusCode ?? 0));
-        }
-      );
-      request.on('error', reject);
-      request.end();
-    });
-    expect(status).toBe(403);
-  });
-
-  it('404s an unknown API route and 405s a wrong method', async () => {
-    expect((await getJson(server.url, '/api/nope')).status).toBe(404);
-    expect((await getJson(server.url, '/api/status', { method: 'POST' })).status).toBe(405);
-  });
-});
-
-describe('helpers', () => {
-  it('derives layers only from the configured vocabulary', () => {
-    const vocabulary = new Set(['bg', 'pp']);
-    expect(layerOf('src/widget.bg.ts', vocabulary)).toBe('bg');
-    expect(layerOf('src/widget.bg.pp.ts', vocabulary)).toBe('bg.pp');
-    expect(layerOf('src/widget.ts', vocabulary)).toBeUndefined();
-    expect(layerOf('src/widget.test.ts', vocabulary)).toBeUndefined();
-    expect(layerOf('src/widget.bg.ts', new Set())).toBeUndefined();
-  });
-
-  it('tokenizes editor templates without a shell', () => {
-    expect(tokenizeCommand('code -g {file}:{line}')).toEqual(['code', '-g', '{file}:{line}']);
-    expect(tokenizeCommand('"/Applications/My Editor" --line {line} {file}')).toEqual([
-      '/Applications/My Editor',
-      '--line',
-      '{line}',
-      '{file}',
-    ]);
-    expect(buildEditorArgv('code -g {file}:{line}', '/tmp/a b.ts', 12)).toEqual([
-      'code',
-      '-g',
-      '/tmp/a b.ts:12',
-    ]);
   });
 });

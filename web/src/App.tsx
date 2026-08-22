@@ -5,31 +5,322 @@
  * every other surface floats on top of it (contract: "minimal + light
  * futuristic; graph is the background; code panels / views float on top").
  *
- * Phase C hangs three things off the canvas:
+ * Phase D adds the question layer and makes the view addressable:
  *
- *  - `renderDetail` fills the floating selection card with the real
- *    `/api/node/:id` info panel (relations, source, editor jump);
- *  - `onController` hands this shell the imperative handle that Cmd+P needs to
- *    *reveal* a node — expand its ancestors, select it, fly the camera to it;
- *  - `onSelect` mirrors the canvas selection here, so a later phase can drive
- *    a card or a view from it.
+ *  - **Cards.** Two standing views (Project, Changes) plus saved question
+ *    cards. Activating one is a single gesture on the canvas: expand exactly
+ *    the ancestors of its result nodes (collapsing everything else), select
+ *    nothing, halo the result, and frame it.
+ *  - **Changes.** `GET /api/changes` refreshed whenever `dataVersion` moves
+ *    while the view is active — changed nodes wear a hot halo, impacted ones a
+ *    warm one, and a node opened from here shows its diff first.
+ *  - **Feedback export.** The active view plus the current selection, rendered
+ *    as markdown to paste into an agent prompt.
+ *  - **URL = state.** Expanded set, active card, colour mode and edge toggles
+ *    live in the hash (see `lib/url-state.ts`), restored on load.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Search, Settings as SettingsIcon } from 'lucide-react';
 
 import { CommandPalette } from '@/components/command-palette';
 import { SettingsDialog } from '@/components/settings-dialog';
+import {
+  CardsPanel,
+  CHANGES_VIEW_ID,
+  PROJECT_VIEW_ID,
+} from '@/components/cards/cards-panel';
+import { FeedbackDialog, type FeedbackNode } from '@/components/feedback-dialog';
 import { GraphCanvas } from '@/components/graph/graph-canvas';
 import { NodePanel } from '@/components/graph/node-panel';
 import { StatusPanel } from '@/components/graph/status-panel';
 import type { CanvasController } from '@/graph/canvas-controller';
+import type { GraphModel, ModelNode } from '@/graph/model';
+import type { ColorMode } from '@/graph/palette';
 import { useGraphData } from '@/graph/use-graph-data';
+import { initialExpansion } from '@/graph/view';
+import {
+  askQuestion,
+  exploreQuery,
+  fetchCards,
+  fetchChanges,
+  fetchSettings,
+  saveCards,
+  type Card,
+  type ChangesPayload,
+  type ExploreResult,
+} from '@/lib/api';
+import { decodeUrlState, encodeUrlState } from '@/lib/url-state';
 
 export default function App() {
   const { status, model, error, indexing, indexLog, runIndex } = useGraphData();
   const controllerRef = useRef<CanvasController | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+
+  const [cards, setCards] = useState<Card[]>([]);
+  const [activeId, setActiveId] = useState<string>(PROJECT_VIEW_ID);
+  const [busy, setBusy] = useState(false);
+  const [askError, setAskError] = useState<string | null>(null);
+  const [askAvailable, setAskAvailable] = useState(false);
+  const [colorMode, setColorMode] = useState<ColorMode>('kind');
+  const [selectedNode, setSelectedNode] = useState<ModelNode | null>(null);
+
+  const [changes, setChanges] = useState<ChangesPayload | null>(null);
+  const [changesError, setChangesError] = useState<string | null>(null);
+
+  // Refs the imperative canvas work reads: the apply/restore paths run outside
+  // React's render, so they must not close over stale state.
+  const cardsRef = useRef(cards);
+  cardsRef.current = cards;
+  const changesRef = useRef(changes);
+  changesRef.current = changes;
+  const activeRef = useRef(activeId);
+  activeRef.current = activeId;
+  const restoredRef = useRef(false);
+  const urlTimer = useRef<number | null>(null);
+
+  // ---------------------------------------------------------------- data ---
+
+  useEffect(() => {
+    void fetchCards()
+      .then(setCards)
+      .catch(() => {
+        /* a project with no cards file is the normal empty state */
+      });
+    void refreshAskAvailability();
+  }, []);
+
+  const refreshAskAvailability = useCallback(async () => {
+    try {
+      const view = await fetchSettings();
+      setAskAvailable(view.anthropicApiKeySet);
+    } catch {
+      setAskAvailable(false);
+    }
+  }, []);
+
+  /** Changes are re-read whenever the index moves while the view is on show. */
+  const loadChanges = useCallback(async () => {
+    try {
+      const payload = await fetchChanges();
+      setChanges(payload);
+      setChangesError(null);
+      return payload;
+    } catch (err) {
+      setChangesError(err instanceof Error ? err.message : String(err));
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeId !== CHANGES_VIEW_ID) return;
+    void loadChanges().then((payload) => {
+      if (payload) applyChanges(payload);
+    });
+    // `dataVersion` is the contract's "something changed" signal.
+  }, [activeId, status?.dataVersion, loadChanges]);
+
+  // --------------------------------------------------------------- cards ---
+
+  const persist = useCallback((next: Card[]) => {
+    setCards(next);
+    void saveCards(next).catch(() => {
+      /* the card still works this session even if the write failed */
+    });
+  }, []);
+
+  /** Expand exactly the ancestors of `ids`, collapsing everything else. */
+  const expandTo = useCallback((controller: CanvasController, graph: GraphModel, ids: string[]) => {
+    const ancestors = new Set<string>();
+    for (const id of ids) {
+      if (!graph.nodes.has(id)) continue;
+      for (const ancestor of graph.ancestors(id)) ancestors.add(ancestor);
+    }
+    controller.setExpanded(ancestors);
+  }, []);
+
+  const applyResult = useCallback(
+    (result: ExploreResult | undefined) => {
+      const controller = controllerRef.current;
+      if (!controller || !model) return;
+      const ids = result?.nodeIds ?? [];
+      expandTo(controller, model, ids);
+      controller.setHighlight({ nodes: ids, edges: result?.edgeRefs ?? [] });
+      controller.setSelected(null);
+      setSelectedNode(null);
+      controller.frameNodes(ids);
+    },
+    [model, expandTo]
+  );
+
+  const applyChanges = useCallback(
+    (payload: ChangesPayload) => {
+      const controller = controllerRef.current;
+      if (!controller || !model) return;
+      const changed = payload.changedNodes.map((node) => node.id);
+      expandTo(controller, model, changed);
+      controller.setHighlight({ changed, impacted: payload.impactedNodeIds });
+      controller.setSelected(null);
+      setSelectedNode(null);
+      controller.frameNodes(changed);
+    },
+    [model, expandTo]
+  );
+
+  const activate = useCallback(
+    (id: string) => {
+      setActiveId(id);
+      const controller = controllerRef.current;
+      if (!controller || !model) return;
+
+      if (id === PROJECT_VIEW_ID) {
+        controller.setExpanded(initialExpansion(model));
+        controller.setHighlight(null);
+        controller.setSelected(null);
+        setSelectedNode(null);
+        controller.fitView();
+        return;
+      }
+      if (id === CHANGES_VIEW_ID) {
+        const payload = changesRef.current;
+        if (payload) applyChanges(payload);
+        else void loadChanges().then((next) => next && applyChanges(next));
+        return;
+      }
+      applyResult(cardsRef.current.find((card) => card.id === id)?.result);
+    },
+    [model, applyChanges, applyResult, loadChanges]
+  );
+
+  /**
+   * Ask a question. The deterministic explore is what lands the card — the
+   * model, when configured, is an explicit follow-up ("refine with AI") rather
+   * than a gate in front of the answer.
+   */
+  const ask = useCallback(
+    (question: string) => {
+      setBusy(true);
+      setAskError(null);
+      void exploreQuery(question)
+        .then((result) => {
+          const card: Card = {
+            id: `card-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+            question,
+            createdAt: Date.now(),
+            result,
+          };
+          persist([card, ...cardsRef.current]);
+          setActiveId(card.id);
+          applyResult(result);
+        })
+        .catch((err: unknown) => setAskError(err instanceof Error ? err.message : String(err)))
+        .finally(() => setBusy(false));
+    },
+    [persist, applyResult]
+  );
+
+  /** Re-answer an existing card through the model, replacing its result. */
+  const refine = useCallback(
+    (card: Card) => {
+      setBusy(true);
+      setAskError(null);
+      void askQuestion(card.question)
+        .then((outcome) => {
+          if (!outcome.ok) {
+            setAskError(outcome.message);
+            return;
+          }
+          const next = cardsRef.current.map((entry) =>
+            entry.id === card.id ? { ...entry, result: outcome.result } : entry
+          );
+          persist(next);
+          setActiveId(card.id);
+          applyResult(outcome.result);
+        })
+        .finally(() => setBusy(false));
+    },
+    [persist, applyResult]
+  );
+
+  const removeCard = useCallback(
+    (id: string) => {
+      persist(cardsRef.current.filter((card) => card.id !== id));
+      if (activeRef.current === id) activate(PROJECT_VIEW_ID);
+    },
+    [persist, activate]
+  );
+
+  // ----------------------------------------------------------- URL state ---
+
+  /** Restore once, as soon as there is a model to restore INTO. */
+  useEffect(() => {
+    if (restoredRef.current || !model) return;
+    restoredRef.current = true;
+    const controller = controllerRef.current;
+    void decodeUrlState(window.location.hash).then((state) => {
+      if (!state || !controller) {
+        scheduleUrlUpdate();
+        return;
+      }
+      setColorMode(state.colorMode);
+      if (state.edgeKinds && state.edgeKinds.length > 0) controller.setEdgeKinds(state.edgeKinds);
+
+      const cardId = state.cardId ?? PROJECT_VIEW_ID;
+      setActiveId(cardId);
+      // The card's highlight is restored, but NOT its expansion: the URL's own
+      // expanded set is what the user actually had open, which may be wider or
+      // narrower than the card's ancestors.
+      if (cardId === CHANGES_VIEW_ID) {
+        void loadChanges().then((payload) => {
+          if (payload) {
+            controller.setHighlight({
+              changed: payload.changedNodes.map((node) => node.id),
+              impacted: payload.impactedNodeIds,
+            });
+          }
+        });
+      } else if (cardId !== PROJECT_VIEW_ID) {
+        const result = cardsRef.current.find((card) => card.id === cardId)?.result;
+        if (result) controller.setHighlight({ nodes: result.nodeIds, edges: result.edgeRefs });
+      }
+
+      if (state.expanded.length > 0) controller.setExpanded(state.expanded);
+      else if (cardId === PROJECT_VIEW_ID) controller.setExpanded(initialExpansion(model));
+    });
+  }, [model, loadChanges]);
+
+  /** Debounced hash write; the canvas fires a view change on every expansion. */
+  const scheduleUrlUpdate = useCallback(() => {
+    if (!restoredRef.current) return;
+    if (urlTimer.current !== null) window.clearTimeout(urlTimer.current);
+    urlTimer.current = window.setTimeout(() => {
+      urlTimer.current = null;
+      const controller = controllerRef.current;
+      if (!controller) return;
+      void encodeUrlState({
+        expanded: [...controller.getExpanded()],
+        cardId: activeRef.current,
+        colorMode,
+        edgeKinds: controller.enabledEdgeKinds(),
+      }).then((hash) => {
+        window.history.replaceState(null, '', hash);
+      });
+    }, 350);
+  }, [colorMode]);
+
+  useEffect(() => {
+    scheduleUrlUpdate();
+  }, [activeId, colorMode, scheduleUrlUpdate]);
+
+  useEffect(
+    () => () => {
+      if (urlTimer.current !== null) window.clearTimeout(urlTimer.current);
+    },
+    []
+  );
+
+  // ------------------------------------------------------------ commands ---
 
   // Cmd/Ctrl+P opens the palette. Captured on the window because the canvas is
   // a WebGL surface with no focusable children to hang a handler on.
@@ -49,19 +340,45 @@ export default function App() {
     controllerRef.current?.reveal(id);
   }, []);
 
+  // ------------------------------------------------------------ feedback ---
+
+  const activeCard = cards.find((card) => card.id === activeId) ?? null;
+  const feedbackContext = activeCard
+    ? activeCard.question
+    : activeId === CHANGES_VIEW_ID
+      ? 'Uncommitted changes vs HEAD'
+      : 'Project overview';
+  const feedbackSummary = activeCard?.result?.summary ?? changesSummaryText(activeId, changes);
+  const feedbackResultNodes = useMemo<FeedbackNode[]>(() => {
+    const ids =
+      activeId === CHANGES_VIEW_ID
+        ? (changes?.changedNodes.map((node) => node.id) ?? [])
+        : (activeCard?.result?.nodeIds ?? []);
+    return ids.map((id) => describeForFeedback(model, id)).filter((node): node is FeedbackNode => Boolean(node));
+  }, [activeId, activeCard, changes, model]);
+  const feedbackSelected = useMemo<FeedbackNode[]>(() => {
+    const node = selectedNode ? describeForFeedback(model, selectedNode.id) : null;
+    return node ? [node] : [];
+  }, [selectedNode, model]);
+
   return (
     <div className="relative h-full w-full">
       <GraphCanvas
         model={model}
+        colorMode={colorMode}
+        onColorModeChange={setColorMode}
+        onViewChange={scheduleUrlUpdate}
         onController={(controller) => {
           controllerRef.current = controller;
         }}
+        onSelect={setSelectedNode}
         renderDetail={(node) => (
           <NodePanel
             node={node}
             model={model}
             root={status?.root ?? null}
             onNavigate={navigate}
+            sourceMode={activeId === CHANGES_VIEW_ID ? 'diff' : 'full'}
           />
         )}
       />
@@ -96,15 +413,62 @@ export default function App() {
               <SettingsIcon className="h-3.5 w-3.5" />
             </button>
           </div>
+
+          <CardsPanel
+            cards={cards}
+            activeId={activeId}
+            model={model}
+            changes={changes}
+            changesError={changesError}
+            busy={busy}
+            askAvailable={askAvailable}
+            error={askError}
+            onActivate={activate}
+            onAsk={ask}
+            onRefine={refine}
+            onDelete={removeCard}
+            onNavigate={navigate}
+            onExport={() => setFeedbackOpen(true)}
+          />
         </div>
       </div>
 
-      <CommandPalette
-        open={paletteOpen}
-        onClose={() => setPaletteOpen(false)}
-        onPick={navigate}
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} onPick={navigate} />
+      <SettingsDialog
+        open={settingsOpen}
+        onClose={() => {
+          setSettingsOpen(false);
+          void refreshAskAvailability();
+        }}
       />
-      <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <FeedbackDialog
+        open={feedbackOpen}
+        onClose={() => setFeedbackOpen(false)}
+        context={feedbackContext}
+        summary={feedbackSummary}
+        selected={feedbackSelected}
+        resultNodes={feedbackResultNodes}
+        projectName={status?.projectName}
+      />
     </div>
   );
+}
+
+/** A node as the feedback export cites it (`path:start-end`). */
+function describeForFeedback(model: GraphModel | null, id: string): FeedbackNode | null {
+  const node = model?.get(id);
+  if (!node) return null;
+  return {
+    id: node.id,
+    name: node.name,
+    kind: node.kind,
+    file: node.file,
+    startLine: node.startLine,
+    endLine: node.endLine,
+  };
+}
+
+function changesSummaryText(activeId: string, changes: ChangesPayload | null): string | undefined {
+  if (activeId !== CHANGES_VIEW_ID || !changes) return undefined;
+  return `${changes.changedFiles.length} changed file(s), ${changes.changedNodes.length} changed symbol(s), ${changes.impactedNodeIds.length} impacted.`;
 }

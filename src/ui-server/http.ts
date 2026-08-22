@@ -68,7 +68,8 @@ export function sendError(
   res: ServerResponse,
   status: number,
   error: ApiError,
-  extra: Record<string, unknown> = {}
+  /** Merged into the body — typically the endpoint's own (empty) result shape. */
+  extra: object = {}
 ): void {
   sendJson(res, status, { error, ...extra });
 }
@@ -81,7 +82,7 @@ export function sendError(
 export function sendNotImplemented(
   res: ServerResponse,
   message: string,
-  shape: Record<string, unknown>,
+  shape: object,
   phase: string
 ): void {
   sendError(res, 501, { code: 'not_implemented', message, phase }, shape);

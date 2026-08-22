@@ -182,6 +182,68 @@ handles the shell drives. Phase D can rely on them:
   The panel renders the `source` block the node payload already carries, so
   opening one costs a single request.
 
+### Phase D clarifications (additive — no contract item changed)
+
+The questions/changes layer fixes the shapes the table left open:
+
+- **Structured explore is the SAME implementation, not a second one.**
+  `handleExplore` collects a structured twin of the response it was already
+  assembling and attaches it to the `ToolResult` under an internal key, opt-in
+  per call (`src/mcp/explore-structured.ts`). The MCP server never opts in, so
+  an agent call computes none of it and its markdown is byte-identical
+  (verified before/after on a multi-file flow fixture and on this repo).
+  `POST /api/explore` runs the tool handler and reads that twin.
+  - `nodeIds` are ordered **flow spine first**, then named symbols, then the
+    symbols of every file whose source survived the budget (≤600).
+  - `edgeRefs` are `{ source, target, kind, provenance?, synthesizedBy? }`
+    among those nodes, spine hops first (≤1200); `contains` is never included.
+  - `flow` is the rendered Flow section's path, hop by hop, with
+    `via = metadata.synthesizedBy` for a synthesized hop, else the edge kind.
+  - `summary` is the response's own "Found N symbols across M files." line plus
+    the flow, as plain text.
+  - An un-indexed project answers **200** with the empty shape and the reason
+    in `summary` (same principle as the 501 stubs).
+- **`POST /api/ask`** answers the contract's 501 (with the result shape and
+  `symbolBag: ''`) when no key is configured, and **502** with the same shape on
+  a timeout (25s), HTTP error or unusable answer — in every case the client's
+  move is the same: keep the deterministic explore answer. The model is called
+  over plain `fetch` (Messages API, no SDK, no new dependency), default model
+  `claude-sonnet-5`, and only ever rewrites the question into a bag of symbol
+  names — it never sees code and never answers about the codebase. The answer is
+  filtered to identifier-shaped tokens (≤16) before it reaches explore.
+- **`GET /api/changes`** returns
+  `{ changedNodes, changedFiles, impactedNodeIds, hunks, git, truncated }`:
+  - `changedNodes: [{ id, status: added|modified|deleted, file, name, kind,
+    startLine, endLine }]` — ids that resolve against `/api/graph`. A node is
+    changed when a hunk's **actually changed lines** (not its context lines)
+    fall in its span; for an added/untracked/deleted file, every node in it.
+  - `changedFiles: [{ path, status: added|modified|deleted|untracked, nodeId,
+    nodeCount, hunkCount, binary }]` — file-level truth. **A deleted file whose
+    nodes the index has already dropped appears only here, with `nodeId: null`**
+    (when the index hasn't caught up yet, its nodes are still reported with
+    `status: "deleted"`).
+  - `hunks` is FLAT: `DiffHunk & { file }`, reusing `parseUnifiedDiff`.
+  - `impactedNodeIds` = union of `getImpactRadius(id, 2)` over changed symbols
+    (file nodes are not seeded), minus the changed ids. **Caps** (all reported
+    via `truncated`): 200 files, 60 untracked files read from disk, 200 impact
+    seeds, 2000 impacted ids. Two git invocations for the whole tree, not two
+    per file.
+  - Non-git root → **409** carrying the full shape with `git: false`.
+- **URL state** is `#<version><base64url>`: `#1…` is DEFLATE-compressed JSON,
+  `#0…` the uncompressed fallback. The JSON is `{ e: expandedIds, c: cardId,
+  m: colorMode, k: edgeKinds }`. Over 6000 chars the expanded set is dropped
+  and everything else still travels (the card re-derives its own expansion).
+- **Canvas highlight** (`CanvasController.setHighlight` / `frameNodes`): halos
+  are a second, larger, translucent circle mounted behind the node (`halo|<id>`)
+  — no custom WebGL program, no new dependency. Hot = changed, warm = impacted,
+  accent = card result; every pointer handler maps a halo back to its node.
+- **Cards**: `{ id, question, createdAt, result }` in `.codegraph/ui/cards.json`.
+  The two standing views are client-side ids (`view:project`, `view:changes`)
+  and are never persisted. Activating a card applies
+  `setExpanded(exactly the ancestors of its result nodes)`, selects nothing,
+  highlights the result, and frames it; **Project** restores the default
+  expansion. A node opened while Changes is active shows its **diff** first.
+
 Standing views (always-present cards, client-side): **Project** (whole graph)
 and **Changes** (`/api/changes`, refreshed on `dataVersion` change).
 

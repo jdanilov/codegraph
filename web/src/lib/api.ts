@@ -155,6 +155,81 @@ export interface SettingsView {
   anthropicApiKeySet: boolean;
 }
 
+/** One hop of an explore result's flow: `from` reaches `to` via `via`. */
+export interface FlowHop {
+  from: string;
+  to: string;
+  /** The synthesizer that wired a heuristic hop, else the edge kind. */
+  via: string;
+}
+
+export interface EdgeRef {
+  source: string;
+  target: string;
+  kind: string;
+  provenance?: string;
+  synthesizedBy?: string;
+}
+
+/** `POST /api/explore` — the structured twin of the `codegraph_explore` tool. */
+export interface ExploreResult {
+  nodeIds: string[];
+  edgeRefs: EdgeRef[];
+  flow: FlowHop[];
+  summary: string;
+  /** Present on `/api/ask` answers: the symbol bag the model produced. */
+  symbolBag?: string;
+}
+
+export const EMPTY_EXPLORE_RESULT: ExploreResult = {
+  nodeIds: [],
+  edgeRefs: [],
+  flow: [],
+  summary: '',
+};
+
+/** A saved question and the answer it produced. */
+export interface Card {
+  id: string;
+  question: string;
+  createdAt: number;
+  result?: ExploreResult;
+}
+
+export type ChangeStatus = 'added' | 'modified' | 'deleted' | 'untracked';
+
+export interface ChangedNode {
+  id: string;
+  status: 'added' | 'modified' | 'deleted';
+  file: string;
+  name: string;
+  kind: string;
+  startLine: number;
+  endLine: number;
+}
+
+export interface ChangedFile {
+  path: string;
+  status: ChangeStatus;
+  /** null when the index no longer holds the file (a deleted one, usually). */
+  nodeId: string | null;
+  nodeCount: number;
+  hunkCount: number;
+  binary: boolean;
+}
+
+export type FileHunk = DiffHunk & { file: string };
+
+/** `GET /api/changes`. A non-git root answers 409 carrying this same shape. */
+export interface ChangesPayload {
+  changedNodes: ChangedNode[];
+  changedFiles: ChangedFile[];
+  impactedNodeIds: string[];
+  hunks: FileHunk[];
+  git: boolean;
+  truncated: boolean;
+}
+
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(path, { headers: { Accept: 'application/json' }, signal });
   if (!response.ok) {
@@ -257,6 +332,82 @@ export async function openInEditor(file: string, line: number): Promise<OpenResu
 
 interface ApiErrorBody {
   error?: { code?: string; message?: string };
+}
+
+/** Raw text → explore. Always available; needs no API key. */
+export async function exploreQuery(query: string, signal?: AbortSignal): Promise<ExploreResult> {
+  const response = await fetch('/api/explore', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query }),
+    signal,
+  });
+  const body = (await response.json().catch(() => null)) as (ExploreResult & ApiErrorBody) | null;
+  if (response.ok && body) return body;
+  throw new Error(body?.error?.message ?? `Explore failed (${response.status})`);
+}
+
+export type AskOutcome =
+  | { ok: true; result: ExploreResult }
+  /** No API key configured (501) — the caller keeps the plain explore answer. */
+  | { ok: false; reason: 'unconfigured'; message: string }
+  | { ok: false; reason: 'failed'; message: string };
+
+/**
+ * Question → model → symbol bag → the same explore.
+ *
+ * Both failure modes are reported rather than thrown, because the client's
+ * response to either is identical: keep the deterministic answer it already has.
+ */
+export async function askQuestion(question: string, signal?: AbortSignal): Promise<AskOutcome> {
+  try {
+    const response = await fetch('/api/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+      signal,
+    });
+    const body = (await response.json().catch(() => null)) as (ExploreResult & ApiErrorBody) | null;
+    if (response.ok && body) return { ok: true, result: body };
+    const message = body?.error?.message ?? `Ask failed (${response.status})`;
+    if (response.status === 501) return { ok: false, reason: 'unconfigured', message };
+    return { ok: false, reason: 'failed', message };
+  } catch (err) {
+    return { ok: false, reason: 'failed', message: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+export function fetchCards(): Promise<Card[]> {
+  return getJson<Card[]>('/api/cards');
+}
+
+/** Persist the whole card list (the endpoint is a replace, not a patch). */
+export async function saveCards(cards: Card[]): Promise<Card[]> {
+  const response = await fetch('/api/cards', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(cards),
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as ApiErrorBody | null;
+    throw new Error(body?.error?.message ?? `Saving cards failed (${response.status})`);
+  }
+  return (await response.json()) as Card[];
+}
+
+/**
+ * `GET /api/changes`. A project outside git answers 409 *with* the payload
+ * (`git: false`), which is an answer — "nothing to compare" — not a failure.
+ */
+export async function fetchChanges(signal?: AbortSignal): Promise<ChangesPayload> {
+  const response = await fetch('/api/changes', {
+    headers: { Accept: 'application/json' },
+    signal,
+  });
+  const body = (await response.json().catch(() => null)) as (ChangesPayload & ApiErrorBody) | null;
+  if (response.ok && body) return body;
+  if (response.status === 409 && body && Array.isArray(body.changedNodes)) return body;
+  throw new Error(body?.error?.message ?? `Changes failed (${response.status})`);
 }
 
 function spanQuery(file: string, start?: number, end?: number): string {

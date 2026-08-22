@@ -44,6 +44,15 @@ import { scanDynamicDispatch } from './dynamic-boundaries';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
+  EXPLORE_STRUCTURED_ARG,
+  EXPLORE_STRUCTURED_KEY,
+  STRUCTURED_MAX_EDGES,
+  STRUCTURED_MAX_NODES,
+  type ExploreEdgeRef,
+  type ExploreFlowHop,
+  type ExploreStructuredResult,
+} from './explore-structured';
+import {
   EXPLORE_EMISSION_KEY,
   EXPLORE_SESSION_VIEW_ARG,
   ExploreSessionState,
@@ -995,6 +1004,13 @@ export interface ToolResult {
    * {@link EXPLORE_EMISSION_KEY}; the two must stay in sync.
    */
   _cgExploreEmission?: ExploreEmission;
+  /**
+   * INTERNAL side-channel: the structured twin of a `codegraph_explore`
+   * response, collected only when the caller asked for it
+   * ({@link EXPLORE_STRUCTURED_ARG}) — the visualizer's `POST /api/explore`
+   * does, the MCP server never does. Keyed by {@link EXPLORE_STRUCTURED_KEY}.
+   */
+  _cgExploreStructured?: ExploreStructuredResult;
 }
 
 /**
@@ -2512,7 +2528,7 @@ export class ToolHandler {
    * whose qualifiedName contains another named token (`PmsProductServiceImpl::list`),
    * dropping unrelated `OmsOrderService::list`.
    */
-  private buildFlowFromNamedSymbols(cg: CodeGraph, query: string): { text: string; pathNodeIds: Set<string>; namedNodeIds: Set<string>; uniqueNamedNodeIds: Set<string>; spineCallSites: Map<string, number> } {
+  private buildFlowFromNamedSymbols(cg: CodeGraph, query: string): { text: string; pathNodeIds: Set<string>; namedNodeIds: Set<string>; uniqueNamedNodeIds: Set<string>; spineCallSites: Map<string, number>; steps?: Array<{ node: Node; edge: Edge | null }> } {
     // spineCallSites: for each spine node, the line where it CALLS the next hop —
     // lets the source assembler window an oversize spine method (e.g. n8n's 962-line
     // processRunExecutionData) to the call site instead of dumping the whole body.
@@ -2814,7 +2830,10 @@ export class ToolHandler {
       // must keep full source even if it's an off-spine polymorphic sibling — the
       // agent named `getResponseWithInterceptorChain` / `SQLCompiler.execute_sql`
       // as the mechanism, not as an interchangeable leaf. See the skeleton gate.
-      return { text: out.join('\n'), pathNodeIds: pathIds, namedNodeIds: new Set<string>([...named.keys(), ...dynNamed.keys()]), uniqueNamedNodeIds, spineCallSites };
+      // `steps` is the rendered spine as DATA (the visualizer's structured
+      // explore reads it). Present only when a Flow section was actually
+      // rendered, so it can never claim a path the text didn't show.
+      return { text: out.join('\n'), pathNodeIds: pathIds, namedNodeIds: new Set<string>([...named.keys(), ...dynNamed.keys()]), uniqueNamedNodeIds, spineCallSites, steps: hasMain ? best! : [] };
     } catch {
       return EMPTY;
     }
@@ -5936,13 +5955,106 @@ export class ToolHandler {
       });
       sourceBytes += emitted.bytes;
     }
-    return this.exploreResult(finalText, {
+    const result = this.exploreResult(finalText, {
       projectRoot,
       query,
       files: emittedFiles,
       sourceBytes,
       responseBytes: finalText.length,
     });
+
+    // Structured twin for the visualizer (opt-in; never set by the MCP server,
+    // so an agent call computes none of this and its text is untouched). Reads
+    // only what the render already decided — it never feeds back into it.
+    if (args[EXPLORE_STRUCTURED_ARG]) {
+      try {
+        result[EXPLORE_STRUCTURED_KEY] = this.collectStructuredExplore(
+          flow,
+          survivors,
+          fileGroups,
+          subgraph,
+          summaryLine,
+        );
+      } catch { /* a data side-channel must never fail a served call */ }
+    }
+    return result;
+  }
+
+  /**
+   * Assemble {@link ExploreStructuredResult} from what {@link handleExplore}
+   * already computed: the flow spine, the files whose source survived the
+   * budget, and the relevance subgraph the response was ranked out of.
+   *
+   * Deliberately derivative — every id here is one the markdown response also
+   * named, which is what keeps the two views of one explore call in agreement.
+   */
+  private collectStructuredExplore(
+    flow: { pathNodeIds: Set<string>; namedNodeIds: Set<string>; steps?: Array<{ node: Node; edge: Edge | null }> },
+    survivors: string[],
+    fileGroups: Map<string, { nodes: Node[]; score: number; peripheral: number }>,
+    subgraph: Subgraph,
+    summaryLine: string,
+  ): ExploreStructuredResult {
+    const steps = flow.steps ?? [];
+    const nodeIds: string[] = [];
+    const seen = new Set<string>();
+    const add = (id: string): void => {
+      if (seen.has(id) || nodeIds.length >= STRUCTURED_MAX_NODES) return;
+      seen.add(id);
+      nodeIds.push(id);
+    };
+
+    // Spine first: it is the answer to a flow question, and a client that has
+    // to truncate should truncate the periphery.
+    for (const step of steps) add(step.node.id);
+    for (const id of flow.pathNodeIds) add(id);
+    for (const id of flow.namedNodeIds) add(id);
+    for (const filePath of survivors) {
+      const group = fileGroups.get(filePath);
+      if (!group) continue;
+      for (const node of group.nodes) {
+        if (node.kind === 'import' || node.kind === 'export') continue;
+        add(node.id);
+      }
+    }
+
+    const edgeRefs: ExploreEdgeRef[] = [];
+    const edgeSeen = new Set<string>();
+    const addEdge = (edge: Edge): void => {
+      if (edge.kind === 'contains' || edgeRefs.length >= STRUCTURED_MAX_EDGES) return;
+      const key = `${edge.kind}|${edge.source}|${edge.target}`;
+      if (edgeSeen.has(key)) return;
+      edgeSeen.add(key);
+      const ref: ExploreEdgeRef = { source: edge.source, target: edge.target, kind: edge.kind };
+      if (edge.provenance) ref.provenance = edge.provenance;
+      const synthesizedBy = edge.metadata?.['synthesizedBy'];
+      if (typeof synthesizedBy === 'string') ref.synthesizedBy = synthesizedBy;
+      edgeRefs.push(ref);
+    };
+    // Spine hops first, for the same reason, then everything among the surfaced
+    // nodes so the client can light up the neighbourhood it was handed.
+    for (const step of steps) if (step.edge) addEdge(step.edge);
+    for (const edge of subgraph.edges) {
+      if (!seen.has(edge.source) || !seen.has(edge.target)) continue;
+      addEdge(edge);
+    }
+
+    const hops: ExploreFlowHop[] = [];
+    for (let i = 1; i < steps.length; i++) {
+      const edge = steps[i]!.edge;
+      const synthesizedBy = edge?.metadata?.['synthesizedBy'];
+      hops.push({
+        from: steps[i - 1]!.node.id,
+        to: steps[i]!.node.id,
+        via: typeof synthesizedBy === 'string' ? synthesizedBy : (edge?.kind ?? 'calls'),
+      });
+    }
+
+    const summary = steps.length > 0
+      ? `${summaryLine} Flow: ${steps.map((s) => s.node.name).join(' → ')}.`
+      : summaryLine;
+
+    return { nodeIds, edgeRefs, flow: hops, summary };
   }
 
   /**

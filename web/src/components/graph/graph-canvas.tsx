@@ -48,20 +48,48 @@ export interface GraphCanvasProps {
   onSelect?(node: ModelNode | null): void;
   /** Published on mount and nulled on unmount — the shell's imperative handle. */
   onController?(controller: CanvasController | null): void;
+  /**
+   * Phase D: colour mode becomes CONTROLLED when supplied, because it is part
+   * of the URL state the shell restores. Left out, the canvas owns it exactly
+   * as before.
+   */
+  colorMode?: ColorMode;
+  onColorModeChange?(mode: ColorMode): void;
+  /** Mirror of the mounted-view summary — the shell re-encodes the URL from it. */
+  onViewChange?(summary: ViewSummary): void;
 }
 
-export function GraphCanvas({ model, renderDetail, onSelect, onController }: GraphCanvasProps) {
+export function GraphCanvas({
+  model,
+  renderDetail,
+  onSelect,
+  onController,
+  colorMode: controlledColorMode,
+  onColorModeChange,
+  onViewChange,
+}: GraphCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const controllerRef = useRef<CanvasController | null>(null);
   const [summary, setSummary] = useState<ViewSummary>(EMPTY_SUMMARY);
   const [selected, setSelected] = useState<ModelNode | null>(null);
   const [tooltip, setTooltip] = useState<EdgeTooltipData | null>(null);
-  const [colorMode, setColorMode] = useState<ColorMode>('kind');
+  const [ownColorMode, setOwnColorMode] = useState<ColorMode>('kind');
   const lastRoot = useRef<string | null>(null);
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
   const onControllerRef = useRef(onController);
   onControllerRef.current = onController;
+  const onColorModeChangeRef = useRef(onColorModeChange);
+  onColorModeChangeRef.current = onColorModeChange;
+  const onViewChangeRef = useRef(onViewChange);
+  onViewChangeRef.current = onViewChange;
+
+  // Controlled when the shell supplies a mode (URL state), self-owned otherwise.
+  const colorMode = controlledColorMode ?? ownColorMode;
+  const setColorMode = useCallback((mode: ColorMode) => {
+    setOwnColorMode(mode);
+    onColorModeChangeRef.current?.(mode);
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -71,7 +99,10 @@ export function GraphCanvas({ model, renderDetail, onSelect, onController }: Gra
         setSelected(node);
         onSelectRef.current?.(node);
       },
-      onViewChange: setSummary,
+      onViewChange: (next) => {
+        setSummary(next);
+        onViewChangeRef.current?.(next);
+      },
       onEdgeTooltip: setTooltip,
     });
     controllerRef.current = controller;

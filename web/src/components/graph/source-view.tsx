@@ -33,6 +33,12 @@ export interface SourceViewProps {
   endLine: number;
   /** The span the node payload already shipped, if any. */
   initial?: SourceSpan | null;
+  /**
+   * Which mode to open in. Arriving from the Changes view the answer is
+   * "changes" — the user is reviewing an edit, and making them click the
+   * toggle every time would be one click per symbol reviewed.
+   */
+  initialMode?: Mode;
 }
 
 type Mode = 'full' | 'diff';
@@ -52,8 +58,8 @@ function useHighlighter(): Engine {
   return engine;
 }
 
-export function SourceView({ file, startLine, endLine, initial }: SourceViewProps) {
-  const [mode, setMode] = useState<Mode>('full');
+export function SourceView({ file, startLine, endLine, initial, initialMode }: SourceViewProps) {
+  const [mode, setMode] = useState<Mode>(initialMode ?? 'full');
   // Seeded from the node payload's own span — opening a panel costs no extra
   // request. The caller remounts this component per node (`key`), so there is
   // deliberately no "reset on prop change" effect to race the in-flight fetch.

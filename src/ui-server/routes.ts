@@ -14,7 +14,10 @@ import type { IncomingMessage, ServerResponse } from 'http';
 import { unsafeIndexRootReason } from '../directory';
 import { validatePathWithinRoot } from '../utils';
 import type { Node } from '../types';
+import { askForSymbolBag } from './ask';
 import { readCards, writeCards, isCard, type Card } from './cards';
+import { collectChanges, EMPTY_CHANGES } from './changes';
+import { EMPTY_EXPLORE, runExplore } from './explore';
 import { launchEditor } from './editor';
 import {
   buildGraphPayload,
@@ -91,33 +94,17 @@ export class ApiRouter {
         return await this.open(req, res);
       }
 
-      // ---- Not implemented in this phase (contract shapes preserved) -------
       if (route === '/api/explore') {
         if (method !== 'POST') return methodNotAllowed(res, 'POST');
-        return sendNotImplemented(
-          res,
-          'Structured explore is not implemented yet.',
-          { nodeIds: [], edgeRefs: [], flow: [], summary: '' },
-          'D'
-        );
+        return await this.explore(req, res);
       }
       if (route === '/api/ask') {
         if (method !== 'POST') return methodNotAllowed(res, 'POST');
-        return sendNotImplemented(
-          res,
-          'Natural-language questions are not implemented yet.',
-          { nodeIds: [], edgeRefs: [], flow: [], summary: '' },
-          'D'
-        );
+        return await this.ask(req, res);
       }
       if (route === '/api/changes') {
         if (method !== 'GET') return methodNotAllowed(res, 'GET');
-        return sendNotImplemented(
-          res,
-          'The changes view is not implemented yet.',
-          { changedNodes: [], impactedNodeIds: [], hunks: [] },
-          'D'
-        );
+        return await this.changes(res);
       }
 
       return sendError(res, 404, { code: 'not_found', message: `No such endpoint: ${route}` });
@@ -372,6 +359,95 @@ export class ApiRouter {
     }
 
     sendJson(res, 200, results);
+  }
+
+  // --------------------------------------------------------------- explore --
+
+  /**
+   * `POST /api/explore` — the structured twin of the `codegraph_explore` tool
+   * (same implementation, different rendering; see `explore.ts`).
+   */
+  private async explore(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJsonBody<{ query?: unknown }>(req);
+    const query = typeof body?.query === 'string' ? body.query : '';
+    if (!query.trim()) {
+      return sendError(res, 400, { code: 'bad_request', message: 'Missing "query"' });
+    }
+
+    const graph = await this.state.graphOrNull();
+    if (!graph) {
+      // An un-indexed project is a normal state: answer with the contract's
+      // shape and say so in the summary, so the client renders "index first"
+      // instead of an error toast.
+      return sendJson(res, 200, {
+        ...EMPTY_EXPLORE,
+        summary: 'This project has not been indexed yet.',
+      });
+    }
+
+    const outcome = await runExplore(graph, query);
+    if (!outcome.ok) {
+      return sendError(res, 500, { code: 'internal', message: outcome.message }, EMPTY_EXPLORE);
+    }
+    sendJson(res, 200, outcome.result);
+  }
+
+  /**
+   * `POST /api/ask` — LLM refinement in front of explore.
+   *
+   * No key configured is the contract's 501 (with the result shape attached);
+   * a model that errors or times out is a 502 with the same shape, because in
+   * both cases the client's move is the same: fall back to plain explore.
+   */
+  private async ask(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJsonBody<{ question?: unknown }>(req);
+    const question = typeof body?.question === 'string' ? body.question : '';
+    if (!question.trim()) {
+      return sendError(res, 400, { code: 'bad_request', message: 'Missing "question"' });
+    }
+
+    const graph = await this.state.graphOrNull();
+    const outcome = await askForSymbolBag(question, graph);
+    if (!outcome.ok) {
+      const shape = { ...EMPTY_EXPLORE, symbolBag: '' };
+      if (outcome.reason === 'no_key') {
+        return sendNotImplemented(res, outcome.message, shape, 'settings');
+      }
+      return sendError(res, 502, { code: 'internal', message: outcome.message }, shape);
+    }
+
+    if (!graph) {
+      return sendJson(res, 200, {
+        ...EMPTY_EXPLORE,
+        summary: 'This project has not been indexed yet.',
+        symbolBag: outcome.symbolBag,
+      });
+    }
+
+    const explored = await runExplore(graph, outcome.symbolBag);
+    if (!explored.ok) {
+      return sendError(
+        res,
+        500,
+        { code: 'internal', message: explored.message },
+        { ...EMPTY_EXPLORE, symbolBag: outcome.symbolBag }
+      );
+    }
+    sendJson(res, 200, { ...explored.result, symbolBag: outcome.symbolBag });
+  }
+
+  // --------------------------------------------------------------- changes --
+
+  /**
+   * `GET /api/changes` — git's uncommitted work mapped onto node spans, plus
+   * the impact radius of what changed. A project outside git answers 409 with
+   * the full shape (`git: false`), the same pattern `mode=diff` uses.
+   */
+  private async changes(res: ServerResponse): Promise<void> {
+    const graph = await this.state.graphOrNull();
+    const outcome = collectChanges(this.state.projectRoot, graph);
+    if (outcome.ok) return sendJson(res, 200, outcome.payload);
+    return sendError(res, 409, { code: 'conflict', message: outcome.message }, EMPTY_CHANGES);
   }
 
   // ----------------------------------------------------------------- cards --

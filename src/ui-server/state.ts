@@ -11,6 +11,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type CodeGraphType from '../index';
 import { isInitialized } from '../directory';
+import { resetExploreHandler } from './explore';
 
 /** What `GET /api/status` returns. */
 export interface UiStatus {
@@ -118,6 +119,9 @@ export class UiServerState {
   private closeGraph(): void {
     const graph = this.graph;
     this.graph = null;
+    // The explore handler holds this instance; a cached one would keep
+    // querying a closed database after an index run swapped it out.
+    resetExploreHandler();
     if (!graph) return;
     try {
       graph.unwatch();

@@ -30,7 +30,7 @@ a bump is what evicts stale daemons still serving old code.
 | 1j | Reference re-attribution into extractor spans | Done |
 | 1h | Resolver-supplied edge provenance | Done |
 | 1k | Call-wrapper unwrapping (JSX components) | Done |
-| 2 | Graph visualizer | In progress |
+| 2 | Graph visualizer | Done (v1) |
 | 3 | Meaning layer | Deferred |
 
 ### Plugin ownership boundaries

@@ -65,6 +65,24 @@ export interface EdgeTooltip {
   line?: number;
 }
 
+/**
+ * What a card (or the Changes view) asks the canvas to light up.
+ *
+ * Three independent channels because they answer different questions and are
+ * shown at once: `nodes`/`edges` are "the answer to this question", `changed`
+ * is "you edited this", `impacted` is "this depends on what you edited".
+ */
+export interface CanvasHighlight {
+  /** Result nodes of a card — drawn with an accent halo, labels forced. */
+  nodes?: Iterable<string>;
+  /** Result edges, matched to model edges by (source, target, kind). */
+  edges?: Iterable<{ source: string; target: string; kind: string }>;
+  /** Nodes with uncommitted edits — hot halo. */
+  changed?: Iterable<string>;
+  /** Nodes within the impact radius of a change — warm halo. */
+  impacted?: Iterable<string>;
+}
+
 export interface CanvasCallbacks {
   onSelect(node: ModelNode | null): void;
   onViewChange(summary: ViewSummary): void;
@@ -75,6 +93,23 @@ const BACKBONE_PREFIX = 'bb|';
 const RELATION_PREFIX = 'rel|';
 /** Edge revealed only while hovering, because one endpoint is collapsed away. */
 const LIFTED_PREFIX = 'lift|';
+/**
+ * Halo ring drawn *behind* a highlighted node.
+ *
+ * A ring is a second, larger, translucent circle at the same position — which
+ * sigma draws with the node program it already has, so highlighting costs no
+ * custom WebGL program and no new dependency. Halo nodes are never interactive
+ * targets: every pointer handler maps them back to the node they hug.
+ */
+const HALO_PREFIX = 'halo|';
+
+/** Halo fills: hot for changed, warm for impacted, accent for a card result. */
+const HALO_CHANGED = 'rgba(248, 113, 113, 0.30)';
+const HALO_IMPACTED = 'rgba(251, 191, 96, 0.22)';
+const HALO_RESULT = 'rgba(103, 232, 249, 0.26)';
+
+/** How much bigger than the node itself each halo is drawn. */
+const HALO_SCALE = 2.1;
 
 /** Simulation frames run before the very first paint, so load looks instant. */
 const WARMUP_TICKS = 240;
@@ -124,6 +159,13 @@ export class CanvasController {
   private highlightEdges = new Set<string>();
   private selected: string | null = null;
 
+  /** Persistent highlight from the active card / Changes view (not hover). */
+  private resultNodes = new Set<string>();
+  private changedNodes = new Set<string>();
+  private impactedNodes = new Set<string>();
+  /** Model-edge keys of the active card's edges, for the persistent boost. */
+  private resultEdges = new Set<string>();
+
   private dragId: string | null = null;
   private dragMoved = false;
   private dragSamples: Array<{ t: number; x: number }> = [];
@@ -133,6 +175,8 @@ export class CanvasController {
   private pendingReveal: string | null = null;
   /** A node the camera should centre on once the layout settles (Cmd+P). */
   private pendingFocus: string | null = null;
+  /** A whole result set the camera should frame once the layout settles. */
+  private pendingFrame: string[] | null = null;
   private pendingRevealAt = 0;
   private fitted = false;
   private disposed = false;
@@ -298,6 +342,51 @@ export class CanvasController {
     return true;
   }
 
+  /**
+   * Install (or clear) the persistent highlight a card drives.
+   *
+   * Unlike hover, this survives until another card replaces it — it is the
+   * card's *answer*, drawn on the graph. Ids the model doesn't know are
+   * dropped silently: a card saved before a re-index can name a symbol that no
+   * longer exists, and that must degrade to "fewer halos", never to an error.
+   */
+  setHighlight(highlight: CanvasHighlight | null): void {
+    const model = this.model;
+    const known = (ids: Iterable<string> | undefined): Set<string> => {
+      const out = new Set<string>();
+      for (const id of ids ?? []) if (!model || model.nodes.has(id)) out.add(id);
+      return out;
+    };
+    this.resultNodes = known(highlight?.nodes);
+    this.changedNodes = known(highlight?.changed);
+    this.impactedNodes = known(highlight?.impacted);
+
+    this.resultEdges = new Set<string>();
+    if (model) {
+      for (const ref of highlight?.edges ?? []) {
+        for (const edge of model.edgesOf(ref.source)) {
+          if (edge.kind !== ref.kind) continue;
+          if (edge.source !== ref.source || edge.target !== ref.target) continue;
+          this.resultEdges.add(edge.key);
+        }
+      }
+    }
+    this.sync(false);
+  }
+
+  /**
+   * Frame a set of nodes — the camera move a card makes after expanding to its
+   * result. Deferred until the layout settles, for the same reason every other
+   * camera move here is: the nodes are still travelling when the mount changes.
+   */
+  frameNodes(ids: Iterable<string>): void {
+    const wanted = [...ids];
+    if (wanted.length === 0) return;
+    this.pendingFrame = wanted;
+    this.pendingRevealAt = performance.now();
+    this.startAnimation();
+  }
+
   destroy(): void {
     this.disposed = true;
     if (this.frame !== null) cancelAnimationFrame(this.frame);
@@ -333,6 +422,11 @@ export class CanvasController {
   private rebuildNodes(model: GraphModel): void {
     const wanted = this.view.byId;
     for (const id of this.graph.nodes()) {
+      if (id.startsWith(HALO_PREFIX)) {
+        const base = id.slice(HALO_PREFIX.length);
+        if (!wanted.has(base) || !this.haloColor(base)) this.graph.dropNode(id);
+        continue;
+      }
       if (!wanted.has(id)) this.graph.dropNode(id);
     }
     for (const mounted of this.view.nodes) {
@@ -352,7 +446,33 @@ export class CanvasController {
       };
       if (this.graph.hasNode(mounted.id)) this.graph.mergeNodeAttributes(mounted.id, attributes);
       else this.graph.addNode(mounted.id, attributes);
+
+      const halo = this.haloColor(mounted.id);
+      const haloId = `${HALO_PREFIX}${mounted.id}`;
+      if (!halo) continue;
+      const haloAttributes: NodeAttributes = {
+        x: point.x,
+        y: point.y,
+        size: attributes.size * HALO_SCALE,
+        color: halo,
+        label: null,
+        // Behind everything, so a ring never covers the node it belongs to.
+        zIndex: -1,
+        satellite: false,
+        expandable: false,
+        expanded: false,
+      };
+      if (this.graph.hasNode(haloId)) this.graph.mergeNodeAttributes(haloId, haloAttributes);
+      else this.graph.addNode(haloId, haloAttributes);
     }
+  }
+
+  /** The halo a node currently earns, most urgent first, or null for none. */
+  private haloColor(id: string): string | null {
+    if (this.changedNodes.has(id)) return HALO_CHANGED;
+    if (this.resultNodes.has(id)) return HALO_RESULT;
+    if (this.impactedNodes.has(id)) return HALO_IMPACTED;
+    return null;
   }
 
   private labelFor(node: ModelNode, satellite: boolean, hidden: number): string | null {
@@ -458,6 +578,11 @@ export class CanvasController {
         this.pendingFocus = null;
         this.focusOn(target);
       }
+      if (this.pendingFrame && settled) {
+        const targets = this.pendingFrame;
+        this.pendingFrame = null;
+        this.frameNow(targets);
+      }
       if (running || this.dragId) this.frame = requestAnimationFrame(step);
     };
     this.frame = requestAnimationFrame(step);
@@ -467,7 +592,10 @@ export class CanvasController {
   private writePositions(): void {
     this.graph.updateEachNodeAttributes(
       (id, attributes) => {
-        const point = this.layout.positionOf(id);
+        // A halo has no layout body of its own; it rides the node it hugs.
+        const point = this.layout.positionOf(
+          id.startsWith(HALO_PREFIX) ? id.slice(HALO_PREFIX.length) : id
+        );
         if (!point) return attributes;
         return { ...attributes, x: point.x, y: point.y };
       },
@@ -590,6 +718,53 @@ export class CanvasController {
     );
   }
 
+  /**
+   * Fit the camera around a set of nodes (a card's result).
+   *
+   * Unlike {@link revealAfterExpand} this zooms IN as well as out: the user
+   * asked to look at exactly these nodes, so filling the viewport with them is
+   * the answer. Nodes the render budget elided contribute nothing; if none of
+   * the set is mounted the camera stays where it is rather than flying to the
+   * origin.
+   */
+  private frameNow(ids: string[]): void {
+    const points = ids
+      .map((id) => (this.graph.hasNode(id) ? this.layout.positionOf(id) : null))
+      .filter((point): point is { x: number; y: number } => Boolean(point));
+    if (points.length === 0) return;
+
+    const world = {
+      minX: Math.min(...points.map((p) => p.x)),
+      maxX: Math.max(...points.map((p) => p.x)),
+      minY: Math.min(...points.map((p) => p.y)),
+      maxY: Math.max(...points.map((p) => p.y)),
+    };
+    const topLeft = this.sigma.graphToViewport({ x: world.minX, y: world.minY });
+    const bottomRight = this.sigma.graphToViewport({ x: world.maxX, y: world.maxY });
+    const box = {
+      minX: Math.min(topLeft.x, bottomRight.x),
+      maxX: Math.max(topLeft.x, bottomRight.x),
+      minY: Math.min(topLeft.y, bottomRight.y),
+      maxY: Math.max(topLeft.y, bottomRight.y),
+    };
+
+    const { width, height } = this.sigma.getDimensions();
+    const margin = 120;
+    const camera = this.sigma.getCamera();
+    const scale = Math.max(
+      (box.maxX - box.minX) / Math.max(width - margin * 2, 1),
+      (box.maxY - box.minY) / Math.max(height - margin * 2, 1)
+    );
+    const centre = this.sigma.viewportToFramedGraph({
+      x: (box.minX + box.maxX) / 2,
+      y: (box.minY + box.maxY) / 2,
+    });
+    // A single node has no extent, so `scale` is 0 — clamp to a sane zoom
+    // instead of dividing the camera ratio down to nothing.
+    const ratio = scale > 0 ? Math.max(camera.ratio * scale, 0.08) : Math.min(camera.ratio, 0.4);
+    void camera.animate({ x: centre.x, y: centre.y, ratio }, { duration: 420 });
+  }
+
   /** Re-fit the whole mounted graph — the "fit" control in the toolbar. */
   fitView(): void {
     this.fitToContent();
@@ -599,6 +774,16 @@ export class CanvasController {
 
   private reduceNode(id: string, data: NodeAttributes): Partial<NodeDisplayData> {
     const result: Partial<NodeDisplayData> = { ...data };
+    if (id.startsWith(HALO_PREFIX)) {
+      // Decoration only: never labelled, never highlighted, and dimmed with
+      // its node when a hover pushes the rest of the graph back.
+      result.label = null;
+      if (this.hovered && !this.highlightNodes.has(id.slice(HALO_PREFIX.length))) {
+        result.color = withAlpha(data.color, 0.06);
+      }
+      return result;
+    }
+    if (!this.hovered && this.resultNodes.has(id)) result.forceLabel = true;
     if (id === this.selected) {
       result.highlighted = true;
       result.forceLabel = true;
@@ -620,7 +805,15 @@ export class CanvasController {
 
   private reduceEdge(id: string, data: EdgeAttributes): Partial<EdgeDisplayData> {
     const result: Partial<EdgeDisplayData> = { ...data };
-    if (!this.hovered) return result;
+    const inResult = !data.backbone && !!data.modelKey && this.resultEdges.has(data.modelKey);
+    if (!this.hovered) {
+      if (inResult) {
+        result.size = data.size * 1.9;
+        result.color = withAlpha(data.color, 0.95);
+        result.zIndex = 2;
+      }
+      return result;
+    }
     if (this.highlightEdges.has(id)) {
       result.size = data.size * 1.9;
       result.color = data.backbone ? 'rgba(190, 210, 240, 0.8)' : withAlpha(data.color, 0.95);
@@ -634,14 +827,17 @@ export class CanvasController {
   // ---------------------------------------------------------------- events --
 
   private bindEvents(): void {
-    this.sigma.on('enterNode', ({ node }) => this.setHover(node));
+    // Every pointer target is normalized through `baseNode`, so a halo ring
+    // behaves exactly like the node it hugs rather than as a phantom object.
+    this.sigma.on('enterNode', ({ node }) => this.setHover(baseNode(node)));
     this.sigma.on('leaveNode', () => this.setHover(null));
 
-    this.sigma.on('clickNode', ({ node, event }) => {
+    this.sigma.on('clickNode', ({ node: clicked, event }) => {
       if (this.suppressClick) {
         this.suppressClick = false;
         return;
       }
+      const node = baseNode(clicked);
       const original = event.original as MouseEvent;
       if (original && original.shiftKey) {
         this.toggle(node);
@@ -663,7 +859,7 @@ export class CanvasController {
     });
 
     this.sigma.on('downNode', ({ node, event }) => {
-      this.dragId = node;
+      this.dragId = baseNode(node);
       this.dragMoved = false;
       this.dragSamples = [{ t: performance.now(), x: this.sigma.viewportToGraph(event).x }];
       this.startAnimation();
@@ -843,6 +1039,11 @@ export class CanvasController {
       enabledKinds: [...this.enabledKinds],
     });
   }
+}
+
+/** A halo's id maps back to the node it decorates; anything else is itself. */
+function baseNode(id: string): string {
+  return id.startsWith(HALO_PREFIX) ? id.slice(HALO_PREFIX.length) : id;
 }
 
 /** `#rrggbb` → `rgba(...)`, used for the hover dim. */
