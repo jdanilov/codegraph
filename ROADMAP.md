@@ -30,7 +30,7 @@ a bump is what evicts stale daemons still serving old code.
 | 1j | Reference re-attribution into extractor spans | Done |
 | 1h | Resolver-supplied edge provenance | Done |
 | 1k | Call-wrapper unwrapping (JSX components) | Done |
-| 2 | Graph visualizer | Deferred |
+| 2 | Graph visualizer | In progress |
 | 3 | Meaning layer | Deferred |
 
 ### Plugin ownership boundaries
@@ -255,19 +255,19 @@ stays a single index.
 
 ---
 
-## 2 — Graph visualizer (deferred)
+## 2 — Graph visualizer (in progress)
 
-Local web UI over the existing index: `codegraph serve --web` attaching to the running
-daemon, serving a small JSON API plus a static SPA.
-
-Core principle: **never render the whole graph.** Three views — focus+expand from a
-search hit; flow view between two symbols as a layered DAG; roll-up view aggregating to
-file/directory/package. Colour edges by provenance so heuristic hops are visually
-distinct from static ones. Optional `git diff` overlay to show changed nodes and their
-blast radius.
-
-Renderer: Cytoscape.js + dagre. Layered layouts, not force-directed — call flows are
-directional and force-directed layouts destroy that.
+Design settled with the maintainer; the full contract lives in
+**`docs/design/visualizer.md`** — locked decisions, visual language, HTTP API,
+and the four-phase agent-train plan (A server+scaffold → B canvas → C panels →
+D questions+changes). Headlines: `codegraph ui` subcommand in this package
+(node:http, zero new runtime deps, 127.0.0.1, no auth), sigma.js WebGL canvas,
+`contains` drawn as an expandable atom/nucleus backbone (never as edge lines),
+radial left-to-right ~120° wedge layout, provenance rendered (solid parsed /
+dashed heuristic), switchable color modes (kind / layer), Changes view with
+git-hunk→node-span badges + impact radius, question cards backed by explore
+with optional LLM refinement, feedback-export markdown for agent prompts.
+Explicitly out of scope for v1: history/time animation, auth, UI tests.
 
 ---
 
