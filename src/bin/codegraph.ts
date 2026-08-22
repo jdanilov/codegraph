@@ -20,6 +20,7 @@
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph affected [files]   Find test files affected by changes
+ *   codegraph ui [path]          Serve the local graph visualizer
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
@@ -42,6 +43,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
+import { validateProjectPath } from '../utils';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -1697,6 +1699,57 @@ function printFileTree(
 
   renderNode(root, '', true, 0);
 }
+
+/**
+ * codegraph ui — local graph visualizer.
+ *
+ * Serves the web UI plus its JSON API on 127.0.0.1 only. A project that has no
+ * `.codegraph/` yet is still served: the UI shows an "index now" screen and can
+ * build the index for you.
+ */
+program
+  .command('ui [path]')
+  .description('Open the local graph visualizer in your browser')
+  .option('-p, --port <port>', 'Port to listen on', String(4747))
+  .option('--path <path>', 'Project root to visualize (defaults to the current directory)')
+  .action(async (pathArg: string | undefined, options: { port?: string; path?: string }) => {
+    const projectPath = resolveProjectPath(options.path ?? pathArg);
+
+    const invalid = validateProjectPath(projectPath);
+    if (invalid) {
+      error(invalid);
+      process.exit(1);
+    }
+
+    const port = Number.parseInt(options.port ?? '4747', 10);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      error(`Invalid port: ${options.port}`);
+      process.exit(1);
+    }
+
+    try {
+      const { startUiServer } = await import('../ui-server');
+      const server = await startUiServer({ projectRoot: projectPath, port });
+
+      console.log('');
+      console.log(`  ${chalk.bold('CodeGraph UI')}  ${chalk.dim(server.projectRoot)}`);
+      console.log(`  ${chalk.cyan(server.url)}`);
+      if (!isInitialized(projectPath)) {
+        console.log(`  ${chalk.dim('Not indexed yet — the UI will offer to build the index.')}`);
+      }
+      console.log(`  ${chalk.dim('Press Ctrl+C to stop.')}`);
+      console.log('');
+
+      const shutdown = () => {
+        void server.close().then(() => process.exit(0));
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+    } catch (err) {
+      error(`Failed to start the UI server: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
 
 /**
  * codegraph daemon — interactive manager for the background daemons. Arrow keys

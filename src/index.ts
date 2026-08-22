@@ -1259,6 +1259,18 @@ export class CodeGraph {
   }
 
   /**
+   * The live database connection behind this instance.
+   *
+   * For whole-graph READS the typed query layer doesn't cover — the visualizer
+   * server exports every node and edge in one pass for `GET /api/graph`.
+   * Always fetch it through this accessor rather than caching the handle:
+   * {@link reopenIfReplaced} can swap the underlying connection out.
+   */
+  getDatabase(): DatabaseConnection {
+    return this.db;
+  }
+
+  /**
    * Active SQLite backend for this project's connection (`node-sqlite` — Node's
    * built-in real-SQLite module). Surfaced via `codegraph status` and the
    * `codegraph_status` MCP tool alongside the effective journal mode.

@@ -1,0 +1,305 @@
+/**
+ * Visualizer server (`codegraph ui`) — route contract tests.
+ *
+ * Covers the shapes `docs/design/visualizer.md` fixes: `contains` never appears
+ * in `edges` (it is the `parent` backbone), `dataVersion` drives the graph
+ * ETag, un-indexed roots answer without erroring, later-phase endpoints answer
+ * 501 with the contract's shape, and no served path escapes the project root.
+ */
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import * as fs from 'fs';
+import * as http from 'http';
+import * as os from 'os';
+import * as path from 'path';
+
+import CodeGraph from '../src/index';
+import { startUiServer, type UiServer } from '../src/ui-server';
+import { layerOf } from '../src/ui-server/graph-payload';
+import { tokenizeCommand, buildEditorArgv } from '../src/ui-server/editor';
+import { mergeSettings, settingsView } from '../src/ui-server/settings';
+
+let projectRoot: string;
+let emptyRoot: string;
+let server: UiServer;
+let emptyServer: UiServer;
+
+async function getJson(base: string, route: string, init?: RequestInit): Promise<{ status: number; body: any; headers: Headers }> {
+  const response = await fetch(`${base}${route}`, init);
+  const text = await response.text();
+  let body: unknown = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = text;
+  }
+  return { status: response.status, body, headers: response.headers };
+}
+
+beforeAll(async () => {
+  projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-ui-'));
+  fs.mkdirSync(path.join(projectRoot, 'src'), { recursive: true });
+  fs.writeFileSync(
+    path.join(projectRoot, 'src', 'alpha.ts'),
+    'export function alpha(): number {\n  return beta() + 1;\n}\n\nexport function beta(): number {\n  return 41;\n}\n'
+  );
+
+  const graph = await CodeGraph.init(projectRoot, { index: false });
+  await graph.indexAll();
+  graph.destroy();
+
+  emptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-ui-empty-'));
+
+  server = await startUiServer({ projectRoot, port: 0 });
+  emptyServer = await startUiServer({ projectRoot: emptyRoot, port: 0 });
+}, 120_000);
+
+afterAll(async () => {
+  await server?.close();
+  await emptyServer?.close();
+  for (const dir of [projectRoot, emptyRoot]) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+});
+
+describe('GET /api/status', () => {
+  it('reports an indexed project', async () => {
+    const { status, body } = await getJson(server.url, '/api/status');
+    expect(status).toBe(200);
+    expect(body.indexed).toBe(true);
+    expect(body.root).toBe(projectRoot);
+    expect(body.nodeCount).toBeGreaterThan(0);
+    expect(typeof body.dataVersion).toBe('number');
+  });
+
+  it('reports an un-indexed root without erroring', async () => {
+    const { status, body } = await getJson(emptyServer.url, '/api/status');
+    expect(status).toBe(200);
+    expect(body.indexed).toBe(false);
+    expect(body.nodeCount).toBe(0);
+  });
+});
+
+describe('GET /api/graph', () => {
+  it('expresses contains through parent, never as an edge', async () => {
+    const { status, body } = await getJson(server.url, '/api/graph');
+    expect(status).toBe(200);
+    expect(body.nodes.length).toBeGreaterThan(0);
+    expect(body.edges.some((edge: { kind: string }) => edge.kind === 'contains')).toBe(false);
+
+    const file = body.nodes.find((node: { kind: string }) => node.kind === 'file');
+    expect(file.parent).toMatch(/^dir:/);
+
+    const alpha = body.nodes.find((node: { name: string }) => node.name === 'alpha');
+    expect(alpha.parent).toBe(file.id);
+  });
+
+  it('rolls file counts and LoC up the directory tree', async () => {
+    const { body } = await getJson(server.url, '/api/graph');
+    const root = body.dirs.find((dir: { path: string }) => dir.path === '');
+    expect(root.parent).toBeNull();
+    expect(root.fileCount).toBeGreaterThan(0);
+    expect(root.loc).toBeGreaterThan(0);
+  });
+
+  it('answers 304 for a matching ETag', async () => {
+    const first = await fetch(`${server.url}/api/graph`);
+    const etag = first.headers.get('etag');
+    expect(etag).toBeTruthy();
+    await first.text();
+
+    const second = await fetch(`${server.url}/api/graph`, {
+      headers: { 'If-None-Match': etag as string },
+    });
+    expect(second.status).toBe(304);
+
+    const stale = await fetch(`${server.url}/api/graph`, {
+      headers: { 'If-None-Match': 'W/"v999999"' },
+    });
+    expect(stale.status).toBe(200);
+    await stale.text();
+  });
+
+  it('serves an empty payload for an un-indexed root', async () => {
+    const { status, body } = await getJson(emptyServer.url, '/api/graph');
+    expect(status).toBe(200);
+    expect(body.indexed).toBe(false);
+    expect(body.nodes).toEqual([]);
+  });
+});
+
+describe('GET /api/search and /api/node/:id', () => {
+  it('finds a symbol and returns its body plus edges', async () => {
+    const { body: hits } = await getJson(server.url, '/api/search?q=alpha');
+    expect(hits.length).toBeGreaterThan(0);
+    const hit = hits.find((entry: { name: string }) => entry.name === 'alpha');
+    expect(hit).toBeTruthy();
+
+    const { status, body } = await getJson(server.url, `/api/node/${encodeURIComponent(hit.id)}`);
+    expect(status).toBe(200);
+    expect(body.node.name).toBe('alpha');
+    expect(body.source.content).toContain('function alpha');
+    expect(body.outgoing.some((edge: { kind: string }) => edge.kind === 'calls')).toBe(true);
+  });
+
+  it('404s an unknown node id', async () => {
+    const { status, body } = await getJson(server.url, '/api/node/does-not-exist');
+    expect(status).toBe(404);
+    expect(body.error.code).toBe('not_found');
+  });
+});
+
+describe('GET /api/source', () => {
+  it('returns the requested span', async () => {
+    const { status, body } = await getJson(server.url, '/api/source?file=src/alpha.ts&start=1&end=2');
+    expect(status).toBe(200);
+    expect(body.mode).toBe('full');
+    expect(body.startLine).toBe(1);
+    expect(body.endLine).toBe(2);
+    expect(body.content.split('\n')).toHaveLength(2);
+  });
+
+  it('refuses a path that escapes the project root', async () => {
+    const { status, body } = await getJson(server.url, '/api/source?file=../../etc/hosts');
+    expect(status).toBe(403);
+    expect(body.error.code).toBe('forbidden');
+  });
+
+  it('501s diff mode with the contract shape', async () => {
+    const { status, body } = await getJson(server.url, '/api/source?file=src/alpha.ts&mode=diff');
+    expect(status).toBe(501);
+    expect(body.error.code).toBe('not_implemented');
+    expect(body.hunks).toEqual([]);
+  });
+});
+
+describe('cards and settings', () => {
+  it('round-trips cards through .codegraph/ui/cards.json', async () => {
+    const cards = [{ id: 'card-1', question: 'how does alpha reach beta?', createdAt: 1 }];
+    const put = await getJson(server.url, '/api/cards', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cards),
+    });
+    expect(put.status).toBe(200);
+
+    const { body } = await getJson(server.url, '/api/cards');
+    expect(body).toEqual(cards);
+    expect(fs.existsSync(path.join(projectRoot, '.codegraph', 'ui', 'cards.json'))).toBe(true);
+  });
+
+  it('rejects a malformed cards body', async () => {
+    const { status } = await getJson(server.url, '/api/cards', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nope: true }),
+    });
+    expect(status).toBe(400);
+  });
+
+  it('masks the API key when reading settings back', () => {
+    const view = settingsView({ anthropicApiKey: 'secret-key-abcd', editorCommand: 'code -g {file}:{line}' });
+    expect(view.anthropicApiKey).not.toContain('secret');
+    expect(view.anthropicApiKey?.endsWith('abcd')).toBe(true);
+    expect(view.anthropicApiKeySet).toBe(true);
+  });
+
+  it('keeps the stored key when the masked value is submitted back', () => {
+    const merged = mergeSettings({ anthropicApiKey: 'real-key' }, { anthropicApiKey: '••••••••-key' });
+    expect(merged.anthropicApiKey).toBe('real-key');
+    expect(mergeSettings({ anthropicApiKey: 'real-key' }, { anthropicApiKey: null }).anthropicApiKey).toBeUndefined();
+  });
+});
+
+describe('later-phase endpoints', () => {
+  it('501s explore, ask and changes with contract shapes', async () => {
+    const explore = await getJson(server.url, '/api/explore', {
+      method: 'POST',
+      body: JSON.stringify({ query: 'alpha beta' }),
+    });
+    expect(explore.status).toBe(501);
+    expect(explore.body.flow).toEqual([]);
+
+    const ask = await getJson(server.url, '/api/ask', {
+      method: 'POST',
+      body: JSON.stringify({ question: 'what calls alpha?' }),
+    });
+    expect(ask.status).toBe(501);
+
+    const changes = await getJson(server.url, '/api/changes');
+    expect(changes.status).toBe(501);
+    expect(changes.body.changedNodes).toEqual([]);
+  });
+
+  it('409s /api/open when no editor command is configured', async () => {
+    // The stored template lives in the user's home dir; only assert the
+    // no-editor branch when this machine genuinely has none configured.
+    const configured = fs.existsSync(path.join(os.homedir(), '.codegraph', 'ui.json'));
+    if (configured) return;
+    const { status, body } = await getJson(server.url, '/api/open', {
+      method: 'POST',
+      body: JSON.stringify({ file: 'src/alpha.ts', line: 1 }),
+    });
+    expect(status).toBe(409);
+    expect(body.error.code).toBe('conflict');
+  });
+});
+
+describe('request hardening', () => {
+  it('rejects a non-loopback Host header', async () => {
+    // Raw http.request: fetch() refuses to let a caller set Host, and this
+    // DNS-rebinding guard is exactly about a forged one.
+    const status = await new Promise<number>((resolve, reject) => {
+      const request = http.request(
+        {
+          host: '127.0.0.1',
+          port: server.port,
+          path: '/api/status',
+          method: 'GET',
+          headers: { Host: 'attacker.example.com' },
+        },
+        (response) => {
+          response.resume();
+          response.on('end', () => resolve(response.statusCode ?? 0));
+        }
+      );
+      request.on('error', reject);
+      request.end();
+    });
+    expect(status).toBe(403);
+  });
+
+  it('404s an unknown API route and 405s a wrong method', async () => {
+    expect((await getJson(server.url, '/api/nope')).status).toBe(404);
+    expect((await getJson(server.url, '/api/status', { method: 'POST' })).status).toBe(405);
+  });
+});
+
+describe('helpers', () => {
+  it('derives layers only from the configured vocabulary', () => {
+    const vocabulary = new Set(['bg', 'pp']);
+    expect(layerOf('src/widget.bg.ts', vocabulary)).toBe('bg');
+    expect(layerOf('src/widget.bg.pp.ts', vocabulary)).toBe('bg.pp');
+    expect(layerOf('src/widget.ts', vocabulary)).toBeUndefined();
+    expect(layerOf('src/widget.test.ts', vocabulary)).toBeUndefined();
+    expect(layerOf('src/widget.bg.ts', new Set())).toBeUndefined();
+  });
+
+  it('tokenizes editor templates without a shell', () => {
+    expect(tokenizeCommand('code -g {file}:{line}')).toEqual(['code', '-g', '{file}:{line}']);
+    expect(tokenizeCommand('"/Applications/My Editor" --line {line} {file}')).toEqual([
+      '/Applications/My Editor',
+      '--line',
+      '{line}',
+      '{file}',
+    ]);
+    expect(buildEditorArgv('code -g {file}:{line}', '/tmp/a b.ts', 12)).toEqual([
+      'code',
+      '-g',
+      '/tmp/a b.ts:12',
+    ]);
+  });
+});

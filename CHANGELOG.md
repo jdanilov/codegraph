@@ -11,6 +11,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- New `codegraph ui` command: run it in a project and it serves a local web app at `http://127.0.0.1:4747` (pass `--port` for a different one, `--path` for a different project) that shows the project's graph — how many symbols, connections and files it holds, and whether the index is following your edits live. It listens on your machine only, and a project that hasn't been indexed yet gets an "index now" button instead of an error, with progress streaming as it builds. This is the first piece of the visualizer; the interactive graph canvas follows.
+
 - A project's `codegraph.json` can now carry a `plugins` section to tailor graph enrichment per project. Use `"plugins": { "disable": ["react"] }` to switch off a built-in framework resolver whose conventions don't match your codebase, and add an entry per opt-in plugin to turn it on and configure it. Projects without a `plugins` section are completely unaffected, and a malformed entry is warned about and skipped rather than failing the index.
 
 - Anonymous usage telemetry is now stored entirely on CodeGraph's own first-party infrastructure — no third-party analytics vendor receives any of it, and the endpoint that receives it makes no outbound requests at all. Individual events are deleted after 90 days, leaving only anonymous daily totals. Nothing about what is collected changed, your IP address is still never read or stored, and every off-switch works exactly as before (`codegraph telemetry off`, `CODEGRAPH_TELEMETRY=0`, `DO_NOT_TRACK=1`). `TELEMETRY.md` remains the complete field-by-field list.

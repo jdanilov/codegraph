@@ -71,6 +71,29 @@ All JSON under `/api/`; everything else serves `dist/ui-web/` static files
 | `POST /api/open` | `{ file, line }` → run the configured editor command template; `409` when unset (client then uses `vscode://`) |
 | `GET/PUT /api/settings` | `~/.codegraph/ui.json`: `{ editorCommand?, anthropicApiKey?, model? }`. The key is never echoed back in full (masked) |
 
+### Phase A clarifications (additive — no contract item changed)
+
+The server implemented in phase A fixes a few details the table above left
+open. Later phases and the client can rely on them:
+
+- **Directory identity.** `dirs[]` entries carry an `id` of `dir:<path>`
+  alongside `path`; the project root is `path: ""` / `id: "dir:"` with
+  `parent: null`. A file node's `parent` is its directory's id, so the
+  backbone is one connected tree from the root down to symbols. A symbol whose
+  `contains` parent is missing falls back to its file node.
+- **Extra response fields.** `/api/status` also returns `projectName`,
+  `edgeCount`, `indexing` and `watcherDegraded`; `/api/graph` also returns
+  `indexed`, `dataVersion`, `root`, `projectName` and the `layers` vocabulary.
+- **Errors** are `{ error: { code, message } }`. A 501 stub carries that error
+  **plus** the contract's empty result shape, so a client can read it without
+  special-casing. `GET /api/graph` is `ETag: W/"v<dataVersion>"`.
+- **`POST /api/index`** streams newline-delimited JSON events
+  (`start` / `log` / `done` / `error`), releasing the database to the spawned
+  CLI for the duration of the run.
+- **Hardening**: loopback `Host` headers only (DNS-rebinding), every served
+  path through `validatePathWithinRoot`, and the editor command is tokenized
+  and spawned without a shell.
+
 Standing views (always-present cards, client-side): **Project** (whole graph)
 and **Changes** (`/api/changes`, refreshed on `dataVersion` change).
 
