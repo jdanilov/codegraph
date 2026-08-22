@@ -94,6 +94,39 @@ open. Later phases and the client can rely on them:
   path through `validatePathWithinRoot`, and the editor command is tokenized
   and spawned without a shell.
 
+### Phase B clarifications (additive — no contract item changed)
+
+The canvas implemented in phase B pins down details the visual language left
+open. Phase C/D can rely on them:
+
+- **Sigma's y axis points UP on screen.** The layout therefore gives the FIRST
+  child (A) the most POSITIVE angle so it lands at the top. Anything that
+  computes positions must use the same convention or the graph renders Z→A.
+- **Initial view** is the root EXPANDED with every top-level directory
+  collapsed, so the first paint is already a wedge of atoms rather than a
+  single blob.
+- **Mount budget split.** Of the ≤2k budget, at most 1,200 are force-laid
+  "primaries"; the rest are satellites, allocated fair-share across collapsed
+  parents with a per-parent cap. A parent whose children were elided shows
+  `+N` in its label, and the toolbar reports `capped`.
+- **Shift+click on a satellite** expands it *and* every ancestor, so a drill-in
+  from a collapsed atom is one click. Collapsing removes the whole subtree from
+  the expansion set.
+- **The hover rule** for edges: a relation whose far endpoint is inside a
+  collapsed subtree is drawn, only while hovering, against the nearest MOUNTED
+  ancestor of that endpoint. Without it a collapsed directory reads as
+  unconnected. These lifted edges never persist past the hover.
+- **Edge-kind chips** are the contract's five in the contract's order, followed
+  by any other non-`contains` kind actually present in the payload (e.g.
+  `implements`, `overrides`) — an edge that is drawn is always toggleable.
+- **Camera framing.** A custom bounding box is pinned at the first fit so
+  sigma never re-normalizes the coordinate frame when the graph grows; without
+  it every expansion yanks the viewport. After an expansion the camera zooms
+  OUT only, and only when the new family doesn't fit.
+- **Phase C mount point**: `<GraphCanvas renderDetail={…} onSelect={…} />`.
+  `renderDetail(node)` replaces the stub body of the floating selection card;
+  `onSelect` publishes the canvas selection to the shell.
+
 Standing views (always-present cards, client-side): **Project** (whole graph)
 and **Changes** (`/api/changes`, refreshed on `dataVersion` change).
 
