@@ -30,6 +30,7 @@
  */
 import type { FrameworkResolver } from '../types';
 import { noopPlugin } from './noop';
+import { namespaceProxyPlugin } from './namespace-proxy';
 
 /**
  * Every in-tree plugin, in registration order. Appended to the built-in
@@ -37,6 +38,7 @@ import { noopPlugin } from './noop';
  */
 export const PLUGIN_RESOLVERS: readonly FrameworkResolver[] = [
   noopPlugin,
+  namespaceProxyPlugin,
 ];
 
 export {
@@ -54,3 +56,4 @@ export {
   type NoopPluginOptions,
 } from './noop';
 
+export { namespaceProxyPlugin, NAMESPACE_PROXY_PLUGIN_NAME } from './namespace-proxy';
