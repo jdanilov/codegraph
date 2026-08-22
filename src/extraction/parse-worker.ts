@@ -18,6 +18,7 @@ import { extractFromSource } from './tree-sitter';
 import { detectLanguage, loadGrammarsForLanguages, resetParser } from './grammars';
 import { tryKernelExtractRaw } from './kernel';
 import { getAllFrameworkResolvers, getApplicableFrameworks } from '../resolution/frameworks';
+import { setExtractionProjectRoot } from '../resolution/plugins/plugin-config';
 import type { Language, ExtractionResult } from '../types';
 
 // Emscripten prints `Aborted()` (and a follow-up RuntimeError diag
@@ -65,10 +66,13 @@ import type { Language, ExtractionResult } from '../types';
 const PARSER_RESET_INTERVAL = 5000;
 const parseCounts = new Map<Language, number>();
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array> }) => {
+parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array>; projectRoot?: string }) => {
   if (msg.type === 'load-grammars') {
     // Grammar WASM bytes pre-read by the main thread (when provided) make this
     // a memory load instead of a per-spawn disk read — see issue #1231.
+    // The project root rides along so plugin extract() hooks can locate the
+    // project's codegraph.json (detect() never runs in a worker).
+    if (msg.projectRoot) setExtractionProjectRoot(msg.projectRoot);
     await loadGrammarsForLanguages(msg.languages!, msg.grammarBuffers);
     parentPort!.postMessage({ type: 'grammars-loaded' });
   } else if (msg.type === 'parse') {

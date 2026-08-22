@@ -67,6 +67,58 @@ export interface ProjectConfig {
    * wins. Absent/empty (the default) forces nothing in.
    */
   include?: string[];
+  /**
+   * Per-project selection and configuration of graph-enrichment plugins.
+   *
+   *   {
+   *     "plugins": {
+   *       "disable": ["react", "vue"],
+   *       "some-plugin": { "someOption": ["a", "b"] },
+   *       "other-plugin": true
+   *     }
+   *   }
+   *
+   * Two independent things live here:
+   *   - `disable`: names of resolvers to turn OFF for this project. Applies
+   *     uniformly to built-in framework resolvers and to plugins.
+   *   - every other key: a plugin name mapped to that plugin's options. The
+   *     PRESENCE of the key is what turns the plugin on — plugins are opt-in
+   *     and stay off with no entry. `true` means "on, default options";
+   *     `false` (or `{ "enabled": false }`) means "off" and is equivalent to
+   *     naming it in `disable`.
+   *
+   * Absent `plugins` ⇒ today's behavior exactly. Unknown keys are ignored,
+   * malformed values warn-and-skip; nothing here is ever fatal.
+   */
+  plugins?: PluginsConfig;
+}
+
+/** Raw shape of the `plugins` section as written in `codegraph.json`. */
+export interface PluginsConfig {
+  /** Resolver/plugin names to turn off for this project. */
+  disable?: string[];
+  /** Plugin name → options object (or a bare boolean toggle). */
+  [pluginName: string]: unknown;
+}
+
+/** A single plugin's validated options object. */
+export type PluginOptions = Readonly<Record<string, unknown>>;
+
+/** Parsed, validated view of the `plugins` section. */
+export interface ParsedPluginsConfig {
+  /**
+   * Names turned OFF for this project — the union of the `disable` array and
+   * any plugin entry whose value is `false` / `{ "enabled": false }`. Applies
+   * to built-in framework resolvers and plugins alike.
+   */
+  readonly disabled: ReadonlySet<string>;
+  /**
+   * Plugin names explicitly turned ON — one key per plugin entry that wasn't
+   * disabled. A plugin absent from this set must not do anything.
+   */
+  readonly enabled: ReadonlySet<string>;
+  /** Per-plugin options, keyed by plugin name. Only enabled plugins appear. */
+  readonly options: Readonly<Record<string, PluginOptions>>;
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -75,6 +127,7 @@ interface ParsedConfig {
   includeIgnored: string[];
   exclude: string[];
   include: string[];
+  plugins: ParsedPluginsConfig;
 }
 
 interface CacheEntry {
@@ -90,13 +143,34 @@ interface CacheEntry {
  */
 const cache = new Map<string, CacheEntry>();
 
+/**
+ * Bumped by every `clearProjectConfigCache()`. Downstream caches that memoize a
+ * DERIVED view of this config (see `resolution/plugins/plugin-config.ts`) hold
+ * the generation they were built at and rebuild when it moves, so one cache
+ * clear invalidates everything without a registration/import cycle. Comparing a
+ * number is cheap enough for the reference-resolution hot path.
+ */
+let configGeneration = 0;
+
+/** Current project-config cache generation (see `configGeneration`). */
+export function getProjectConfigGeneration(): number {
+  return configGeneration;
+}
+
 /** Shared frozen empties so the no-config path allocates nothing. */
 const EMPTY_EXTENSIONS: Record<string, Language> = Object.freeze({});
+const EMPTY_PLUGIN_OPTIONS: Record<string, PluginOptions> = Object.freeze({});
+const EMPTY_PLUGINS: ParsedPluginsConfig = Object.freeze({
+  disabled: Object.freeze(new Set<string>()) as ReadonlySet<string>,
+  enabled: Object.freeze(new Set<string>()) as ReadonlySet<string>,
+  options: EMPTY_PLUGIN_OPTIONS,
+});
 const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   extensions: EMPTY_EXTENSIONS,
   includeIgnored: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
+  plugins: EMPTY_PLUGINS,
 });
 
 /**
@@ -149,15 +223,17 @@ function parseConfig(file: string): ParsedConfig {
   const includeIgnored = extractIncludeIgnored(parsed, file);
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
+  const plugins = extractPlugins(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
-    include.length === 0
+    include.length === 0 &&
+    plugins === EMPTY_PLUGINS
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include };
+  return { extensions, includeIgnored, exclude, include, plugins };
 }
 
 /**
@@ -265,6 +341,86 @@ function extractInclude(parsed: object, file: string): string[] {
 }
 
 /**
+ * Validate the `plugins` section: a `disable` array of resolver names plus one
+ * entry per opt-in plugin (an options object, or a bare boolean toggle). Every
+ * failure mode warns-and-skips that entry — a typo'd plugin name, a wrong-typed
+ * value, or a `plugins` key that isn't an object must never fail an index.
+ *
+ * Returns the shared frozen empty when the section contributes nothing, so the
+ * zero-config path stays allocation-free and identity-comparable.
+ */
+function extractPlugins(parsed: object, file: string): ParsedPluginsConfig {
+  const raw = (parsed as ProjectConfig).plugins;
+  if (raw === undefined) return EMPTY_PLUGINS;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    logWarn(`Ignoring "plugins" in ${PROJECT_CONFIG_FILENAME}: must be an object`, { file });
+    return EMPTY_PLUGINS;
+  }
+
+  const disabled = new Set<string>();
+  const enabled = new Set<string>();
+  const options: Record<string, PluginOptions> = {};
+
+  for (const [rawKey, value] of Object.entries(raw as Record<string, unknown>)) {
+    const key = typeof rawKey === 'string' ? rawKey.trim() : '';
+    if (!key) continue;
+
+    if (key === 'disable') {
+      if (!Array.isArray(value)) {
+        logWarn(`Ignoring "plugins.disable" in ${PROJECT_CONFIG_FILENAME}: must be an array of resolver names`, { file });
+        continue;
+      }
+      for (const entry of value) {
+        if (typeof entry !== 'string' || !entry.trim()) {
+          logWarn(`Ignoring a "plugins.disable" entry in ${PROJECT_CONFIG_FILENAME}: every name must be a non-empty string`, { file });
+          continue;
+        }
+        disabled.add(entry.trim());
+      }
+      continue;
+    }
+
+    // Bare boolean toggle: `"plugin": true` opts in with default options,
+    // `"plugin": false` is shorthand for naming it in `disable`.
+    if (typeof value === 'boolean') {
+      if (value) {
+        enabled.add(key);
+        options[key] = EMPTY_PLUGIN_OPTIONS;
+      } else {
+        disabled.add(key);
+      }
+      continue;
+    }
+
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      logWarn(`Ignoring plugin "${key}" in ${PROJECT_CONFIG_FILENAME}: value must be an options object or a boolean`, { file });
+      continue;
+    }
+
+    const opts = value as Record<string, unknown>;
+    if (opts.enabled === false) {
+      disabled.add(key);
+      continue;
+    }
+    enabled.add(key);
+    options[key] = Object.freeze({ ...opts });
+  }
+
+  // `disable` always wins over an options entry, whichever order they appear in.
+  for (const name of disabled) {
+    enabled.delete(name);
+    delete options[name];
+  }
+
+  if (disabled.size === 0 && enabled.size === 0) return EMPTY_PLUGINS;
+  return Object.freeze({
+    disabled: Object.freeze(disabled) as ReadonlySet<string>,
+    enabled: Object.freeze(enabled) as ReadonlySet<string>,
+    options: Object.freeze(options),
+  });
+}
+
+/**
  * Load the parsed `codegraph.json` for a project, mtime-cached. A missing or
  * malformed file yields the zero-config default. One `stat` (and at most one
  * read/parse) while a single config file is in force, shared across every field.
@@ -338,9 +494,27 @@ export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
 }
 
+/**
+ * Load the validated `plugins` section for a project, mtime-cached.
+ *
+ * Carries which resolver names this project turned off (`disabled`), which
+ * plugins it opted into (`enabled`), and each enabled plugin's options. An
+ * empty result — the zero-config default — means every built-in resolver runs
+ * and no plugin does, i.e. exactly today's behavior.
+ *
+ * Plugin code should not call this directly; use the cached, per-plugin helpers
+ * in `resolution/plugins/plugin-config.ts`, which are safe on the hot path.
+ */
+export function loadPluginsConfig(rootDir: string): ParsedPluginsConfig {
+  return loadParsedConfig(rootDir).plugins;
+}
+
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */
 export function clearProjectConfigCache(): void {
   cache.clear();
+  // Invalidate every derived cache built on top of this one (plugin
+  // enable/options lookups); see `getProjectConfigGeneration`.
+  configGeneration++;
 }
 
 /**

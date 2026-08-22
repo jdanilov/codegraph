@@ -33,6 +33,7 @@ import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
+import { setExtractionProjectRoot } from '../resolution/plugins/plugin-config';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
 
@@ -1632,6 +1633,11 @@ export class ExtractionOrchestrator {
     const parseWorkerPath = path.join(__dirname, 'parse-worker.js');
     const useWorker = fs.existsSync(parseWorkerPath);
 
+    // Let plugin extract() hooks locate this project's codegraph.json — on
+    // this thread (in-process fallback) and, via the pool option below, in
+    // every parse worker.
+    setExtractionProjectRoot(this.rootDir);
+
     let pool: ParseWorkerPool | null = null;
     if (useWorker) {
       // CODEGRAPH_PARSE_WORKERS: explicit worker count; 1 = the old single-worker
@@ -1657,6 +1663,7 @@ export class ExtractionOrchestrator {
         parseTimeoutMs: PARSE_TIMEOUT_MS,
         log,
         grammarBuffers,
+        projectRoot: this.rootDir,
       });
       log(`Parse worker pool: ${poolSize} worker(s)`);
       // Bulk index: every core will be needed — spawn the whole pool now so

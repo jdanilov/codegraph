@@ -11,6 +11,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- A project's `codegraph.json` can now carry a `plugins` section to tailor graph enrichment per project. Use `"plugins": { "disable": ["react"] }` to switch off a built-in framework resolver whose conventions don't match your codebase, and add an entry per opt-in plugin to turn it on and configure it. Projects without a `plugins` section are completely unaffected, and a malformed entry is warned about and skipped rather than failing the index.
+
 - Anonymous usage telemetry is now stored entirely on CodeGraph's own first-party infrastructure — no third-party analytics vendor receives any of it, and the endpoint that receives it makes no outbound requests at all. Individual events are deleted after 90 days, leaving only anonymous daily totals. Nothing about what is collected changed, your IP address is still never read or stored, and every off-switch works exactly as before (`codegraph telemetry off`, `CODEGRAPH_TELEMETRY=0`, `DO_NOT_TRACK=1`). `TELEMETRY.md` remains the complete field-by-field list.
 
 - `codegraph_explore` no longer re-sends source it already returned earlier in the same conversation. A file it has already shown you comes back as a short pointer — the path, the symbols and the exact line range, with confirmation that the file hasn't changed since — and the space that frees is spent on code you haven't seen yet, so a follow-up call covers new ground instead of repeating the last one. If a file was edited in between, its source is always shown again in full. Set `CODEGRAPH_EXPLORE_DEDUP=0` to turn this off.

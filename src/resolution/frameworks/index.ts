@@ -29,6 +29,8 @@ import { expoModulesResolver } from './expo-modules';
 import { fabricViewResolver } from './fabric';
 import { cicsResolver } from './cics';
 import { terraformResolver } from './terraform';
+import { PLUGIN_RESOLVERS } from '../plugins';
+import { getDisabledResolverNames } from '../plugins/plugin-config';
 
 /**
  * All registered framework resolvers
@@ -76,13 +78,40 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   cicsResolver,
   // Terraform / OpenTofu — disambiguate var/local/module/resource refs to same-dir module
   terraformResolver,
+  // Config-selected plugins (`src/resolution/plugins/`). Registered statically
+  // — see that module's header for why — and each one gates itself on the
+  // project's `codegraph.json` inside its own `detect()`, so a project that
+  // configures none of them is unaffected by their presence here.
+  ...PLUGIN_RESOLVERS,
 ];
 
 /**
- * Get all framework resolvers
+ * Names a project turned off through `plugins.disable` in `codegraph.json`.
+ * Empty (and allocation-free) for a project with no `plugins` key.
  */
-export function getAllFrameworkResolvers(): FrameworkResolver[] {
-  return FRAMEWORK_RESOLVERS;
+function disabledFor(projectRoot: string | undefined): ReadonlySet<string> | null {
+  if (!projectRoot) return null;
+  try {
+    const disabled = getDisabledResolverNames(projectRoot);
+    return disabled.size > 0 ? disabled : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get all framework resolvers.
+ *
+ * Pass `projectRoot` to honor that project's `plugins.disable` list. Called
+ * without one — the pre-existing signature, and what every caller that already
+ * filters by detected-framework NAME does — it returns the full registry
+ * unchanged, since a disabled resolver never made it into that name list in the
+ * first place (`detectFrameworks` drops it).
+ */
+export function getAllFrameworkResolvers(projectRoot?: string): FrameworkResolver[] {
+  const disabled = disabledFor(projectRoot);
+  if (!disabled) return FRAMEWORK_RESOLVERS;
+  return FRAMEWORK_RESOLVERS.filter((r) => !disabled.has(r.name));
 }
 
 /**
@@ -93,10 +122,24 @@ export function getFrameworkResolver(name: string): FrameworkResolver | undefine
 }
 
 /**
- * Detect which frameworks are used in a project
+ * Detect which frameworks are used in a project.
+ *
+ * This is the single gate every downstream consumer passes through — extraction
+ * and the parse workers both filter the registry by the NAMES this returns — so
+ * honoring `plugins.disable` here is what actually turns a resolver off
+ * everywhere. Plugins gate themselves inside their own `detect()`.
  */
 export function detectFrameworks(context: ResolutionContext): FrameworkResolver[] {
+  let projectRoot: string | undefined;
+  try {
+    projectRoot = context.getProjectRoot();
+  } catch {
+    projectRoot = undefined;
+  }
+  const disabled = disabledFor(projectRoot);
+
   return FRAMEWORK_RESOLVERS.filter((resolver) => {
+    if (disabled?.has(resolver.name)) return false;
     try {
       return resolver.detect(context);
     } catch {
@@ -108,6 +151,10 @@ export function detectFrameworks(context: ResolutionContext): FrameworkResolver[
 /**
  * Filter a list of detected frameworks down to ones that apply to a given language.
  * Frameworks without an explicit `languages` list are treated as universal.
+ *
+ * Deliberately not plugin-aware: it filters a list the caller already obtained
+ * from `detectFrameworks` (or by name from it), so anything `plugins.disable`
+ * turned off is gone before it gets here.
  */
 export function getApplicableFrameworks(
   detected: FrameworkResolver[],

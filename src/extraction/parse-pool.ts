@@ -180,6 +180,12 @@ export interface ParseWorkerPoolOptions {
    * the worker's own disk read.
    */
   grammarBuffers?: Record<string, Uint8Array>;
+  /**
+   * Project root forwarded to every worker's `load-grammars` message, so a
+   * plugin's `extract()` hook can locate the project's `codegraph.json` from
+   * inside a worker (where `detect()` never runs).
+   */
+  projectRoot?: string;
 }
 
 export class ParseWorkerPool {
@@ -202,10 +208,12 @@ export class ParseWorkerPool {
   private readonly createWorker: () => ParsePoolWorker;
   private readonly log: (msg: string) => void;
   private readonly grammarBuffers?: Record<string, Uint8Array>;
+  private readonly projectRoot?: string;
 
   constructor(opts: ParseWorkerPoolOptions) {
     this.languages = opts.languages;
     this.grammarBuffers = opts.grammarBuffers;
+    this.projectRoot = opts.projectRoot;
     this.maxSize = Math.max(1, Math.min(opts.size, MAX_PARSE_POOL_SIZE));
     this.recycleInterval = opts.recycleInterval ?? DEFAULT_RECYCLE_INTERVAL;
     this.parseTimeoutMs = opts.parseTimeoutMs ?? DEFAULT_PARSE_TIMEOUT_MS;
@@ -278,7 +286,7 @@ export class ParseWorkerPool {
     // Load grammars; the worker replies 'grammars-loaded' and only then is idle.
     // Pre-read WASM bytes (when the orchestrator provided them) make this a
     // memory load instead of a per-spawn disk read.
-    w.postMessage({ type: 'load-grammars', languages: this.languages, grammarBuffers: this.grammarBuffers });
+    w.postMessage({ type: 'load-grammars', languages: this.languages, grammarBuffers: this.grammarBuffers, projectRoot: this.projectRoot });
   }
 
   private onMessage(w: ParsePoolWorker, m: ParseWorkerMessage): void {
