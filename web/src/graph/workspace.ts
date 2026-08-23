@@ -82,8 +82,21 @@ export const CROSS_EDGE_BOW = 0.14;
 /** Samples along a cross-disk curve — enough for a smooth long span. */
 export const CROSS_EDGE_SAMPLES = 24;
 
-/** Where a secondary disk's close affordance sits on its rim (up and right). */
-export const CLOSE_ANGLE = -Math.PI / 4;
+/**
+ * First angle of {@link placeSpawnedDisk}'s fallback scan (up and right), and
+ * therefore the direction a crowded workspace prefers to grow in.
+ */
+const SCAN_START_ANGLE = -Math.PI / 4;
+
+/**
+ * How far BELOW a disk's centre its close `×` sits, in layout units (phase G2).
+ *
+ * The centre circle is 62 units and its `N loc` line sits ~10 units down, so 32
+ * clears the text and still leaves the button comfortably inside the circle at
+ * any zoom. It moved here from the rim, where it competed with the wedges for
+ * the eye and shifted every time the disk's radius changed.
+ */
+export const CLOSE_CENTRE_OFFSET = 32;
 
 // ------------------------------------------------------------------ bounds ---
 
@@ -188,12 +201,13 @@ export function fromDiskLocal(local: Point, disk: DiskPlacement): Point {
   return { x: local.x + disk.x, y: local.y + disk.y };
 }
 
-/** Where a secondary disk's `×` sits, in workspace coordinates. */
-export function closeAnchor(disk: DiskPlacement): Point {
-  return {
-    x: disk.x + Math.cos(CLOSE_ANGLE) * disk.radius,
-    y: disk.y + Math.sin(CLOSE_ANGLE) * disk.radius,
-  };
+/**
+ * Where a secondary disk's `×` sits, in workspace coordinates: in the CENTRE
+ * circle, one line below the `N loc` caption. Independent of the radius, so it
+ * does not move when a re-root changes how far the disk reaches.
+ */
+export function closeAnchor(disk: Point): Point {
+  return { x: disk.x, y: disk.y + CLOSE_CENTRE_OFFSET };
 }
 
 // ------------------------------------------------------------- spawn placing ---
@@ -272,7 +286,7 @@ export function placeSpawnedDisk(
   const step = radius + gap;
   for (let ring = 1; ring <= SCAN_RINGS; ring++) {
     for (let slot = 0; slot < SCAN_ANGLES; slot++) {
-      const angle = CLOSE_ANGLE + (slot * Math.PI * 2) / SCAN_ANGLES;
+      const angle = SCAN_START_ANGLE + (slot * Math.PI * 2) / SCAN_ANGLES;
       const candidate = {
         x: preferred.x + Math.cos(angle) * step * ring,
         y: preferred.y + Math.sin(angle) * step * ring,

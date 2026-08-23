@@ -248,14 +248,22 @@ const GLOW_RESULT = '#67e8f9';
 const CENTRE_FILL = 'rgba(24, 33, 52, 0.92)';
 const CENTRE_STROKE = 'rgba(140, 165, 205, 0.45)';
 
-/** Phase G chrome: the drag ghost, the close `×`, the "expanded away" tick. */
+/** Phase G chrome: the drag ghost, the close `×`, the expansion tether. */
 const GHOST_RADIUS_PX = 44;
 const GHOST_STROKE = 'rgba(140, 200, 255, 0.75)';
 const GHOST_FILL = 'rgba(24, 40, 66, 0.55)';
 const CLOSE_RADIUS_PX = 9;
 const CLOSE_HIT_PX = 13;
-const SPAWN_TICK_PX = 5;
-const SPAWN_TICK_COLOR = '#7dd3fc';
+/**
+ * The tether: one quiet line from a collapsed wedge's rim to the disk that
+ * expanded it. Deliberately NOT an edge colour — it is not a relation in the
+ * code, it is the workspace saying "that subtree is over there", so it borrows
+ * neither the green/amber direction vocabulary nor the dashed-for-heuristic
+ * one. Always on while the disk exists, which is the other half of telling it
+ * apart from a code edge (those are drawn on demand only).
+ */
+const TETHER_COLOR = 'rgba(148, 163, 184, 0.42)';
+const TETHER_WIDTH_PX = 1;
 /** Ring around the focused disk's centre, drawn only once there are several. */
 const FOCUS_RING = 'rgba(125, 211, 252, 0.55)';
 
@@ -328,6 +336,8 @@ interface DiskState {
   primary: boolean;
   /** Node the drag-away spawned this disk from — `null` for the primary. */
   source: string | null;
+  /** Disk the drag-away started in — where this disk's tether is anchored. */
+  sourceDiskId: string | null;
 
   layout: SunburstLayout | null;
   labelGeom: ArcLabelGeom[];
@@ -439,8 +449,17 @@ export class CanvasController {
   /** File node id → what changed in it, for the outer-rim change markers. */
   private changeMarkers = new Map<string, ChangeMarker>();
 
-  /** Node id → how many open disks were dragged out of it (the "away" tick). */
-  private expandedAway = new Map<string, number>();
+  /**
+   * Node id → how many open disks are rooted at it (phase G2).
+   *
+   * These are the COLLAPSED nodes: a node expanded as its own disk is drawn in
+   * every other disk as a third-depth stub with no children below it, and the
+   * relations of its subtree are routed to the disk that actually shows it. The
+   * count is a multiset because two disks can be dragged out of one wedge.
+   */
+  private expandedNodes = new Map<string, number>();
+  /** `expandedNodes`' keys, sorted and joined — part of the layout cache key. */
+  private collapsedSignature = '';
 
   /** `(font bucket, text)` → measured width in SCREEN px. */
   private readonly textWidths = new Map<string, number>();
@@ -509,7 +528,8 @@ export class CanvasController {
     if (!previous || !sameProject) {
       this.disks = [makeDisk(PRIMARY_DISK_ID, initialRoot(model), 0, 0, true, null)];
       this.focusedDiskId = PRIMARY_DISK_ID;
-      this.expandedAway.clear();
+      this.expandedNodes.clear();
+      this.collapsedSignature = '';
       this.enabledKinds = new Set(model.edgeKinds);
       this.selected = null;
       this.zoom = 1;
@@ -521,7 +541,7 @@ export class CanvasController {
       this.disks = this.disks.filter((disk) => disk.primary || model.nodes.has(disk.rootId));
       const primary = this.primary();
       if (!model.nodes.has(primary.rootId)) primary.rootId = initialRoot(model);
-      this.rebuildExpandedAway();
+      this.rebuildExpandedNodes();
       if (!this.disks.some((disk) => disk.id === this.focusedDiskId)) {
         this.focusedDiskId = PRIMARY_DISK_ID;
       }
@@ -655,23 +675,38 @@ export class CanvasController {
    * Spawn a disk rooted at `nodeId` near a workspace point — the drop half of
    * the drag-away gesture. Placement is nudged clear of every existing disk, so
    * two disks never overlap at birth.
+   *
+   * The node becomes COLLAPSED everywhere else the moment the disk exists, so
+   * every layout is rebuilt: the source wedge shrinks to a stub, its subtree
+   * stops being drawn twice, and the freed arc budget goes to the wedges that
+   * still have children to show.
    */
-  private spawnDisk(nodeId: string, at: Point, layout: SunburstLayout | null): DiskState | null {
+  private spawnDisk(
+    nodeId: string,
+    at: Point,
+    sourceDiskId: string | null,
+    layout: SunburstLayout | null
+  ): DiskState | null {
     const model = this.model;
     if (!model || !model.nodes.has(nodeId)) return null;
-    const resolved = layout ?? this.layoutFor(nodeId);
-    const placed = placeSpawnedDisk(this.placements(), at, resolved.maxRadius);
+    // The RADIUS only has to be right for placement; the collapsed set cannot
+    // change a disk's own root, so the ghost's preview layout is still valid.
+    const placement = layout ?? this.layoutFor(nodeId);
+    const placed = placeSpawnedDisk(this.placements(), at, placement.maxRadius);
     this.diskSeq += 1;
-    const disk = makeDisk(`disk:${this.diskSeq}`, resolved.rootId, placed.x, placed.y, false, nodeId);
-    disk.layout = resolved;
+    const disk = makeDisk(
+      `disk:${this.diskSeq}`,
+      placement.rootId,
+      placed.x,
+      placed.y,
+      false,
+      nodeId,
+      sourceDiskId
+    );
     this.disks.push(disk);
-    this.buildLabelGeometry(disk);
-    this.expandedAway.set(nodeId, (this.expandedAway.get(nodeId) ?? 0) + 1);
+    this.rebuildExpandedNodes();
     this.focusedDiskId = disk.id;
-    this.projectHighlight();
-    this.edgesDirty = true;
-    this.requestDraw();
-    this.emitSummary();
+    this.rebuildAllLayouts();
     return disk;
   }
 
@@ -680,7 +715,7 @@ export class CanvasController {
     const disk = this.diskById(id);
     if (!disk || disk.primary) return;
     this.disks = this.disks.filter((entry) => entry.id !== id);
-    this.rebuildExpandedAway();
+    this.rebuildExpandedNodes();
     if (this.focusedDiskId === id) this.focusedDiskId = PRIMARY_DISK_ID;
     if (this.hoveredDiskId === id) {
       this.hoveredDiskId = null;
@@ -689,18 +724,21 @@ export class CanvasController {
     }
     if (this.closeHoverDiskId === id) this.closeHoverDiskId = null;
     if (this.pulseDiskId === id) this.pulseNodeId = null;
-    this.edgesDirty = true;
-    this.requestDraw();
-    this.emitSummary();
+    // Its source wedge is whole again — every layout is rebuilt for that.
+    this.rebuildAllLayouts();
   }
 
-  /** Recount the "expanded elsewhere" ticks from the disks that exist now. */
-  private rebuildExpandedAway(): void {
-    this.expandedAway = new Map();
+  /**
+   * Recount the collapsed set from the disks that exist now, and re-derive the
+   * cache signature. Every layout depends on it, so callers re-lay out after.
+   */
+  private rebuildExpandedNodes(): void {
+    this.expandedNodes = new Map();
     for (const disk of this.disks) {
       if (!disk.source) continue;
-      this.expandedAway.set(disk.source, (this.expandedAway.get(disk.source) ?? 0) + 1);
+      this.expandedNodes.set(disk.source, (this.expandedNodes.get(disk.source) ?? 0) + 1);
     }
+    this.collapsedSignature = [...this.expandedNodes.keys()].sort().join('\u0000');
   }
 
   // ---------------------------------------------------------- navigation ---
@@ -1008,16 +1046,25 @@ export class CanvasController {
 
   // --------------------------------------------------------------- layout ---
 
-  /** The (cached) layout for a root under the current model and sort mode. */
+  /**
+   * The (cached) layout for a root under the current model, sort mode and
+   * COLLAPSED set — all three are inputs to `computeSunburst`, so all three are
+   * in the key. Closing a disk restores the previous signature, and with it the
+   * layouts computed under it, so a spawn/close round trip still costs nothing.
+   */
   private layoutFor(rootId: string): SunburstLayout {
-    const key = `${rootId}|${this.sortMode}`;
+    const suffix = `|${this.sortMode}|${this.collapsedSignature}`;
+    const key = `${rootId}${suffix}`;
     const cached = this.layoutCache.get(key);
     if (cached) return cached;
-    const layout = computeSunburst(this.model!, rootId, { sort: this.sortMode });
+    const layout = computeSunburst(this.model!, rootId, {
+      sort: this.sortMode,
+      collapsed: new Set(this.expandedNodes.keys()),
+    });
     this.layoutCache.set(key, layout);
     // `computeSunburst` may fall back to the project root for an unknown id;
     // cache the answer under the root it actually produced too.
-    this.layoutCache.set(`${layout.rootId}|${this.sortMode}`, layout);
+    this.layoutCache.set(`${layout.rootId}${suffix}`, layout);
     return layout;
   }
 
@@ -1297,6 +1344,8 @@ export class CanvasController {
     ctx.save();
     ctx.translate(origin.x, origin.y);
     ctx.scale(scale, scale);
+    // Tethers first, so a code edge is never hidden under one.
+    this.drawTethers(ctx, scale);
     this.drawEdges(ctx, null, scale);
     ctx.restore();
 
@@ -1382,7 +1431,6 @@ export class CanvasController {
       }
 
       this.drawChangeMarker(ctx, arc, a0, a1, alpha);
-      this.drawSpawnTick(ctx, arc, k);
     }
   }
 
@@ -1402,29 +1450,6 @@ export class CanvasController {
     }
     const phase = (elapsed / PULSE_MS) * PULSE_CYCLES * Math.PI;
     return Math.abs(Math.sin(phase)) * (1 - elapsed / PULSE_MS);
-  }
-
-  /**
-   * "Expanded elsewhere" — a short tick on the outer edge of a wedge the user
-   * dragged a disk out of, for as long as that disk exists.
-   *
-   * The source wedge is still a normal wedge; without the tick, a workspace of
-   * four disks gives no answer to "which of these came from where", and the only
-   * honest answer is on the wedge itself.
-   */
-  private drawSpawnTick(ctx: CanvasRenderingContext2D, arc: SunburstArc, k: number): void {
-    if (this.expandedAway.size === 0 || !arc.nodeId) return;
-    if (!this.expandedAway.has(arc.nodeId)) return;
-    const mid = (arc.a0 + arc.a1) / 2;
-    const length = Math.min(SPAWN_TICK_PX / k, (arc.r1 - arc.r0) * 0.7);
-    const cos = Math.cos(mid);
-    const sin = Math.sin(mid);
-    ctx.beginPath();
-    ctx.moveTo(cos * arc.r1, sin * arc.r1);
-    ctx.lineTo(cos * (arc.r1 - length), sin * (arc.r1 - length));
-    ctx.strokeStyle = SPAWN_TICK_COLOR;
-    ctx.lineWidth = 1.8 / k;
-    ctx.stroke();
   }
 
   /**
@@ -1560,6 +1585,66 @@ export class CanvasController {
     ctx.font = `500 ${10 / k}px ui-sans-serif, system-ui, sans-serif`;
     ctx.fillStyle = 'rgba(190, 205, 230, 0.72)';
     ctx.fillText(fitText(ctx, `${formatNumber(layout.rootLoc)} loc`, width), 0, (parent ? 14 : 10) / k);
+  }
+
+  /**
+   * The EXPANSION tethers: one quiet line per secondary disk, from the rim of
+   * the disk holding its collapsed wedge to the nearest point on its own rim.
+   *
+   * It answers "which of these disks came from where" — the question a
+   * workspace of four disks otherwise leaves unanswered. It is deliberately not
+   * a code edge and does not look like one: neutral, thin, solid, and ALWAYS
+   * visible, where relations are drawn only on hover/selection and carry the
+   * green/amber direction colours. The anchor is the collapsed wedge's mid
+   * angle, so the line leaves the disk pointing at the thing it expanded.
+   */
+  private drawTethers(ctx: CanvasRenderingContext2D, k: number): void {
+    if (this.disks.length < 2) return;
+    ctx.lineCap = 'round';
+    ctx.setLineDash([]);
+    ctx.strokeStyle = TETHER_COLOR;
+    ctx.lineWidth = TETHER_WIDTH_PX / k;
+    for (const disk of this.disks) {
+      if (disk.primary || !disk.source) continue;
+      const anchor = this.tetherAnchor(disk);
+      if (!anchor) continue;
+      const radius = disk.layout?.maxRadius ?? MAX_RADIUS;
+      const dx = anchor.x - disk.x;
+      const dy = anchor.y - disk.y;
+      const distance = Math.hypot(dx, dy);
+      // The wedge's rim point is inside this disk — the two overlap, and a line
+      // drawn from inside outward would point the wrong way. Say nothing.
+      if (distance <= radius) continue;
+      ctx.beginPath();
+      ctx.moveTo(anchor.x, anchor.y);
+      ctx.lineTo(disk.x + (dx / distance) * radius, disk.y + (dy / distance) * radius);
+      ctx.stroke();
+    }
+  }
+
+  /**
+   * Workspace point a disk's tether leaves from: the rim of the disk that holds
+   * its collapsed wedge, at that wedge's mid angle.
+   *
+   * The disk the drag STARTED in answers when it still renders the wedge;
+   * otherwise (it was re-rooted away, or closed) any disk that does will do, in
+   * creation order. No disk renders it → no tether, rather than a line from an
+   * arbitrary centre.
+   */
+  private tetherAnchor(disk: DiskState): Point | null {
+    const nodeId = disk.source;
+    if (!nodeId) return null;
+    const preferred = this.diskById(disk.sourceDiskId);
+    const candidates = preferred ? [preferred, ...this.disks] : this.disks;
+    for (const holder of candidates) {
+      if (holder.id === disk.id) continue;
+      const arc = holder.layout?.byNode.get(nodeId);
+      if (!arc) continue;
+      const mid = (arc.a0 + arc.a1) / 2;
+      const radius = holder.layout!.maxRadius;
+      return { x: holder.x + Math.cos(mid) * radius, y: holder.y + Math.sin(mid) * radius };
+    }
+    return null;
   }
 
   /** Paint the relations belonging to one disk (`null` = the cross-disk set). */
@@ -1854,8 +1939,13 @@ export class CanvasController {
   // ------------------------------------------------------- workspace chrome ---
 
   /**
-   * The `×` on a hovered secondary disk, in SCREEN space so it keeps its size
-   * at every zoom. No transitions, like every other surface here.
+   * The `×` on a hovered secondary disk — in the CENTRE circle, under the
+   * `N loc` line, drawn in SCREEN space so it keeps its size at every zoom.
+   *
+   * It sat on the rim through phase G1, where it competed with the wedges for
+   * the eye and moved with the disk's radius. The centre circle is the one part
+   * of a disk that is always chrome rather than data, and "close this disk" is
+   * chrome. No transitions, like every other surface here.
    */
   private drawDiskChrome(ctx: CanvasRenderingContext2D): void {
     if (this.disks.length < 2) return;
@@ -1863,14 +1953,7 @@ export class CanvasController {
       if (disk.primary) continue;
       const shown = this.hoveredDiskId === disk.id || this.closeHoverDiskId === disk.id;
       if (!shown) continue;
-      const anchor = this.toScreen(
-        closeAnchor({
-          id: disk.id,
-          x: disk.x,
-          y: disk.y,
-          radius: disk.layout?.maxRadius ?? MAX_RADIUS,
-        })
-      );
+      const anchor = this.closeAnchorScreen(disk);
       const hot = this.closeHoverDiskId === disk.id;
       ctx.beginPath();
       ctx.arc(anchor.x, anchor.y, CLOSE_RADIUS_PX, 0, Math.PI * 2);
@@ -2057,6 +2140,18 @@ export class CanvasController {
     const layout = disk.layout;
     const model = this.model;
     if (!layout || !model) return { score: 0, arc: null };
+    // A subtree that is EXPANDED as its own disk does not answer here (phase
+    // G2). The stub this disk draws for it stands for a structure it is no
+    // longer showing, so an edge landing on it would attach a relation to a
+    // wedge that cannot be read — the disk that expanded the node renders the
+    // real endpoint, and scoring 0 here is what routes the edge there.
+    if (layout.collapsed.size > 0) {
+      if (layout.collapsed.has(nodeId)) return { score: 0, arc: null };
+      for (const ancestor of model.ancestors(nodeId)) {
+        if (layout.collapsed.has(ancestor)) return { score: 0, arc: null };
+        if (ancestor === disk.rootId) break;
+      }
+    }
     const direct = layout.byNode.get(nodeId);
     if (direct) return { score: 4, arc: direct };
     const folded = layout.aggregatedInto.get(nodeId);
@@ -2172,19 +2267,17 @@ export class CanvasController {
     return { disk, local: toDiskLocal(workspace, placement) };
   }
 
+  /** Screen position of a secondary disk's `×` — its centre, one line down. */
+  private closeAnchorScreen(disk: DiskState): Point {
+    return this.toScreen(closeAnchor({ x: disk.x, y: disk.y }));
+  }
+
   /** The secondary disk whose `×` a screen point is on, if any. */
   private closeButtonUnder(screen: Point): DiskState | null {
     if (this.disks.length < 2) return null;
     for (const disk of this.disks) {
       if (disk.primary) continue;
-      const anchor = this.toScreen(
-        closeAnchor({
-          id: disk.id,
-          x: disk.x,
-          y: disk.y,
-          radius: disk.layout?.maxRadius ?? MAX_RADIUS,
-        })
-      );
+      const anchor = this.closeAnchorScreen(disk);
       if (Math.hypot(screen.x - anchor.x, screen.y - anchor.y) <= CLOSE_HIT_PX) return disk;
     }
     return null;
@@ -2354,7 +2447,12 @@ export class CanvasController {
 
     if (drag.mode === 'wedge') {
       if (drag.moved && drag.outside && drag.nodeId) {
-        this.spawnDisk(drag.nodeId, this.toWorkspace(position.x, position.y), drag.preview);
+        this.spawnDisk(
+          drag.nodeId,
+          this.toWorkspace(position.x, position.y),
+          drag.diskId,
+          drag.preview
+        );
         this.suppressClick = true;
         return;
       }
@@ -2475,9 +2573,10 @@ export class CanvasController {
       this.requestDraw();
     }
     if (closeHover) {
-      // The `×` sits ON its disk's rim, so the disk stays hovered (that is what
-      // keeps the button on screen) but the WEDGE hover goes: the pointer is on
-      // a button now, and a tooltip about the arc underneath is a lie.
+      // The `×` sits in its disk's CENTRE circle, so the disk stays hovered
+      // (that is what keeps the button on screen) but the WEDGE hover goes: the
+      // pointer is on a button now, and a tooltip about what is under it is a
+      // lie — and the press must not read as the centre's up-navigation.
       this.setHover(closeHover.id, null, null);
       this.canvas.style.cursor = 'pointer';
       return;
@@ -2636,7 +2735,8 @@ function makeDisk(
   x: number,
   y: number,
   primary: boolean,
-  source: string | null
+  source: string | null,
+  sourceDiskId: string | null = null
 ): DiskState {
   return {
     id,
@@ -2645,6 +2745,7 @@ function makeDisk(
     y,
     primary,
     source,
+    sourceDiskId,
     layout: null,
     labelGeom: [],
     labelPlan: null,

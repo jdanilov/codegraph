@@ -39,10 +39,12 @@
  *     are folded into one `+N` fold arc per parent, so a directory of 900
  *     tiny files is one honest arc rather than 900 unreadable hairlines.
  *
- * Symbols are drawn only where their file's wedge is wide enough to read
- * ({@link SYMBOL_RING_MIN_ANGLE}) — and always when the user has re-rooted into
- * the file, because then the file *is* the centre and its children own the full
- * 360°.
+ * The arc budget is spent **breadth first** (phase G2): every wedge is offered
+ * its first child before any wedge is offered its second. The old rule — a
+ * file or symbol grew a ring of its own only once its wedge passed a minimum
+ * angle — meant a small file simply showed nothing until the user drilled into
+ * it, which reads as "the children were silently dropped". See
+ * {@link computeSunburst} for the exact round-robin and its invariant.
  */
 import { DIRECTORY_KIND, ROOT_ID, type GraphModel, type ModelNode } from './model';
 
@@ -54,8 +56,16 @@ export const START_ANGLE = -Math.PI / 2;
 /** No arc is ever thinner than this — the "still clickable" floor. */
 export const MIN_ARC_ANGLE = (1.1 * Math.PI) / 180;
 
-/** A file/symbol wedge must be at least this wide to show its own children. */
-export const SYMBOL_RING_MIN_ANGLE = (6 * Math.PI) / 180;
+/**
+ * Share of its normal radial depth a wedge keeps while it is **expanded as its
+ * own disk** somewhere else in the workspace (phase G2).
+ *
+ * The subtree lives in the other disk now, so the source wedge is a stub that
+ * says "this is still here, and it is over there" — a third of the depth reads
+ * as exactly that next to its full-depth siblings, without moving any of them
+ * (the ANGLE is untouched: a collapsed wedge keeps its share of the circle).
+ */
+export const COLLAPSED_DEPTH_SHARE = 1 / 3;
 
 /** Rings drawn outward from the current root before the rest is aggregated. */
 export const MAX_RINGS = 6;
@@ -236,6 +246,13 @@ export interface SunburstLayout {
   /** Direct child id → the aggregate arc that swallowed it. */
   aggregatedInto: Map<string, SunburstArc>;
   /**
+   * Nodes rendered COLLAPSED here because they are expanded as their own disk
+   * (phase G2): a third-depth wedge with no children below it. The workspace
+   * reads this to route relations away from the stub and on to the disk that
+   * actually shows the subtree.
+   */
+  collapsed: Set<string>;
+  /**
    * Arcs indexed by ring and **sorted by `a0`**, so a hit test binary-searches
    * one ring per level rather than scanning the disk. Radii are per branch, so
    * the ring alone no longer tells you the radius — the hit test checks the
@@ -312,54 +329,91 @@ interface Slot {
   angle: number;
 }
 
+/** One child of a parent, as the fit and the budget pass see it. */
+export interface FitChild {
+  id: string;
+  size: number;
+}
+
+/** Who survives one parent's own geometry, before the global budget speaks. */
+export interface FitSelection {
+  /** Survivors, **in display order** — the round-robin's candidate list. */
+  kept: FitChild[];
+  /** Children the geometry alone already folded, in display order. */
+  tail: FitChild[];
+}
+
 /**
- * Split `span` among `children`, **in the display order they arrive in**.
+ * How many children a parent's span can render individually.
  *
- * **A child is folded only when it does not fit.** The parent can hold
- * `span / minAngle` slots (never more than {@link MAX_SLOTS_PER_PARENT}, which
- * is what stops a 300-child directory from rendering as a fine-toothed comb);
- * if the children fit, every one of them is drawn, with the tiny ones resting
- * on the sliver floor. If they don't, the SMALLEST are folded into the
- * `+N` fold arc — which is a size decision, while the order the survivors
- * are drawn in stays whatever the caller asked for (phase F: the structural
- * sort must not be re-shuffled by the fold). The aggregate arc is always last.
+ * `span / minAngle` slots, never more than {@link MAX_SLOTS_PER_PARENT} (which
+ * is what stops a 300-child directory from rendering as a fine-toothed comb).
+ * When the children do not all fit, one slot has to go to the `+N` fold arc, so
+ * the survivor count is one less than the capacity.
+ *
+ * Exported because it is the geometric half of the breadth-first invariant: a
+ * probe can recompute `K(parent)` from nothing but the wedge's span and its
+ * child count, without re-deriving the layout's internals.
+ */
+export function fitCapacity(span: number, childCount: number): number {
+  if (childCount <= 0 || span < MIN_ARC_ANGLE) return 0;
+  const capacity = Math.max(
+    1,
+    Math.min(MAX_SLOTS_PER_PARENT, Math.floor(span / MIN_ARC_ANGLE + 1e-9))
+  );
+  return childCount <= capacity ? childCount : Math.max(0, capacity - 1);
+}
+
+/**
+ * Which of `children` fit in `span`, **in the display order they arrive in**.
+ *
+ * **A child is folded only when it does not fit.** If the children fit, every
+ * one of them survives, with the tiny ones resting on the sliver floor. If they
+ * don't, the SMALLEST are folded into the `+N` fold arc — which is a size
+ * decision, while the order the survivors are drawn in stays whatever the
+ * caller asked for (phase F: the structural sort must not be re-shuffled by the
+ * fold).
  *
  * A *share* threshold was tried first and is wrong: 40 equally-sized files in a
  * 6° wedge are each below any fixed share, so the whole directory folded into a
  * single `+40` arc even though four of them fit comfortably. Fit is the only
  * honest threshold.
- *
- * Every slot then gets `minAngle` plus a proportional share of what is left,
- * which sums back to exactly `span`.
  */
-export function allocateSlots(
-  children: Array<{ id: string; size: number }>,
-  span: number,
-  minAngle: number
-): Slot[] {
-  if (children.length === 0 || span < minAngle) return [];
-
-  const capacity = Math.max(
-    1,
-    Math.min(MAX_SLOTS_PER_PARENT, Math.floor(span / minAngle + 1e-9))
-  );
-  const fits = children.length <= capacity;
-  let kept = children;
-  let tail: Array<{ id: string; size: number }> = [];
-  if (!fits) {
-    const keptCount = Math.max(0, capacity - 1);
-    // Rank by size to decide WHO survives; index order decides where they sit.
-    const survivors = new Set(
-      children
-        .map((child, index) => ({ index, size: child.size }))
-        .sort((a, b) => b.size - a.size || a.index - b.index)
-        .slice(0, keptCount)
-        .map((entry) => entry.index)
-    );
-    kept = children.filter((_, index) => survivors.has(index));
-    tail = children.filter((_, index) => !survivors.has(index));
+export function fitChildren(children: readonly FitChild[], span: number): FitSelection {
+  const keptCount = fitCapacity(span, children.length);
+  if (keptCount === 0) {
+    // Nothing renders individually. A span too thin for even one arc has no
+    // fold arc either; otherwise everything folds into one.
+    return { kept: [], tail: span < MIN_ARC_ANGLE ? [] : [...children] };
   }
+  if (keptCount >= children.length) return { kept: [...children], tail: [] };
 
+  // Rank by size to decide WHO survives; index order decides where they sit.
+  const survivors = new Set(
+    children
+      .map((child, index) => ({ index, size: child.size }))
+      .sort((a, b) => b.size - a.size || a.index - b.index)
+      .slice(0, keptCount)
+      .map((entry) => entry.index)
+  );
+  return {
+    kept: children.filter((_, index) => survivors.has(index)),
+    tail: children.filter((_, index) => !survivors.has(index)),
+  };
+}
+
+/**
+ * Turn a kept/tail split into angular slots that sum back to exactly `span`.
+ *
+ * Every slot gets {@link MIN_ARC_ANGLE} plus a proportional share of what is
+ * left. The aggregate arc is always last, whatever order the survivors are in.
+ */
+export function sizeSlots(
+  kept: readonly FitChild[],
+  tail: readonly FitChild[],
+  span: number
+): Slot[] {
+  const minAngle = MIN_ARC_ANGLE;
   const slots: Slot[] = kept.map((child) => ({
     id: child.id,
     ids: [child.id],
@@ -381,6 +435,20 @@ export function allocateSlots(
   return slots;
 }
 
+/**
+ * One parent's slots under its own geometry alone — the composition of
+ * {@link fitChildren} and {@link sizeSlots}, with no budget pressure.
+ *
+ * `computeSunburst` does not call this (it has to interleave the fit of every
+ * parent in a ring with the global budget), but it is the honest statement of
+ * what a parent gets when the budget is not the binding constraint.
+ */
+export function allocateSlots(children: readonly FitChild[], span: number): Slot[] {
+  if (children.length === 0 || span < MIN_ARC_ANGLE) return [];
+  const fit = fitChildren(children, span);
+  return sizeSlots(fit.kept, fit.tail, span);
+}
+
 // --------------------------------------------------------------- layout ----
 
 export interface SunburstOptions {
@@ -388,7 +456,23 @@ export interface SunburstOptions {
   maxArcs?: number;
   /** Sibling order. Defaults to {@link DEFAULT_SORT_MODE}. */
   sort?: SortMode;
+  /**
+   * Nodes that are **expanded as their own disk** elsewhere in the workspace.
+   *
+   * Such a wedge is drawn at {@link COLLAPSED_DEPTH_SHARE} of its normal depth
+   * and grows no children here: its subtree lives in the other disk, so drawing
+   * it twice would claim two homes for one structure. Nothing folds into a `+N`
+   * for it either — there is no "more inside" to promise, the "more" is on the
+   * other disk, and the tether drawn between the two says so.
+   *
+   * A node is never collapsed in the disk it is the ROOT of (the root has no
+   * arc), so the expanded disk always shows the subtree in full.
+   */
+  collapsed?: ReadonlySet<string>;
 }
+
+/** Nothing collapsed — the shared empty set, so the common path allocates none. */
+const NO_COLLAPSED: ReadonlySet<string> = new Set<string>();
 
 /**
  * Siblings in display order for the active mode.
@@ -425,22 +509,74 @@ function orderChildren(
 }
 
 /**
- * Whether an arc is wide enough (and the right kind) to grow another ring.
+ * Whether a wedge can grow another ring at all — **geometry only** (phase G2).
  *
- * Directories always drill; files and symbols only do so once their wedge is
- * legible, which is what keeps the outermost ring from turning into a hairline
- * comb. A wedge that cannot hold two children plus a tail is left alone rather
- * than stacking `+N` arcs radially outward, which reads as noise.
+ * The kind no longer enters into it. Files and symbols used to need a legible
+ * wedge ({@link MIN_ARC_ANGLE} × ~5.5) before they grew a ring of their own,
+ * which meant a small file showed NOTHING until the user drilled into it — the
+ * "children silently dropped" reading this pass exists to remove. What is left
+ * is the one honest floor: a wedge has to be able to render at least one real
+ * child.
+ *
+ *  - one child → it needs one sliver;
+ *  - more than one → it needs two, because the second slot is the `+N` fold arc.
+ *    A wedge that could only ever draw a lone `+N` is left alone instead: a ring
+ *    of nothing but fold arcs stacked radially outward reads as noise, and the
+ *    parent's own tooltip already says how many children it is holding back.
  */
 function canDescend(arc: SunburstArc, childCount: number): boolean {
   if (childCount === 0) return false;
   const span = arc.a1 - arc.a0;
-  const needed = childCount === 1 ? MIN_ARC_ANGLE : MIN_ARC_ANGLE * 3;
-  if (span < needed) return false;
-  if (arc.kind === DIRECTORY_KIND) return true;
-  return span >= SYMBOL_RING_MIN_ANGLE;
+  return span >= (childCount === 1 ? MIN_ARC_ANGLE : MIN_ARC_ANGLE * 2);
 }
 
+/**
+ * The layout — a pure, deterministic function of (model, root, options).
+ *
+ * ## The breadth-first arc budget (phase G2)
+ *
+ * The disk has a global arc budget ({@link MAX_ARCS}). It used to be spent
+ * depth-first and greedily: each parent in a ring took every child it could fit,
+ * in turn, and a whole ring was dropped once the budget could not hold it. On
+ * top of that a file or symbol only grew a ring at all once its wedge passed a
+ * legibility angle — so a small file's symbols were simply absent, with nothing
+ * on screen saying so. Both rules are gone.
+ *
+ * A ring is now laid out in three passes:
+ *
+ *  1. **Per-parent geometric fit.** Each parent independently decides which of
+ *     its children can be rendered at the sliver floor ({@link fitChildren}),
+ *     folding the rest — this is unchanged, and it is why the minimum arc angle
+ *     still governs how many children a thin wedge can ever show.
+ *  2. **Round-robin by sibling index.** Every parent is offered its 1st
+ *     surviving child, then every parent its 2nd, then its 3rd… until the budget
+ *     runs out. Parents are visited in the order their wedges sit around the
+ *     disk, so the pass is deterministic.
+ *  3. **Sizing.** Whatever a parent was granted keeps the sort mode's display
+ *     order; everything else — geometric tail and budget remainder alike — folds
+ *     into that parent's single `+N` arc, which is always drawn last.
+ *
+ * The budget is charged for fold arcs too, and a parent that is holding anything
+ * back is charged for its fold arc *before* it is offered another child. That is
+ * what makes the cap exact: a ring never draws more arcs than the budget left.
+ *
+ * **The invariant this buys.** Write `K(p)` for the children of parent `p` that
+ * survive `p`'s own geometric fit, and `A(p)` for the ones actually rendered.
+ * Then, within one ring:
+ *
+ *   - `A(p)` is a **prefix** of `p`'s fitted survivors in display order;
+ *   - `A(p) < K(p)` (p was cut short by the budget) **implies** `A(q) ≤ A(p) + 1`
+ *     for every other parent `q` in the ring — the `+1` because the budget can
+ *     run out part-way through a round.
+ *
+ * In words: no wedge gets a second child while another wedge still has none.
+ * A wedge showing fewer children than a sibling wedge is either at its own
+ * geometric limit or within one of it.
+ *
+ * Rings are still laid out outward in order, so the budget is spent shallowest
+ * first — which is what "breadth first" means for a disk whose deeper rings do
+ * not exist until the ring above them is placed.
+ */
 export function computeSunburst(
   model: GraphModel,
   requestedRootId: string,
@@ -449,6 +585,7 @@ export function computeSunburst(
   const maxRings = Math.min(options.maxRings ?? MAX_RINGS, MAX_RINGS);
   const maxArcs = options.maxArcs ?? MAX_ARCS;
   const sort = options.sort ?? DEFAULT_SORT_MODE;
+  const collapsedNodes = options.collapsed ?? NO_COLLAPSED;
   const sizes = sizesOf(model);
 
   const root = model.get(requestedRootId) ?? model.get(ROOT_ID)!;
@@ -458,6 +595,7 @@ export function computeSunburst(
   const byKey = new Map<string, SunburstArc>();
   const byNode = new Map<string, SunburstArc>();
   const aggregatedInto = new Map<string, SunburstArc>();
+  const collapsed = new Set<string>();
   const byRing: SunburstArc[][] = [[]];
   let truncated = false;
 
@@ -480,6 +618,16 @@ export function computeSunburst(
     const thickness = ringThickness(ring);
     const produced: SunburstArc[] = [];
 
+    // --- pass 1: each parent's own geometric fit, independent of the budget.
+    interface Pending {
+      item: Frontier;
+      childCount: number;
+      children: FitChild[];
+      fit: FitSelection;
+      /** How many of `fit.kept` the round-robin has granted so far. */
+      granted: number;
+    }
+    const pending: Pending[] = [];
     for (const item of frontier) {
       const childIds = model.childrenOf(item.nodeId);
       if (childIds.length === 0) continue;
@@ -498,10 +646,56 @@ export function computeSunburst(
         sort
       );
 
-      const span = item.a1 - item.a0;
-      const slots = allocateSlots(children, span, MIN_ARC_ANGLE);
-      if (slots.length === 0) {
+      const fit = fitChildren(children, item.a1 - item.a0);
+      if (fit.kept.length === 0 && fit.tail.length === 0) {
         if (item.arc) item.arc.hiddenChildren = childIds.length;
+        truncated = true;
+        continue;
+      }
+      pending.push({ item, childCount: childIds.length, children, fit, granted: 0 });
+    }
+    if (pending.length === 0) break;
+
+    // --- pass 2: the breadth-first budget. `committed` is what this ring will
+    // cost if the round-robin stopped right now: one arc per granted child plus
+    // one fold arc for every parent still holding something back. Granting a
+    // child costs 1, unless it is the parent's LAST — then it also retires that
+    // parent's fold arc, so the net cost is 0.
+    const budget = Math.max(0, maxArcs - arcs.length);
+    let folds = pending.length; // every parent starts out holding everything back
+    let committed = folds;
+    if (committed > budget) {
+      // Not even one arc per parent fits. A partial ring here would be an
+      // arbitrary subset of the disk, so nothing is drawn and the layout says so.
+      truncated = true;
+      break;
+    }
+    let widest = 0;
+    for (const entry of pending) widest = Math.max(widest, entry.fit.kept.length);
+    roundRobin: for (let index = 0; index < widest; index++) {
+      for (const entry of pending) {
+        if (entry.fit.kept.length <= index) continue;
+        const last = index === entry.fit.kept.length - 1 && entry.fit.tail.length === 0;
+        const cost = last ? 0 : 1;
+        if (committed + cost > budget) break roundRobin;
+        committed += cost;
+        if (last) folds -= 1;
+        entry.granted = index + 1;
+      }
+    }
+
+    // --- pass 3: sizing. Whatever was granted keeps the display order; the rest
+    // folds into this parent's single `+N` arc.
+    for (const entry of pending) {
+      const { item, fit } = entry;
+      const r0 = item.r0;
+      const granted = new Set(fit.kept.slice(0, entry.granted).map((child) => child.id));
+      const kept = fit.kept.slice(0, entry.granted);
+      const tail = entry.children.filter((child) => !granted.has(child.id));
+      const span = item.a1 - item.a0;
+      const slots = sizeSlots(kept, tail, span);
+      if (slots.length === 0) {
+        if (item.arc) item.arc.hiddenChildren = entry.childCount;
         truncated = true;
         continue;
       }
@@ -516,6 +710,8 @@ export function computeSunburst(
         // Radial depth is the KIND's floor plus whatever the LABEL wants
         // (round 4). An aggregate takes the deepest of what it folded, so a
         // `+N` arc never looks shallower than the siblings it stands in for.
+        // A wedge expanded as its own disk keeps a third of that (phase G2).
+        const isCollapsed = node !== undefined && collapsedNodes.has(node.id);
         const factor = node
           ? labelDepthFactor(node.kind, node.name)
           : slot.ids.reduce((deepest, id) => {
@@ -524,6 +720,7 @@ export function computeSunburst(
                 ? Math.max(deepest, labelDepthFactor(child.kind, child.name))
                 : deepest;
             }, 1);
+        const depth = thickness * factor * (isCollapsed ? COLLAPSED_DEPTH_SHARE : 1);
         const arc: SunburstArc = {
           key: slot.id ?? aggregateKey(item.nodeId),
           nodeId: slot.id,
@@ -532,33 +729,31 @@ export function computeSunburst(
           a0,
           a1,
           r0,
-          r1: Math.min(MAX_RADIUS, r0 + thickness * factor),
+          r1: Math.min(MAX_RADIUS, r0 + depth),
           parentKey: item.arc?.key ?? null,
           parentNodeId: item.nodeId,
           weight: slot.size,
-          hiddenChildren: node ? model.childrenOf(node.id).length : slot.ids.length,
+          // A collapsed wedge hides nothing: its subtree is on the other disk,
+          // in full, which is a different claim from "there is more in here".
+          hiddenChildren: isCollapsed ? 0 : node ? model.childrenOf(node.id).length : slot.ids.length,
           // A fold arc is labelled `+N`, nothing more: it is drawn at the same
           // size as its neighbours and "smaller" ate the room a real name needs.
           label: node ? node.name : `+${slot.ids.length}`,
           kind: node ? node.kind : AGGREGATE_KIND,
         };
         if (node?.layer) arc.layer = node.layer;
+        if (isCollapsed) collapsed.add(node!.id);
         produced.push(arc);
         if (!slot.id) truncated = true;
       });
 
       if (item.arc) {
         const rendered = slots.filter((slot) => slot.id !== null).length;
-        item.arc.hiddenChildren = childIds.length - rendered;
+        item.arc.hiddenChildren = entry.childCount - rendered;
       }
     }
 
     if (produced.length === 0) break;
-    if (arcs.length + produced.length > maxArcs) {
-      // Never render a partial ring: a half-drawn ring reads as missing data.
-      truncated = true;
-      break;
-    }
 
     const ringArcs: SunburstArc[] = [];
     for (const arc of produced) {
@@ -578,6 +773,10 @@ export function computeSunburst(
     const next: Frontier[] = [];
     for (const arc of ringArcs) {
       if (!arc.nodeId) continue;
+      // A wedge expanded as its own disk grows nothing here — and, unlike every
+      // other reason not to descend, that is not truncation: the whole subtree
+      // is on the other disk, and the tether between them says where.
+      if (collapsedNodes.has(arc.nodeId)) continue;
       const childCount = model.childrenOf(arc.nodeId).length;
       if (ring >= maxRings || !canDescend(arc, childCount)) {
         if (childCount > 0) truncated = true;
@@ -607,6 +806,7 @@ export function computeSunburst(
     byKey,
     byNode,
     aggregatedInto,
+    collapsed,
     byRing,
     rings,
     truncated,

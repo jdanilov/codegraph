@@ -857,6 +857,97 @@ G2/G3 and are **deliberately not built here** (see the deferrals at the end).
   become shareable — and therefore what will decide whether the URL grows beyond
   the primary disk).
 
+### Phase G — multi-disk workspace (2) (additive; supersedes three G1 items)
+
+A manual review of the G1 build. It changes how the arc budget is spent, gives
+an expanded wedge an honest representation in the disk it came from, and moves
+one affordance. No contract item and no endpoint shape changed.
+
+- **The arc budget is spent BREADTH FIRST, round-robin by sibling index.**
+  Every wedge is offered its 1st child before any wedge is offered its 2nd.
+  *Supersedes phase E's "a file or symbol only grows a ring of its own once its
+  wedge is ≥ 6°"* and the whole-ring rejection ("never render a partial ring"):
+  a small file used to show **nothing** until the user drilled into it, which
+  reads as "the children were silently dropped", and a ring that did not fit the
+  budget vanished entirely. A ring is now laid out in three passes:
+  1. **Per-parent geometric fit** — unchanged. Each parent decides on its own
+     which children it can render at the minimum sliver (1.1°, capped at 96
+     slots) and folds the rest. The minimum arc angle still governs how many
+     children a thin wedge can *ever* show.
+  2. **Round-robin** over every parent in the ring, in the order their wedges sit
+     around the disk, taking one child per parent per pass until the budget runs
+     out. The budget is charged for fold arcs too, and a parent that is holding
+     anything back is charged for its `+N` arc **before** it is offered another
+     child — which is what makes the cap exact rather than approximate.
+  3. **Sizing** — the granted children keep the sort mode's display order;
+     everything else (geometric tail *and* budget remainder) folds into that
+     parent's single `+N` arc, drawn last, exactly as before.
+
+  **The invariant.** Write `K(p)` for the children of parent `p` that survive
+  `p`'s own geometric fit and `A(p)` for those actually rendered. Within one
+  ring: `A(p)` is a **prefix of `p`'s fitted survivors in display order**, and
+  `A(p) < K(p)` (p was cut short by the budget) **implies `A(q) ≤ A(p) + 1` for
+  every other parent `q` in that ring** — the `+1` because the budget can run out
+  part-way through a round. In words: no wedge gets a second child while another
+  wedge still has none. Rings are still laid out outward in order, so the budget
+  is spent shallowest first, which is what "breadth first" means for a disk whose
+  deeper rings do not exist until the ring above them is placed.
+
+  Only the *kind* gate is gone from `canDescend`; the geometric floor stays — one
+  child needs one sliver, more than one needs two (the second slot is the fold
+  arc), because a ring of nothing but `+N` arcs stacked radially outward is
+  noise and the parent's own tooltip already says how many it is holding back.
+  Measured on a real 14.2k-node project (559 roots × both sort modes): the layout
+  draws **+12.2%** arcs, **2,912** parents that previously showed fewer children
+  (or none) now show them, and the largest disk grew from 327 to 414 arcs — still
+  a fifth of the 2,000 budget. Under forced caps as low as 8 arcs (2,992 layouts,
+  2,870 budget-cut parents) the cap was never exceeded, the `A_max − A_cut`
+  spread was never more than 1, every `+N` count was exact and every layout
+  re-ran byte-identically.
+- **A wedge expanded as its own disk COLLAPSES where it came from.** While a
+  secondary disk is rooted at a node, every other disk draws that node as a stub:
+  1. **one third of its normal radial depth** (`COLLAPSED_DEPTH_SHARE`) — its
+     angle is untouched, so nothing around it moves;
+  2. **no children**, and nothing folded into a `+N` for it either. There is no
+     "more inside" to promise: the more is on the other disk, in full. The
+     un-rendered subtree simply frees arc budget, which the round-robin above
+     then gives to the wedges that do still have children to show;
+  3. **no code edges**, to it or to anything in its subtree, in that disk. The
+     projection ladder scores the whole collapsed subtree **0** there, so every
+     relation routes to the disk that actually renders the endpoint. Drawing a
+     rope onto a stub would attach a relation to a wedge that cannot be read.
+
+  `collapsed` is an option of `computeSunburst` and a set on the resulting
+  layout, so the layout stays a **pure deterministic function of (model, rootId,
+  options)** — and it is part of the layout cache key alongside the root and the
+  sort mode, so closing a disk restores the previously cached layouts and a
+  spawn/close round trip still costs nothing. A node is never collapsed in the
+  disk it is the ROOT of. Closing the disk restores the wedge in full.
+- **One tether per expanded disk, always visible.** A single quiet line from the
+  rim of the disk holding the collapsed wedge — at that wedge's **mid angle** —
+  to the **nearest point on the expanded disk's rim**. *Supersedes G1's
+  "expanded elsewhere" tick*, which was removed: a mark on the source wedge said
+  *that* something had been pulled out but not *which* disk it became. The tether
+  is deliberately **not** a code edge and does not look like one — neutral slate,
+  thin, solid, and drawn under the relations — where relations appear only on
+  hover/selection and carry the green-incoming / amber-outgoing colours and the
+  dashed-for-`heuristic` rule. It represents the expansion relationship, nothing
+  about the code. When the two disks overlap far enough that the rim anchor falls
+  inside the expanded disk, nothing is drawn rather than a line pointing the
+  wrong way.
+- **The close `×` moved from the rim to the CENTRE**, under the `N loc` line,
+  still screen-sized, still hover-only, still non-primary disks only, still no
+  transitions. *Supersedes G1's "a small `×` on its rim"*: on the rim it competed
+  with the wedges for the eye and shifted every time a re-root changed the disk's
+  radius. The centre circle is the one part of a disk that is always chrome
+  rather than data, and "close this disk" is chrome. It is hit-tested before the
+  centre circle, so a press on it never reads as the centre's up-navigation.
+- **The keyboard overlay gets the settings dialog's panel.** It hand-rolled its
+  own container classes and named a `bg-card` colour the theme does not define,
+  so it rendered with **no background** and the disk showed straight through the
+  shortcut list. It now uses the same `Card` the settings dialog does, so the two
+  cannot drift.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all
@@ -901,9 +992,14 @@ G2/G3 and are **deliberately not built here** (see the deferrals at the end).
    `workspace.ts` layer, drag-away spawning with a ghost, disk move/close/focus,
    a global selection projected onto every disk, cross-disk relations drawn as
    single bowed curves while intra-disk ones keep their bundling, and a URL that
-   still describes the primary disk only. **G2** (AI-composed flow views) and
-   **G3** (named saved views, which is what makes a workspace survive a refresh)
-   follow.
+   still describes the primary disk only. **G2** (built) is the review round on
+   top of it: a breadth-first, round-robin arc budget replacing the depth/size
+   gating that silently dropped a small wedge's children, expanded wedges
+   collapsed to a third-depth stub in the disk they came from (no children, no
+   edges) with one always-visible tether to the disk that holds them, the close
+   `×` moved to the disk's centre, and the keyboard overlay given the settings
+   dialog's panel. **G3** (named saved views, which is what makes a workspace
+   survive a refresh) follows, along with the AI-composed flow views.
 
 ## House rules for every phase
 

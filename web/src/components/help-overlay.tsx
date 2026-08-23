@@ -10,6 +10,8 @@
  */
 import { Keyboard } from 'lucide-react';
 
+import { Card } from '@/components/ui/card';
+
 /** One row per binding. Grouped by what the key is FOR, not by key order. */
 const SHORTCUTS: Array<{ group: string; rows: Array<[string, string]> }> = [
   {
@@ -40,14 +42,15 @@ export function HelpOverlay({ open, onClose }: { open: boolean; onClose(): void 
   if (!open) return null;
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 p-6"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-background/50 p-6 backdrop-blur-[2px]"
       onClick={onClose}
       data-testid="help-overlay"
     >
-      <div
-        className="w-[26rem] rounded-lg border border-border bg-card p-4 shadow-xl"
-        onClick={(event) => event.stopPropagation()}
-      >
+      {/* Same panel treatment as the settings dialog — one `Card`, so the two
+          dialogs cannot drift. It used to hand-roll the classes and named a
+          `bg-card` colour this theme does not define, so it rendered with no
+          background at all and the disk showed straight through the text. */}
+      <Card className="w-[26rem] p-4 shadow-xl" onClick={(event) => event.stopPropagation()}>
         <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-[0.2em] text-muted">
           <Keyboard className="h-3 w-3" /> keyboard
         </div>
@@ -66,7 +69,7 @@ export function HelpOverlay({ open, onClose }: { open: boolean; onClose(): void 
             </div>
           ))}
         </dl>
-      </div>
+      </Card>
     </div>
   );
 }
