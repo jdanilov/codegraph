@@ -122,7 +122,9 @@ export function LegendPanel({
 
       {collapsed ? null : (
         <>
-          <ul className="mt-2.5 flex max-h-48 flex-col gap-0.5 overflow-auto">
+          {/* ~30px taller than the phase F cap: on a project with a dozen kinds
+              the list was cut mid-row, which reads as "that's all of them". */}
+          <ul className="mt-2.5 flex max-h-[14rem] flex-col gap-0.5 overflow-auto">
             {entries.map((entry) => {
               const isOff = off.has(entry.key);
               return (

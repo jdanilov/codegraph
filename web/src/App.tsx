@@ -66,6 +66,7 @@ import {
   type ChangesPayload,
   type ExploreResult,
 } from '@/lib/api';
+import { useStoredState } from '@/lib/prefs';
 import { decodeUrlState, encodeUrlState, type UrlState } from '@/lib/url-state';
 
 export default function App() {
@@ -93,6 +94,20 @@ export default function App() {
   // folded while they walk the graph.
   const [nodePanelCollapsed, setNodePanelCollapsed] = useState(false);
   const [codePanelCollapsed, setCodePanelCollapsed] = useState(false);
+  /**
+   * Width of the right-hand column, dragged by the handle on its inner edge.
+   *
+   * How much room the code deserves against how much of the disk stays visible
+   * is a per-person, per-screen trade, so it is a stored preference rather than
+   * a constant — and it is `localStorage`, not the URL (it describes this
+   * browser, not the view a link would share) and not `~/.codegraph/ui.json`
+   * (which the server would have to be written to on every drag).
+   */
+  const [rightWidth, setRightWidth] = useStoredState(
+    'rightColumnWidth',
+    RIGHT_COLUMN_DEFAULT,
+    clampColumnWidth
+  );
   // …and so do the two LEFT-hand panels (round 2): the disk is the app, and
   // both columns should be able to get out of its way with the same gesture.
   const [cardsPanelCollapsed, setCardsPanelCollapsed] = useState(false);
@@ -504,6 +519,42 @@ export default function App() {
 
   // ------------------------------------------------------------ commands ---
 
+  /**
+   * Drag the right column's inner edge.
+   *
+   * The pointer is captured for the whole gesture, so the drag survives the
+   * cursor crossing the canvas (which has its own pointer handlers) and a
+   * release outside the window. Width follows the cursor directly — there is no
+   * transition anywhere in this DOM, and a resize handle that lags is a resize
+   * handle that feels broken.
+   */
+  const startColumnResize = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      const handle = event.currentTarget;
+      handle.setPointerCapture(event.pointerId);
+      const onMove = (move: PointerEvent): void => {
+        setRightWidth(window.innerWidth - move.clientX);
+      };
+      const onUp = (): void => {
+        handle.removeEventListener('pointermove', onMove);
+        handle.removeEventListener('pointerup', onUp);
+        handle.removeEventListener('pointercancel', onUp);
+      };
+      handle.addEventListener('pointermove', onMove);
+      handle.addEventListener('pointerup', onUp);
+      handle.addEventListener('pointercancel', onUp);
+    },
+    [setRightWidth]
+  );
+
+  /** A stored width has to stay legal when the window shrinks under it. */
+  useEffect(() => {
+    const onResize = (): void => setRightWidth((width) => width);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [setRightWidth]);
+
   /** Drop the selection and, with it, both right-hand panels. */
   const clearSelection = useCallback(() => {
     controllerRef.current?.setSelected(null);
@@ -573,6 +624,16 @@ export default function App() {
       if (event.key === 'Enter') {
         event.preventDefault();
         controllerRef.current?.enterSelected();
+        return;
+      }
+      // Backspace steps the FOCUSED disk one level out — the keyboard twin of
+      // clicking its centre circle, and the way back from an Enter that drilled
+      // in. It stands down under exactly the same conditions the arrows do (a
+      // dialog up, a field being typed in), which is also what keeps it from
+      // fighting a text field for the delete key.
+      if (event.key === 'Backspace') {
+        event.preventDefault();
+        controllerRef.current?.rootUp();
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -697,7 +758,20 @@ export default function App() {
 
       {/* Right column: the selection, and nothing else. */}
       {selectedNode ? (
-        <div className="pointer-events-none absolute inset-y-0 right-0 flex w-[30rem] flex-col gap-3 p-4">
+        <div
+          className="pointer-events-none absolute inset-y-0 right-0 flex flex-col gap-3 p-4"
+          style={{ width: `${rightWidth}px` }}
+        >
+          {/* The column's inner edge is the handle — no separate gutter to
+              find, and nothing moves until it is dragged. */}
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize panel column"
+            data-testid="right-column-resize"
+            onPointerDown={startColumnResize}
+            className="pointer-events-auto absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize bg-transparent hover:bg-accent/40"
+          />
           <NodePanel
             key={selectedNode.id}
             node={selectedNode}
@@ -786,6 +860,20 @@ function sameHashState(a: HashState, b: HashState): boolean {
     a.edgeKinds.length === b.edgeKinds.length &&
     a.edgeKinds.every((kind, index) => kind === b.edgeKinds[index])
   );
+}
+
+/** Right column: the phase F width, still the default. */
+const RIGHT_COLUMN_DEFAULT = 480;
+/** Narrower than this and a diff line is no longer worth reading. */
+const RIGHT_COLUMN_MIN = 320;
+/** The disk is the app: the column never takes more than this of the window. */
+const RIGHT_COLUMN_MAX_SHARE = 0.6;
+
+/** A column width the current viewport can actually hold. */
+function clampColumnWidth(width: number): number {
+  const viewport = typeof window === 'undefined' ? Infinity : window.innerWidth;
+  const max = Math.max(RIGHT_COLUMN_MIN, viewport * RIGHT_COLUMN_MAX_SHARE);
+  return Math.round(Math.min(max, Math.max(RIGHT_COLUMN_MIN, width)));
 }
 
 /** Arrow key → the move it makes on the disk. */

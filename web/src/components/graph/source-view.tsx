@@ -36,6 +36,13 @@ export interface SourceBodyProps {
   endLine: number;
   /** Controlled by the code panel's title-bar toggle. */
   mode: SourceMode;
+  /**
+   * Wrap long lines instead of scrolling them horizontally — the other
+   * title-bar toggle, off by default and remembered per browser. It applies to
+   * BOTH views: a diff's lines wrap exactly like the source's, so switching
+   * between them never changes how the same line reads.
+   */
+  wrap?: boolean;
   /** The span the node payload already shipped, if any. */
   initial?: SourceSpan | null;
 }
@@ -55,7 +62,14 @@ function useHighlighter(): Engine {
   return engine;
 }
 
-export function SourceBody({ file, startLine, endLine, mode, initial }: SourceBodyProps) {
+export function SourceBody({
+  file,
+  startLine,
+  endLine,
+  mode,
+  wrap = false,
+  initial,
+}: SourceBodyProps) {
   // Seeded from the node payload's own span — opening a panel costs no extra
   // request. The caller remounts this component per node (`key`), so there is
   // deliberately no "reset on prop change" effect to race the in-flight fetch.
@@ -101,9 +115,9 @@ export function SourceBody({ file, startLine, endLine, mode, initial }: SourceBo
   }
   if (error) return <p className="px-2 py-3 text-[11px] text-red-400">{error}</p>;
   return mode === 'full' ? (
-    <FullSource span={span} file={file} engine={engine} />
+    <FullSource span={span} file={file} engine={engine} wrap={wrap} />
   ) : (
-    <DiffSource diff={diff} file={file} engine={engine} />
+    <DiffSource diff={diff} file={file} engine={engine} wrap={wrap} />
   );
 }
 
@@ -111,10 +125,12 @@ function FullSource({
   span,
   file,
   engine,
+  wrap,
 }: {
   span: SourceSpan | null;
   file: string;
   engine: Engine;
+  wrap: boolean;
 }) {
   const html = useMemo(
     () => (span ? (highlightWith(engine, span.content, file) ?? escapeHtml(span.content)) : ''),
@@ -124,7 +140,12 @@ function FullSource({
 
   return (
     <>
-      <pre className="px-2 py-1.5 font-mono text-[11px] leading-[1.55]">
+      <pre
+        className={cn(
+          'px-2 py-1.5 font-mono text-[11px] leading-[1.55]',
+          wrap && 'whitespace-pre-wrap break-words'
+        )}
+      >
         <code className="hljs-code" dangerouslySetInnerHTML={{ __html: html }} />
       </pre>
       {span.truncated ? (
@@ -138,10 +159,12 @@ function DiffSource({
   diff,
   file,
   engine,
+  wrap,
 }: {
   diff: SourceDiff | null;
   file: string;
   engine: Engine;
+  wrap: boolean;
 }) {
   if (!diff) return <p className="px-2 py-3 text-[11px] text-muted">No diff available.</p>;
 
@@ -180,7 +203,7 @@ function DiffSource({
             @@ -{hunk.oldStart},{hunk.oldLines} +{hunk.newStart},{hunk.newLines} @@
             {hunk.heading ? ` ${hunk.heading}` : ''}
           </div>
-          {renderHunkLines(hunk, file, engine)}
+          {renderHunkLines(hunk, file, engine, wrap)}
         </div>
       ))}
     </div>
@@ -190,7 +213,8 @@ function DiffSource({
 function renderHunkLines(
   hunk: SourceDiff['hunks'][number],
   file: string,
-  engine: Engine
+  engine: Engine,
+  wrap: boolean
 ): React.ReactNode {
   return hunk.lines.map((line, index) => {
     const html = highlightWith(engine, line.text, file) ?? escapeHtml(line.text);
@@ -199,6 +223,10 @@ function renderHunkLines(
         key={index}
         className={cn(
           'flex font-mono',
+          // Unwrapped, the row is as wide as its longest line (never narrower
+          // than the panel), so the add/del tint covers the whole line when the
+          // pane is scrolled sideways instead of stopping at the fold.
+          wrap ? '' : 'w-max min-w-full',
           line.type === 'add' && 'bg-emerald-500/12',
           line.type === 'del' && 'bg-rose-500/12'
         )}
@@ -214,7 +242,10 @@ function renderHunkLines(
           {line.type === 'add' ? '+' : line.type === 'del' ? '−' : ' '}
         </span>
         <span
-          className="hljs-code min-w-0 flex-1 whitespace-pre-wrap break-words pr-2"
+          className={cn(
+            'hljs-code flex-1 pr-2',
+            wrap ? 'min-w-0 whitespace-pre-wrap break-words' : 'whitespace-pre'
+          )}
           dangerouslySetInnerHTML={{ __html: html || '&nbsp;' }}
         />
       </div>

@@ -27,6 +27,7 @@ const SHORTCUTS: Array<{ group: string; rows: Array<[string, string]> }> = [
       ['← →', 'previous / next sibling, in the order they are drawn'],
       ['↑', 'select the wedge that contains this one'],
       ['↓', 'select the first wedge inside this one'],
+      ['Backspace', 'one level out — what the centre circle does'],
     ],
   },
   {

@@ -277,6 +277,8 @@ const TETHER_COLOR = 'rgba(148, 163, 184, 0.42)';
 /** Same slate, brighter, while the pointer is on the line (its `×` is up). */
 const TETHER_COLOR_HOVER = 'rgba(186, 202, 224, 0.85)';
 const TETHER_WIDTH_PX = 1;
+/** Radius of the direction dot at the tether's arrival end, in SCREEN px. */
+const TETHER_DOT_PX = 3.2;
 /** Screen-space tolerance of the tether's own hit test (the `×` affordance). */
 const TETHER_HIT_PX = 6;
 /** Ring around the focused disk's centre, drawn only once there are several. */
@@ -462,6 +464,12 @@ export class CanvasController {
    * is untouched, so it keeps its angular space and nothing else moves.
    */
   private hiddenColorKeys = new Set<string>();
+  /**
+   * How many folded children each `+N` arc still stands for under the current
+   * legend filters — memoised per arc, dropped whenever the filters, the colour
+   * mode or the layouts change ({@link invalidateAggregates}).
+   */
+  private aggregateCounts = new Map<SunburstArc, number>();
 
   /** File node id → what changed in it, for the outer-rim change markers. */
   private changeMarkers = new Map<string, ChangeMarker>();
@@ -541,6 +549,7 @@ export class CanvasController {
     const previous = this.model;
     this.model = model;
     this.layoutCache.clear();
+    this.aggregateCounts.clear();
 
     if (!previous || !sameProject) {
       this.disks = [makeDisk(PRIMARY_DISK_ID, initialRoot(model), 0, 0, true, null)];
@@ -575,6 +584,10 @@ export class CanvasController {
   setColorMode(mode: ColorMode): void {
     if (this.colorMode === mode) return;
     this.colorMode = mode;
+    // The legend's categories are named per MODE (kinds vs layers), so which
+    // wedges — and which folded children — a filter hides changes with it.
+    this.invalidateAggregates();
+    this.edgesDirty = true;
     this.requestDraw();
     this.emitSummary();
   }
@@ -587,6 +600,7 @@ export class CanvasController {
     if (this.sortMode === mode) return;
     this.sortMode = mode;
     this.layoutCache.clear();
+    this.aggregateCounts.clear();
     if (this.model) this.rebuildAllLayouts();
   }
 
@@ -619,6 +633,11 @@ export class CanvasController {
    * does NOT mean is re-laying out the disk — the wedge keeps its angular
    * space, so switching a category off never moves anything else. A filter that
    * re-flows the picture is a filter you cannot use to compare two states.
+   *
+   * Everything derived from "what is on screen" follows the filter: a `+N` fold
+   * arc recounts (and vanishes when nothing it folded is left), and a relation
+   * with a hidden endpoint is not drawn at all — an invisible wedge must not be
+   * reachable as the far end of a rope either.
    */
   setHiddenColorKeys(keys: Iterable<string>): void {
     const next = new Set(keys);
@@ -626,7 +645,8 @@ export class CanvasController {
       return;
     }
     this.hiddenColorKeys = next;
-    for (const disk of this.disks) disk.labelPlan = null;
+    this.invalidateAggregates();
+    this.edgesDirty = true;
     this.requestDraw();
   }
 
@@ -787,11 +807,12 @@ export class CanvasController {
     const nextDepth = model.get(id)?.depth ?? 0;
     disk.rootId = id;
     disk.rootChangedAt = performance.now();
-    if (disk.primary) {
-      this.zoom = 1;
-      this.panX = 0;
-      this.panY = 0;
-    }
+    // The CAMERA does not move. Drilling into a wedge used to reset the primary
+    // disk's zoom and pan, which yanked the picture back to the default framing
+    // — in a workspace where the user has panned to a corner (or zoomed into a
+    // second disk) that is the whole view moving because one disk re-rooted.
+    // A disk drills IN PLACE, at its workspace position; re-framing is `fit`,
+    // and it is an explicit gesture. The wedge-morph animation below stays.
     this.hoveredDiskId = null;
     this.hoveredKey = null;
     this.hoveredEdgeKey = null;
@@ -1140,19 +1161,81 @@ export class CanvasController {
     }
   }
 
-  /** The legend row a wedge belongs to — the unit an interactive legend hides. */
-  private legendKeyFor(arc: SunburstArc): string | null {
-    const node = arc.nodeId ? this.model?.get(arc.nodeId) : undefined;
-    if (!node) return null;
+  /** The legend row a NODE belongs to — the unit an interactive legend hides. */
+  private legendKeyForNode(node: ModelNode): string {
     if (this.colorMode !== 'layer') return node.kind;
     return node.kind === DIRECTORY_KIND ? DIRECTORY_LEGEND_KEY : (node.layer ?? '');
   }
 
-  /** Is this wedge switched off in the legend? Aggregates never are. */
+  /** The legend row a wedge belongs to. `null` for a `+N` fold arc. */
+  private legendKeyFor(arc: SunburstArc): string | null {
+    const node = arc.nodeId ? this.model?.get(arc.nodeId) : undefined;
+    return node ? this.legendKeyForNode(node) : null;
+  }
+
+  /** Is this NODE switched off in the legend? The unit every filter reads. */
+  private isHiddenNode(id: string): boolean {
+    if (this.hiddenColorKeys.size === 0) return false;
+    const node = this.model?.get(id);
+    return node ? this.hiddenColorKeys.has(this.legendKeyForNode(node)) : false;
+  }
+
+  /**
+   * Is this wedge switched off in the legend?
+   *
+   * A `+N` fold arc has no kind of its own — it stands in for the children it
+   * folded, so the legend reaches it through THEM: the arc is hidden exactly
+   * when every node it folded is hidden. A `+15` holding three methods reads
+   * `+12` with methods switched off (see {@link visibleAggregatedCount}) and
+   * disappears entirely once nothing it stands for is left, because a fold arc
+   * that folds nothing visible is a promise of content that is not there.
+   */
   private isHiddenArc(arc: SunburstArc): boolean {
     if (this.hiddenColorKeys.size === 0) return false;
+    if (!arc.nodeId) {
+      return arc.aggregated.length > 0 && this.visibleAggregatedCount(arc) === 0;
+    }
     const key = this.legendKeyFor(arc);
     return key !== null && this.hiddenColorKeys.has(key);
+  }
+
+  /**
+   * The folded children a `+N` arc still stands for — its layout metadata
+   * (`SunburstArc.aggregated`, the folded node ids) minus the categories the
+   * legend switched off.
+   *
+   * The count is baked into the arc's label at LAYOUT time, and the layout is a
+   * pure function of (model, root, options) that deliberately knows nothing
+   * about the legend — a filter that re-flowed the disk would be a filter you
+   * cannot use to compare two states. So the recount happens here, at render
+   * time, from the ids the layout exposes.
+   */
+  private visibleAggregated(arc: SunburstArc): string[] {
+    if (this.hiddenColorKeys.size === 0) return arc.aggregated;
+    return arc.aggregated.filter((id) => !this.isHiddenNode(id));
+  }
+
+  /** Same recount, memoised per arc — the painter asks once per wedge per frame. */
+  private visibleAggregatedCount(arc: SunburstArc): number {
+    if (this.hiddenColorKeys.size === 0) return arc.aggregated.length;
+    const cached = this.aggregateCounts.get(arc);
+    if (cached !== undefined) return cached;
+    let count = 0;
+    for (const id of arc.aggregated) if (!this.isHiddenNode(id)) count++;
+    this.aggregateCounts.set(arc, count);
+    return count;
+  }
+
+  /** What a wedge is CALLED on screen — a fold arc's `+N` is recounted. */
+  private labelTextFor(arc: SunburstArc): string {
+    if (arc.nodeId || this.hiddenColorKeys.size === 0) return arc.label;
+    return `+${this.visibleAggregatedCount(arc)}`;
+  }
+
+  /** Drop the memoised fold-arc counts — the filters or the arcs changed. */
+  private invalidateAggregates(): void {
+    this.aggregateCounts.clear();
+    for (const disk of this.disks) disk.labelPlan = null;
   }
 
   /**
@@ -1415,8 +1498,25 @@ export class CanvasController {
       ctx.arc(0, 0, arc.r0, a0, a1);
       ctx.arc(0, 0, arc.r1, a1, a0, true);
       ctx.closePath();
-      ctx.fillStyle = withAlpha(this.fillFor(arc, model), alpha);
-      ctx.fill();
+      // A wedge expanded as its own disk is drawn HOLLOW: the canvas's own
+      // background inside, its normal colour on the outline. Stretched to the
+      // rim it is by far the largest shape on the disk, and painted solid it
+      // dominated a picture whose subject is somewhere else entirely — the
+      // other disk. An outline says "this is an open channel, the content is
+      // over there" and still reads as the wedge's own colour under the active
+      // mode. Its label, hit test and tether anchor are untouched.
+      const fill = this.fillFor(arc, model);
+      const hollow = arc.nodeId !== null && layout.collapsed.has(arc.nodeId);
+      if (hollow) {
+        ctx.fillStyle = BACKGROUND;
+        ctx.fill();
+        ctx.strokeStyle = withAlpha(fill, Math.max(alpha, 0.85));
+        ctx.lineWidth = 1.6 / k;
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = withAlpha(fill, alpha);
+        ctx.fill();
+      }
 
       // Outlines first, while the annulus is still the current path — the rim
       // below starts a path of its own and would otherwise be stroked twice.
@@ -1655,6 +1755,20 @@ export class CanvasController {
         curve.end.y
       );
       ctx.stroke();
+
+      // A small dot where the tether ARRIVES, on the expanded disk's rim: the
+      // line is symmetric, so without it the pair reads as an undirected thread
+      // and "which of these two is the expansion" has to be worked out from the
+      // wedge at the other end. Screen-sized (like the `×`), hollow, and NOT a
+      // button — the close affordance stays on the middle of the line.
+      const dot = TETHER_DOT_PX / k;
+      ctx.beginPath();
+      ctx.arc(curve.end.x, curve.end.y, dot, 0, Math.PI * 2);
+      ctx.fillStyle = BACKGROUND;
+      ctx.fill();
+      ctx.strokeStyle = hot ? TETHER_COLOR_HOVER : TETHER_COLOR;
+      ctx.lineWidth = TETHER_WIDTH_PX / k;
+      ctx.stroke();
     }
   }
 
@@ -1758,7 +1872,15 @@ export class CanvasController {
       const arc = label.geom.arc;
       if (this.isHiddenArc(arc)) continue;
       if (reuse && !this.planStillFits(label, k)) continue;
-      const ink = this.isDimmed(disk, arc) ? DIM_LABEL_COLOR : readableOn(this.fillFor(arc, model));
+      // A hollow (expanded-away) wedge has the canvas background behind its
+      // name, not its own colour, so the ink that would be readable ON the
+      // colour can be the wrong one — it wears the colour itself instead.
+      const hollow = arc.nodeId !== null && (disk.layout?.collapsed.has(arc.nodeId) ?? false);
+      const ink = this.isDimmed(disk, arc)
+        ? DIM_LABEL_COLOR
+        : hollow
+          ? this.fillFor(arc, model)
+          : readableOn(this.fillFor(arc, model));
       // The plan's own font is kept while the camera moves: recomputing it would
       // miss the metrics cache on every bucket change, which is the cost this
       // whole path exists to avoid. The size only ever varies between 8 and
@@ -1806,10 +1928,14 @@ export class CanvasController {
     geom: ArcLabelGeom,
     k: number
   ): PlannedLabel | null {
+    // A `+N` fold arc is named by what it still stands for, which the legend
+    // can change without the layout moving — everything else wears the name the
+    // layout baked in.
+    const text = this.labelTextFor(geom.arc);
     if (geom.tangential > geom.radial) {
-      return this.planCurved(ctx, geom, k) ?? this.planRadial(ctx, geom, k);
+      return this.planCurved(ctx, geom, text, k) ?? this.planRadial(ctx, geom, text, k);
     }
-    return this.planRadial(ctx, geom, k) ?? this.planCurved(ctx, geom, k);
+    return this.planRadial(ctx, geom, text, k) ?? this.planCurved(ctx, geom, text, k);
   }
 
   /**
@@ -1819,12 +1945,13 @@ export class CanvasController {
   private planCurved(
     ctx: CanvasRenderingContext2D,
     geom: ArcLabelGeom,
+    text: string,
     k: number
   ): PlannedLabel | null {
     const thicknessPx = geom.radial * k;
     if (geom.tangential * k < LABEL_MIN_ARC_PX || thicknessPx < LABEL_MIN_THICKNESS_PX) return null;
     const fontPx = curvedFontPx(thicknessPx);
-    const fitted = this.fitLabel(ctx, geom.arc.label, geom.tangential * 0.9 * k, fontPx, k);
+    const fitted = this.fitLabel(ctx, text, geom.tangential * 0.9 * k, fontPx, k);
     // `ex…` names nothing — let the caller try the other orientation.
     if (!fitted || (fitted.text.endsWith('…') && fitted.text.length < LABEL_MIN_CHARS)) return null;
     return { geom, text: fitted.text, orientation: 'curved', fontPx, widthPx: fitted.widthPx };
@@ -1843,13 +1970,14 @@ export class CanvasController {
   private planRadial(
     ctx: CanvasRenderingContext2D,
     geom: ArcLabelGeom,
+    text: string,
     k: number
   ): PlannedLabel | null {
     const lengthPx = geom.radial * k;
     const heightPx = geom.tangential * k;
     if (lengthPx < RLABEL_MIN_LENGTH_PX || heightPx < RLABEL_MIN_HEIGHT_PX) return null;
     const fontPx = radialFontPx(heightPx);
-    const fitted = this.fitLabel(ctx, geom.arc.label, geom.radial * 0.92 * k, fontPx, k);
+    const fitted = this.fitLabel(ctx, text, geom.radial * 0.92 * k, fontPx, k);
     if (!fitted || (fitted.text.endsWith('…') && fitted.text.length < RLABEL_MIN_CHARS)) return null;
     return { geom, text: fitted.text, orientation: 'radial', fontPx, widthPx: fitted.widthPx };
   }
@@ -2125,7 +2253,9 @@ export class CanvasController {
     const directions = new Map<string, EdgeDirection>();
     for (const key of this.resultEdges) {
       const edge = model.edgeByKey.get(key);
-      if (edge && this.enabledKinds.has(edge.kind)) wanted.set(key, edge);
+      if (edge && this.enabledKinds.has(edge.kind) && !this.hasHiddenEndpoint(edge)) {
+        wanted.set(key, edge);
+      }
       if (wanted.size >= EDGE_BUDGET) break;
     }
     if (this.selected) this.collectOwnEdges([this.selected], wanted, directions);
@@ -2138,7 +2268,10 @@ export class CanvasController {
         : null;
     if (hoveredArc) {
       this.collectOwnEdges(
-        hoveredArc.nodeId ? [hoveredArc.nodeId] : hoveredArc.aggregated,
+        // A `+N` wedge stands in for the nodes it folded — the ones it still
+        // stands in for, i.e. minus whatever the legend switched off (item: a
+        // hidden category is absent, and an absent node has no relations here).
+        hoveredArc.nodeId ? [hoveredArc.nodeId] : this.visibleAggregated(hoveredArc),
         hoverEdges,
         directions,
         // A card with an edge set scopes the hover to that set; a view with no
@@ -2158,7 +2291,7 @@ export class CanvasController {
     if (hoveredArc) {
       const nodes = new Set<string>();
       if (hoveredArc.nodeId) nodes.add(hoveredArc.nodeId);
-      for (const id of hoveredArc.aggregated) nodes.add(id);
+      else for (const id of this.visibleAggregated(hoveredArc)) nodes.add(id);
       for (const edge of hoverEdges.values()) {
         nodes.add(edge.source);
         nodes.add(edge.target);
@@ -2199,6 +2332,21 @@ export class CanvasController {
   }
 
   /**
+   * Does either end of this relation belong to a category the legend switched
+   * off?
+   *
+   * A hidden wedge is not painted and the pointer goes straight through it, so
+   * it cannot be the SUBJECT of a hover — but it could still turn up as the far
+   * end of somebody else's rope, i.e. as a relation pointing at nothing
+   * visible. It doesn't: a filtered-out node is absent from every edge display
+   * (hover, selection, card, impact, cross-disk), on both sides.
+   */
+  private hasHiddenEndpoint(edge: ModelEdge): boolean {
+    if (this.hiddenColorKeys.size === 0) return false;
+    return this.isHiddenNode(edge.source) || this.isHiddenNode(edge.target);
+  }
+
+  /**
    * How well one disk can show a node, so an edge can be routed to the disk
    * that shows its endpoint BEST.
    *
@@ -2224,17 +2372,20 @@ export class CanvasController {
         if (ancestor === disk.rootId) break;
       }
     }
+    // An INVISIBLE wedge cannot stand in for anything: a rope that ended on one
+    // would point at empty disk. Such an arc is skipped and the ladder carries
+    // on — the endpoint attaches to the next visible ancestor, or to the centre.
     const direct = layout.byNode.get(nodeId);
-    if (direct) return { score: 4, arc: direct };
+    if (direct && !this.isHiddenArc(direct)) return { score: 4, arc: direct };
     const folded = layout.aggregatedInto.get(nodeId);
-    if (folded) return { score: 3, arc: folded };
+    if (folded && !this.isHiddenArc(folded)) return { score: 3, arc: folded };
     // The disk's own root has no arc — the centre circle IS its wedge.
     if (nodeId === disk.rootId) return { score: 3, arc: null };
     for (const ancestor of model.ancestors(nodeId)) {
       const arc = layout.byNode.get(ancestor);
-      if (arc) return { score: 2, arc };
+      if (arc && !this.isHiddenArc(arc)) return { score: 2, arc };
       const aggregate = layout.aggregatedInto.get(ancestor);
-      if (aggregate) return { score: 2, arc: aggregate };
+      if (aggregate && !this.isHiddenArc(aggregate)) return { score: 2, arc: aggregate };
       if (ancestor === disk.rootId) return { score: 1, arc: null };
     }
     return { score: 0, arc: null };
@@ -2288,11 +2439,13 @@ export class CanvasController {
     const model = this.model;
     if (!model) return;
     for (const id of seeds) {
+      if (this.isHiddenNode(id)) continue;
       for (const edge of model.edgesOf(id)) {
         if (into.size >= EDGE_BUDGET) return;
         if (!this.enabledKinds.has(edge.kind)) continue;
         if (edge.source === edge.target) continue;
         if (only && !only.has(edge.key)) continue;
+        if (this.hasHiddenEndpoint(edge)) continue;
         into.set(edge.key, edge);
         if (directions && !directions.has(edge.key)) {
           directions.set(edge.key, edge.source === id ? 'outgoing' : 'incoming');
@@ -2767,15 +2920,17 @@ export class CanvasController {
       return;
     }
     const node = arc.nodeId ? model.get(arc.nodeId) : undefined;
+    // A fold arc reports what it still folds under the legend's filters, so the
+    // tooltip and the `+N` painted on the wedge can never disagree.
     const tooltip: ArcTooltip = {
       x,
       y,
-      name: node?.name ?? arc.label,
+      name: node?.name ?? this.labelTextFor(arc),
       path: node?.file ?? '',
       kind: node?.kind ?? AGGREGATE_KIND,
       loc: arc.weight,
       aggregate: !arc.nodeId,
-      hiddenChildren: arc.hiddenChildren,
+      hiddenChildren: arc.nodeId ? arc.hiddenChildren : this.visibleAggregatedCount(arc),
     };
     if (node?.layer) tooltip.layer = node.layer;
     this.callbacks.onArcTooltip(tooltip);

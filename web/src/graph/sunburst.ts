@@ -255,7 +255,18 @@ export interface SunburstArc {
   key: string;
   /** Model node this arc renders. `null` for an aggregate arc. */
   nodeId: string | null;
-  /** Direct children folded into this arc (aggregate arcs only). */
+  /**
+   * Direct children folded into this arc (aggregate arcs only) — **every one
+   * of them**, so `aggregated.length` plus the parent's individually rendered
+   * children is exactly its child count.
+   *
+   * This is the fold arc's METADATA, and it is what lets a renderer recount the
+   * `+N` without the layout ever learning about a filter: the legend can make a
+   * kind invisible, and the painter then displays `+` the folded children that
+   * are still visible (and paints nothing at all when none are). The layout
+   * stays a pure function of (model, root, options) — a filter that re-flowed
+   * the disk would be a filter you cannot use to compare two states.
+   */
   aggregated: string[];
   /** 1-based; ring 0 is the centre disk. */
   ring: number;
@@ -271,6 +282,11 @@ export interface SunburstArc {
   weight: number;
   /** Children that exist in the model but are not rendered individually. */
   hiddenChildren: number;
+  /**
+   * Name to paint. For a fold arc this is `+N` with N **baked at layout time**
+   * — a renderer filtering categories out re-derives it from {@link aggregated}
+   * rather than asking for a different layout.
+   */
   label: string;
   /** Model NodeKind, or `aggregate`. */
   kind: string;

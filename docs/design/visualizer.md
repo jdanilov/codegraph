@@ -1097,6 +1097,92 @@ so twice over:
   just OUTSIDE the identity border instead of replacing it: losing a disk's
   colour the moment you point at it is the wrong trade.
 
+### Phase G — multi-disk workspace (4) (additive; supersedes two G2/G3 items)
+
+A third manual review of the multi-disk build. It makes the LEGEND's filter
+reach everything derived from what is on screen, gives the expanded wedge and
+its tether an honest reading, hands the right-hand column its own width and
+wrap, and states outright that drilling in does not move the camera. No
+contract item and no endpoint shape changed.
+
+- **A `+N` fold arc counts what it still stands for.** The number is baked into
+  the arc's label at LAYOUT time, and the layout deliberately knows nothing
+  about the legend — so the recount happens in the CONTROLLER, at render time,
+  from the metadata the layout already exposes: `SunburstArc.aggregated` is
+  **every** folded child's node id, so `rendered children + aggregated.length`
+  is exactly the parent's child count. Switch `method` off and a `+15` holding
+  three of them paints `+12`; switch off everything it folded and the arc is
+  **not drawn at all** — unpainted, unlabelled, and the pointer goes straight
+  through it, exactly like any other hidden wedge, because a fold arc that
+  folds nothing visible promises content that is not there. The stand-in rule
+  follows the same set: a `+N` wedge takes the own-edges of the nodes it still
+  stands for, and its tooltip reports the same number the wedge does. The
+  layout stays a **pure function of (model, root, options)** and nothing moves
+  when a category is switched off — the wedges keep their angular space, which
+  is the whole point of an invisible-not-reflowed filter.
+  - Probed against a live `/api/graph` on a real 13.8k-node project (4,514
+    layouts over 1,400 roots × both sort modes, 85,730 arcs): every one of
+    1,852 fold arcs summed exactly (15,918 folded ids, no duplicates, every id
+    a real child of the parent), each parent wedge's `hiddenChildren` equalled
+    its fold arc's id count, 870 synthetic hidden-kind cases recounted exactly
+    (3,010 arcs with a non-zero delta, 2,370 correctly reduced to zero and
+    therefore not rendered), all 57,640 parent→child pairs sat at exactly
+    `RING_GAP = 2`, all 85,730 centroid hit tests round-tripped, and every
+    layout re-ran byte-identical.
+- **A relation with a hidden endpoint is not drawn, on EITHER side.** A hidden
+  wedge already could not be hovered; now it cannot turn up as the far end of
+  somebody else's rope either — in any edge display (hover, selection, card
+  `edgeRefs`, impact, cross-disk). And when an edge that survives has to attach
+  to an ancestor, the projection ladder **skips invisible arcs** and carries on
+  to the next visible one (the centre, in the limit), so a rope can never end
+  on a wedge that is not painted. *Refines phase F's "an endpoint that is not
+  rendered attaches to its deepest visible ancestor"*: invisible is now part of
+  "not rendered".
+- **An expanded wedge is drawn HOLLOW.** The rim-stretched spoke keeps its
+  angle, its inner radius and its full extent out to `maxRadius`, but it is
+  filled with the **canvas background** and outlined in the colour it would
+  otherwise be filled with (under the active colour mode) — its label wears
+  that colour too, since there is no fill behind it any more. *Supersedes G3's
+  solid spoke*: stretched to the rim it is by far the largest shape on the
+  disk, and painted solid it dominated a picture whose subject is somewhere
+  else entirely — the other disk. An outline reads as an open channel. Label,
+  hit test and tether anchoring are unchanged.
+- **The tether has a direction dot.** A small circle — canvas-background fill,
+  the tether's own slate on the border, screen-sized like the `×` — sits where
+  the curve ARRIVES, on the expanded disk's rim. A symmetric line between two
+  disks otherwise reads as undirected, leaving "which of these two is the
+  expansion" to be worked out from the wedge at the far end. It is **not a
+  button**: the close `×` stays on the middle of the line, and the dot has no
+  hit area of its own.
+- **Drilling in never moves the camera.** Clicking a directory wedge re-roots
+  its disk **in place**, at its workspace position; zoom and pan are exactly
+  what they were. *Supersedes the primary disk's `zoom = 1; pan = 0,0` reset*,
+  which fired on every re-root of the URL-backed disk: in a workspace the user
+  had panned or zoomed, one disk drilling in yanked the entire view back to the
+  default framing. This is the same rule phase G3 stated for views ("views are
+  highlighters: switching one never moves the camera"), now applied to
+  navigation: `fit` is the one gesture that frames, and it is explicit. The
+  wedge-morph re-root animation is untouched. (The disk is still fitted to the
+  free viewport at zoom 1, so a re-root can still change the disk's SIZE — that
+  is the phase E fit rule, not a camera move.)
+- **Backspace goes up.** It re-roots the FOCUSED disk one level out — the
+  keyboard twin of clicking its centre circle, and the way back from the
+  `Enter` that drilled in. It stands down under exactly the conditions the
+  arrows do: a dialog up, or a field/contenteditable holding the focus, so it
+  never competes with a text input for the delete key. It is in the (?)
+  shortcut overlay with the arrows.
+- **The right-hand column is resizable, and the code can wrap.** A drag handle
+  on the column's INNER edge sets its width (min 20rem, max 60% of the window,
+  clamped again when the window itself shrinks); a `wrap` toggle in the code
+  panel's title bar wraps long lines in **both** the source and the diff view,
+  off by default. Both are remembered across sessions in **`localStorage`**
+  (`web/src/lib/prefs.ts`) — there was no existing client-side preference
+  store, and neither belongs in the URL (they describe this browser, not a view
+  worth sharing) or in `~/.codegraph/ui.json` (a server write per drag frame).
+  No transitions, like every other surface here.
+- **The legend list is ~30px taller**, so a project with a dozen kinds shows
+  another row or two before it scrolls.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all
@@ -1152,7 +1238,13 @@ so twice over:
    leaves and arrives radially, the close `×` moved onto the middle of that
    tether, hover and selection narrowed to a node's own relations (scoped to the
    active card's edge set inside a card view), and views made pure highlighters
-   that never move the camera. **Named saved views** — what makes a workspace
+   that never move the camera. **G4** (built) is the third review round: the
+   legend's filter carried through to `+N` fold arcs (recounted at render time
+   from the layout's folded-id metadata, and dropped when nothing they fold is
+   left) and to relations (an edge with a hidden endpoint is never drawn),
+   expanded wedges drawn hollow, a direction dot on the tether, a re-root that
+   leaves the camera exactly where it is, Backspace as up-navigation, and a
+   resizable right-hand column whose code panel can wrap. **Named saved views** — what makes a workspace
    survive a refresh — follow, along with the AI-composed flow views.
 
 ## House rules for every phase
