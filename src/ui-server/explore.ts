@@ -62,6 +62,11 @@ export function resetExploreHandler(): void {
 /**
  * Run one explore over `graph` and return its structured result.
  *
+ * `scopePath` is the optional subtree scope (`src/mcp`, `packages/api/**`) —
+ * the same `path` argument the MCP tool takes. An unusable scope comes back as
+ * the tool's SUCCESS-shaped guidance, i.e. an empty result whose `summary`
+ * explains how to spell it.
+ *
  * `executeReadTool` is the dispatch entry point that classifies expected
  * failures itself — an un-indexed project or a missing symbol comes back as a
  * SUCCESS-shaped answer, never a throw, which is exactly the shape this route
@@ -69,15 +74,20 @@ export function resetExploreHandler(): void {
  */
 export async function runExplore(
   graph: CodeGraphType,
-  query: string
+  query: string,
+  scopePath?: string
 ): Promise<ExploreOutcome> {
   const trimmed = query.trim();
   if (!trimmed) return { ok: true, result: { ...EMPTY_EXPLORE } };
 
+  const scope = typeof scopePath === 'string' ? scopePath.trim() : '';
   try {
     const handler = await handlerFor(graph);
     const result = await handler.executeReadTool('codegraph_explore', {
       query: trimmed,
+      // Additive and optional: with no scope the args are exactly what they
+      // were before, so the unscoped path is unchanged.
+      ...(scope ? { path: scope } : {}),
       [EXPLORE_STRUCTURED_ARG]: true,
     });
     if (result.isError) {

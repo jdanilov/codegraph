@@ -368,8 +368,10 @@ export class ApiRouter {
    * (same implementation, different rendering; see `explore.ts`).
    */
   private async explore(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const body = await readJsonBody<{ query?: unknown }>(req);
+    const body = await readJsonBody<{ query?: unknown; path?: unknown }>(req);
     const query = typeof body?.query === 'string' ? body.query : '';
+    // Optional subtree scope, same spelling as the tool's `path` argument.
+    const scopePath = typeof body?.path === 'string' ? body.path : undefined;
     if (!query.trim()) {
       return sendError(res, 400, { code: 'bad_request', message: 'Missing "query"' });
     }
@@ -385,7 +387,7 @@ export class ApiRouter {
       });
     }
 
-    const outcome = await runExplore(graph, query);
+    const outcome = await runExplore(graph, query, scopePath);
     if (!outcome.ok) {
       return sendError(res, 500, { code: 'internal', message: outcome.message }, EMPTY_EXPLORE);
     }
@@ -400,8 +402,10 @@ export class ApiRouter {
    * both cases the client's move is the same: fall back to plain explore.
    */
   private async ask(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const body = await readJsonBody<{ question?: unknown }>(req);
+    const body = await readJsonBody<{ question?: unknown; path?: unknown }>(req);
     const question = typeof body?.question === 'string' ? body.question : '';
+    // Optional subtree scope — the Ask box scopes exactly like the tool does.
+    const scopePath = typeof body?.path === 'string' ? body.path : undefined;
     if (!question.trim()) {
       return sendError(res, 400, { code: 'bad_request', message: 'Missing "question"' });
     }
@@ -424,7 +428,7 @@ export class ApiRouter {
       });
     }
 
-    const explored = await runExplore(graph, outcome.symbolBag);
+    const explored = await runExplore(graph, outcome.symbolBag, scopePath);
     if (!explored.ok) {
       return sendError(
         res,

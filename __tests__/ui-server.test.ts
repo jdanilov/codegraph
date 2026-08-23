@@ -344,6 +344,29 @@ describe('POST /api/explore', () => {
     });
     expect(status).toBe(400);
   });
+
+  // The optional `path` is the same subtree scope the MCP tool takes, so the
+  // Ask box can narrow an answer to one folder.
+  it('passes an optional `path` scope through to explore', async () => {
+    const { status, body } = await getJson(server.url, '/api/explore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'alpha beta', path: 'src' }),
+    });
+    expect(status).toBe(200);
+    expect(body.nodeIds.length).toBeGreaterThan(0);
+  });
+
+  it('answers an unusable `path` with guidance, not an error status', async () => {
+    const { status, body } = await getJson(server.url, '/api/explore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'alpha beta', path: 'no-such-folder' }),
+    });
+    expect(status).toBe(200);
+    expect(body.nodeIds).toEqual([]);
+    expect(body.summary).toContain('path');
+  });
 });
 
 describe('POST /api/ask', () => {

@@ -55,6 +55,7 @@ calls; a grep/read exploration is dozens.
 - **"How does X reach/become Y? / the flow / the path from X to Y"** → \`codegraph_explore\`, naming the symbols that span the flow (e.g. \`mutateElement renderScene\`) — it surfaces the call path among them, riding dynamic-dispatch hops, and returns their source.
 - **Reading or editing a file/symbol you can name** → put its name or file path in the \`codegraph_explore\` query — it returns that current line-numbered source (safe to \`Edit\` from) with the call path and blast radius attached, so you don't Read it separately. For an overloaded name it returns every matching definition's body in one call.
 - **Need more?** Call \`codegraph_explore\` again with more specific names — treat the source it returns as already Read.
+- **Know which folder or package owns it?** Pass \`path\` (a project-relative directory like \`src/mcp\`, or a glob like \`packages/api/**\`) to scope results to that subtree — same answer, without the same-named symbols from the rest of the repo.
 
 ## Anti-patterns
 

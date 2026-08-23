@@ -1053,6 +1053,26 @@ camera. No contract item and no endpoint shape changed.
   explicit navigation act, and now the only one in this path. `focusNodes` stays
   on `CanvasController` as navigation API; nothing in the view layer calls it.
 
+### Explore/ask scope (additive; no contract item changed)
+
+`POST /api/explore` and `POST /api/ask` take an **optional `path`** alongside
+`query` / `question`: a project-relative directory (`core`, `packages/api`) or
+glob (`packages/api/**`) that scopes the answer to one subtree. It is the same
+`path` argument `codegraph_explore` gained on the MCP surface, passed straight
+through — one implementation, one spelling, so the Ask box scopes exactly the
+way an agent does.
+
+- **Additive and optional.** Omitting `path` is byte-for-byte the previous
+  behaviour; the request/response shapes are otherwise unchanged.
+- **An unusable scope is not an error.** A path that escapes the project, is
+  malformed, or selects no indexed file comes back `200` with the contract's
+  empty result shape and the guidance in `summary` — the same rule the MCP
+  surface follows, because an error response teaches abandonment. The client
+  renders that summary rather than an error toast.
+- Scoping restricts candidate files, ranked symbols, emitted source **and** flow
+  endpoints, so a returned `nodeIds`/`flow` can only name nodes inside the
+  scope.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all

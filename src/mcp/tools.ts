@@ -43,6 +43,7 @@ import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, C
 import { scanDynamicDispatch } from './dynamic-boundaries';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreDiagnostics } from './explore-diagnostics';
+import { ExploreScope, ScopedNodeMap, parseExploreScope } from './explore-scope';
 import {
   EXPLORE_STRUCTURED_ARG,
   EXPLORE_STRUCTURED_KEY,
@@ -1208,13 +1209,17 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_explore',
-    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
+    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop. Optionally pass `path` (a project-relative directory or glob) to scope the answer to one subtree.',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
           description: 'Symbol names, file names, or short code terms to explore (e.g., "AuthService loginUser session-manager", "GraphTraverser BFS impact traversal.ts"). For a flow question, name the symbols spanning the flow (e.g. "mutateElement renderScene"). A natural-language question works too — no prior codegraph_search needed.',
+        },
+        path: {
+          type: 'string',
+          description: 'Optional. Scope the whole answer to one subtree: a project-relative directory ("src/mcp", "packages/api") or glob ("src/**/*.ts"). Only files under it are searched, ranked, returned, or used as flow endpoints. Use it when you already know which package/folder owns the code — it removes same-named symbols from the rest of the repo. Omit it to search the whole project.',
         },
         maxFiles: {
           type: 'number',
@@ -1980,8 +1985,11 @@ export class ToolHandler {
         return pathCheck;
       }
       // The `path` and `pattern` properties used by codegraph_files are
-      // also path-shaped — apply the same cap.
-      if (args.path !== undefined) {
+      // also path-shaped — apply the same cap. `codegraph_explore`'s `path` is
+      // a subtree SCOPE instead, and an unusable one must come back as
+      // guidance rather than `isError` (an error teaches session-long
+      // abandonment), so that tool validates its own — see `handleExplore`.
+      if (args.path !== undefined && toolName !== 'codegraph_explore') {
         const check = this.validateOptionalPath(args.path, 'path');
         if (typeof check === 'object' && check !== undefined) return check;
       }
@@ -2542,7 +2550,7 @@ export class ToolHandler {
    * whose qualifiedName contains another named token (`PmsProductServiceImpl::list`),
    * dropping unrelated `OmsOrderService::list`.
    */
-  private buildFlowFromNamedSymbols(cg: CodeGraph, query: string): { text: string; pathNodeIds: Set<string>; namedNodeIds: Set<string>; uniqueNamedNodeIds: Set<string>; spineCallSites: Map<string, number>; steps?: Array<{ node: Node; edge: Edge | null }> } {
+  private buildFlowFromNamedSymbols(cg: CodeGraph, query: string, scope: ExploreScope | null = null): { text: string; pathNodeIds: Set<string>; namedNodeIds: Set<string>; uniqueNamedNodeIds: Set<string>; spineCallSites: Map<string, number>; steps?: Array<{ node: Node; edge: Edge | null }> } {
     // spineCallSites: for each spine node, the line where it CALLS the next hop —
     // lets the source assembler window an oversize spine method (e.g. n8n's 962-line
     // processRunExecutionData) to the call site instead of dumping the whole body.
@@ -2597,10 +2605,13 @@ export class ToolHandler {
       const isPreciseToken = (x: string) =>
         /[._$]|::|\//.test(x) || /[a-z][A-Z]/.test(x) || /^[A-Z]/.test(x);
       const preciseNamedIds = new Set<string>();
+      // Subtree scope (optional): a flow may only START, END or PASS THROUGH
+      // files under it, so every node this builder admits is filtered here.
+      const nodeInScope = (n: Node): boolean => !scope || scope.matches(n.filePath);
       const hasHeuristicEdge = (id: string): boolean =>
         [...cg.getCallers(id), ...cg.getCallees(id)].some(({ edge }) => edge.provenance === 'heuristic');
       for (const t of tokens) {
-        const hits = this.findAllSymbols(cg, t).nodes;
+        const hits = this.findAllSymbols(cg, t).nodes.filter(nodeInScope);
         const cands = hits.filter((n) => CALLABLE.has(n.kind));
         tokenFamily.set(t, cands);
         // A qualified or otherwise-specific name (<=3 hits) keeps all; an
@@ -2652,6 +2663,7 @@ export class ToolHandler {
           for (const { node: other, edge } of [...cg.getCallers(n.id), ...cg.getCallees(n.id)]) {
             if (synthLines.length >= 6) break;
             if (edge.provenance !== 'heuristic' || other.id === n.id) continue;
+            if (!nodeInScope(other)) continue;
             if (skipInChain && skipInChain(edge)) continue;
             const src = edge.source === n.id ? n : other;
             const tgt = edge.source === n.id ? other : n;
@@ -2700,7 +2712,7 @@ export class ToolHandler {
         // whole chain; (2) the one resolved callable's body may hold the
         // dynamic-dispatch site that EXPLAINS a half-connected flow.
         const synthLines = collectSynthLinks(null);
-        const boundaries = named.size === 0 ? '' : (this.buildDynamicBoundaries(cg, [...named.values()], named) || '');
+        const boundaries = named.size === 0 ? '' : (this.buildDynamicBoundaries(cg, [...named.values()], named, scope) || '');
         if (synthLines.length === 0 && !boundaries) return identityOnly();
         const out: string[] = [];
         if (synthLines.length) out.push(
@@ -2729,6 +2741,7 @@ export class ToolHandler {
           if (depth >= MAX_HOPS - 1) continue;
           for (const c of cg.getCallees(id)) {
             if (c.edge.kind !== 'calls' || parent.has(c.node.id)) continue;
+            if (!nodeInScope(c.node)) continue;
             const newStreak = named.has(c.node.id) ? 0 : streak + 1;
             if (newStreak > MAX_BRIDGE) continue;
             parent.set(c.node.id, { prev: id, edge: c.edge, node: c.node });
@@ -2779,7 +2792,7 @@ export class ToolHandler {
           if (hasMain) scanList.push(best![best!.length - 1]!.node);
           scanList.push(...uncovered.sort((a, b) =>
             (uniqueNamedNodeIds.has(b.id) ? 1 : 0) - (uniqueNamedNodeIds.has(a.id) ? 1 : 0)));
-          boundaryText = this.buildDynamicBoundaries(cg, scanList, named);
+          boundaryText = this.buildDynamicBoundaries(cg, scanList, named, scope);
         }
       }
 
@@ -2864,7 +2877,7 @@ export class ToolHandler {
    * at runtime. Query-time, deterministic, zero graph mutation; a fully
    * connected flow never reaches this method.
    */
-  private buildDynamicBoundaries(cg: CodeGraph, scanList: Node[], named: Map<string, Node>): string {
+  private buildDynamicBoundaries(cg: CodeGraph, scanList: Node[], named: Map<string, Node>, scope: ExploreScope | null = null): string {
     const MAX_NOTES = 4;       // boundary bullets per explore
     const MAX_SCAN = 8;        // bodies scanned
     const MAX_TOTAL_CHARS = 200_000;
@@ -2893,7 +2906,7 @@ export class ToolHandler {
         const more = m.moreSites ? ` (+${m.moreSites} more such site${m.moreSites > 1 ? 's' : ''} in this body)` : '';
         notes.push(`- \`${node.name}\` (${node.filePath}:${m.line}) — ${m.label}: \`${m.snippet}\`${more}`);
         if (m.key) {
-          const cand = this.boundaryCandidates(cg, m.key, !!m.keyIsType, named, node.id);
+          const cand = this.boundaryCandidates(cg, m.key, !!m.keyIsType, named, node.id, scope);
           if (cand) notes.push(`  ${cand}`);
         }
       }
@@ -3004,7 +3017,7 @@ export class ToolHandler {
    * candidate list should be). Symbols the agent already named sort first and
    * are marked — that's the "you were right, here's the wiring" case.
    */
-  private boundaryCandidates(cg: CodeGraph, key: string, keyIsType: boolean, named: Map<string, Node>, selfId: string): string {
+  private boundaryCandidates(cg: CodeGraph, key: string, keyIsType: boolean, named: Map<string, Node>, selfId: string, scope: ExploreScope | null = null): string {
     const CALLABLE = new Set(['method', 'function', 'component', 'constructor', 'class']);
     const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
     const keyNorm = norm(key);
@@ -3012,6 +3025,7 @@ export class ToolHandler {
     const cands = new Map<string, Node>();
     const consider = (n: Node | undefined | null) => {
       if (!n || n.id === selfId || !CALLABLE.has(n.kind) || cands.has(n.id)) return;
+      if (scope && !scope.matches(n.filePath)) return;
       const nameNorm = norm(n.name || '');
       if (nameNorm.length < 3) return;
       if (!nameNorm.includes(keyNorm) && !keyNorm.includes(nameNorm)) return;
@@ -3260,6 +3274,22 @@ export class ToolHandler {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
 
+    // Optional subtree scope. Omitted (or empty) leaves `scope` null and every
+    // step below on its original path, so an unscoped call is byte-identical to
+    // the pre-scope build. A path that is malformed, escapes the project or
+    // selects nothing indexed answers with SUCCESS-shaped guidance — an
+    // `isError` here would teach the agent to stop calling codegraph at all.
+    let scope: ExploreScope | null = null;
+    if (args.path !== undefined && args.path !== null && args.path !== '') {
+      const indexedFiles = (() => {
+        try { return cg.getFiles().map((f) => f.path); } catch { return [] as string[]; }
+      })();
+      const parsed = parseExploreScope(args.path, projectRoot, indexedFiles);
+      if (!parsed.ok) return this.textResult(parsed.guidance);
+      if (parsed.scope.pattern !== '') scope = parsed.scope;
+    }
+    const inScope = (filePath: string): boolean => !scope || scope.matches(filePath);
+
     // Resolve adaptive output budget from project size. Falls back to the
     // largest-tier defaults if stats aren't available, which preserves
     // pre-#185 behavior for callers that hit the rare stats failure.
@@ -3288,7 +3318,7 @@ export class ToolHandler {
       try {
         const extraction = extractQueryPaths(
           rawQuery,
-          cg.getFiles().map((f) => f.path),
+          cg.getFiles().map((f) => f.path).filter(inScope),
           { maxPins: maxFiles },
         );
         if (extraction.pinnedFiles.length > 0 || extraction.unresolvedPathSpans.length > 0) {
@@ -3364,6 +3394,19 @@ export class ToolHandler {
       maxNodes: 200,
       minScore: 0.2,
     });
+
+    // Apply the subtree scope to the gather ITSELF. Swapping the node map for a
+    // scoped one means every later gather step — pinned files, call-graph glue,
+    // named-symbol seeding, the change-surface rescue — is scoped by
+    // construction rather than by a filter someone has to remember to add.
+    if (scope) {
+      const kept = [...subgraph.nodes].filter(([, n]) => scope!.matches(n.filePath));
+      subgraph.nodes = new ScopedNodeMap<Node>(scope, kept);
+      subgraph.roots = subgraph.roots.filter((id) => subgraph.nodes.has(id));
+      subgraph.edges = subgraph.edges.filter(
+        (e) => subgraph.nodes.has(e.source) && subgraph.nodes.has(e.target)
+      );
+    }
 
     // Pinned files' symbols enter the gather unconditionally — the agent named
     // the file itself, so its contents ARE the answer regardless of what the
@@ -3685,7 +3728,10 @@ export class ToolHandler {
       for (const e of outs) {
         if (!SIG_EDGE.has(e.kind)) continue;
         const tgt = cg.getNode(e.target);
-        if (!tgt || !TYPE_KINDS.has(tgt.kind) || namedSeedIds.has(tgt.id)) continue;
+        // The rescue below injects straight into `fileGroups`/`relevantFiles`,
+        // bypassing the scoped node map — so the scope is enforced here.
+        if (!tgt || !inScope(tgt.filePath)) continue;
+        if (!TYPE_KINDS.has(tgt.kind) || namedSeedIds.has(tgt.id)) continue;
         if (seenChangeSurface.has(tgt.id)) continue;
         seenChangeSurface.add(tgt.id);
         changeSurfaceCandidates.push(tgt);
@@ -4017,6 +4063,10 @@ export class ToolHandler {
       (fileTermHits.get(fp) ?? 0) >= 2 &&
       (entryFiles.has(fp) || centralFiles.has(fp));
 
+    // Belt and braces for the subtree scope: whatever any ranking step pulled
+    // in, only scoped files can be RANKED or EMITTED.
+    if (scope) relevantFiles = relevantFiles.filter(([fp]) => inScope(fp));
+
     const sortedFiles = relevantFiles.sort((a, b) => {
       const aPath = a[0].toLowerCase();
       const bPath = b[0].toLowerCase();
@@ -4131,7 +4181,7 @@ export class ToolHandler {
     // Compute the flow spine once — used both to prepend the Flow section (below)
     // and to gate adaptive source sizing: files on the spine get full source,
     // off-spine peers skeletonize.
-    const flow = this.buildFlowFromNamedSymbols(cg, matchQuery);
+    const flow = this.buildFlowFromNamedSymbols(cg, matchQuery, scope);
 
     // Snapshot every ranked candidate's scoring inputs, in final sort order, so
     // the diagnostic can show what each file's share of the envelope was BOUGHT
