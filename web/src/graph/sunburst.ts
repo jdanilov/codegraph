@@ -56,17 +56,6 @@ export const START_ANGLE = -Math.PI / 2;
 /** No arc is ever thinner than this — the "still clickable" floor. */
 export const MIN_ARC_ANGLE = (1.1 * Math.PI) / 180;
 
-/**
- * Share of its normal radial depth a wedge keeps while it is **expanded as its
- * own disk** somewhere else in the workspace (phase G2).
- *
- * The subtree lives in the other disk now, so the source wedge is a stub that
- * says "this is still here, and it is over there" — a third of the depth reads
- * as exactly that next to its full-depth siblings, without moving any of them
- * (the ANGLE is untouched: a collapsed wedge keeps its share of the circle).
- */
-export const COLLAPSED_DEPTH_SHARE = 1 / 3;
-
 /** Rings drawn outward from the current root before the rest is aggregated. */
 export const MAX_RINGS = 6;
 
@@ -459,11 +448,13 @@ export interface SunburstOptions {
   /**
    * Nodes that are **expanded as their own disk** elsewhere in the workspace.
    *
-   * Such a wedge is drawn at {@link COLLAPSED_DEPTH_SHARE} of its normal depth
-   * and grows no children here: its subtree lives in the other disk, so drawing
-   * it twice would claim two homes for one structure. Nothing folds into a `+N`
-   * for it either — there is no "more inside" to promise, the "more" is on the
-   * other disk, and the tether drawn between the two says so.
+   * Such a wedge is drawn as a full-height SPOKE — its angle and inner radius
+   * are untouched and it is stretched OUTWARD to the disk's rim
+   * (`maxRadius`) — and it grows no children here: its subtree lives in the
+   * other disk, so drawing it twice would claim two homes for one structure.
+   * Nothing folds into a `+N` for it either — there is no "more inside" to
+   * promise, the "more" is on the other disk, and the tether that leaves the
+   * rim exactly where this spoke meets it says which one.
    *
    * A node is never collapsed in the disk it is the ROOT of (the root has no
    * arc), so the expanded disk always shows the subtree in full.
@@ -596,6 +587,8 @@ export function computeSunburst(
   const byNode = new Map<string, SunburstArc>();
   const aggregatedInto = new Map<string, SunburstArc>();
   const collapsed = new Set<string>();
+  /** Wedges the post-pass below stretches out to the rim (phase G3). */
+  const collapsedArcs: SunburstArc[] = [];
   const byRing: SunburstArc[][] = [[]];
   let truncated = false;
 
@@ -710,7 +703,10 @@ export function computeSunburst(
         // Radial depth is the KIND's floor plus whatever the LABEL wants
         // (round 4). An aggregate takes the deepest of what it folded, so a
         // `+N` arc never looks shallower than the siblings it stands in for.
-        // A wedge expanded as its own disk keeps a third of that (phase G2).
+        // A wedge expanded as its own disk keeps its NATURAL depth here and is
+        // stretched out to the rim by the post-pass below (phase G3) — natural
+        // depth first, so a collapsed wedge can never make the disk larger
+        // than the same wedge uncollapsed would.
         const isCollapsed = node !== undefined && collapsedNodes.has(node.id);
         const factor = node
           ? labelDepthFactor(node.kind, node.name)
@@ -720,7 +716,7 @@ export function computeSunburst(
                 ? Math.max(deepest, labelDepthFactor(child.kind, child.name))
                 : deepest;
             }, 1);
-        const depth = thickness * factor * (isCollapsed ? COLLAPSED_DEPTH_SHARE : 1);
+        const depth = thickness * factor;
         const arc: SunburstArc = {
           key: slot.id ?? aggregateKey(item.nodeId),
           nodeId: slot.id,
@@ -742,7 +738,10 @@ export function computeSunburst(
           kind: node ? node.kind : AGGREGATE_KIND,
         };
         if (node?.layer) arc.layer = node.layer;
-        if (isCollapsed) collapsed.add(node!.id);
+        if (isCollapsed) {
+          collapsed.add(node!.id);
+          collapsedArcs.push(arc);
+        }
         produced.push(arc);
         if (!slot.id) truncated = true;
       });
@@ -790,6 +789,18 @@ export function computeSunburst(
     }
     frontier = next;
   }
+
+  // --- post-pass: stretch every collapsed wedge OUT TO THE RIM (phase G3).
+  //
+  // A wedge whose subtree is open as its own disk is drawn as a full-height
+  // spoke: same angle, same inner radius, outer edge on the disk's rim. It is
+  // done here, once the rim is known, and it is deliberately one-directional —
+  // `maxRadius` already accounts for every arc at its natural depth, so the
+  // stretch can only ever grow a wedge INTO existing disk, never push the rim
+  // out. Siblings' radii and the ring structure are therefore untouched, and
+  // because the extent lives in the arc itself, `arcAt` hit-tests the whole
+  // spoke without knowing anything about collapsing.
+  for (const arc of collapsedArcs) arc.r1 = maxRadius;
 
   const trail: ModelNode[] = [];
   for (const id of [...model.ancestors(rootId)].reverse()) {

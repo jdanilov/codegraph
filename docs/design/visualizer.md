@@ -948,6 +948,111 @@ one affordance. No contract item and no endpoint shape changed.
   shortcut list. It now uses the same `Card` the settings dialog does, so the two
   cannot drift.
 
+### Phase G — multi-disk workspace (3) (additive; supersedes four G1/G2 items)
+
+A manual review of the G2 build. It changes how an expanded wedge is drawn and
+tied back, moves the close affordance onto that tie, narrows hover and selection
+to a node's own relations, and states the invariant that a view never moves the
+camera. No contract item and no endpoint shape changed.
+
+- **An expanded wedge is a full-height SPOKE, out to the rim.** A wedge whose
+  subtree is open as its own disk keeps its angle and its inner radius `r0` and
+  is stretched OUTWARD to the disk's own `maxRadius`. It still renders no
+  children and still folds nothing into a `+N`. *Supersedes G2's
+  `COLLAPSED_DEPTH_SHARE` third-depth stub*: a wedge shorter than its siblings
+  read as "this shrank", disappeared into the ring rather than standing out of
+  it, and gave the tether nowhere honest to leave from. A spoke that touches the
+  rim reads as an open channel and is exactly where the tether starts.
+  - **The stretch lives in the LAYOUT, as a post-pass**, not as a paint-time
+    override in the controller. Two reasons: the rim is not known until every
+    arc is placed, and putting the extent in the arc means `arcAt` covers the
+    whole stretched spoke for free — a paint-time override would need its own
+    parallel hit test, which is how a click target drifts from what is drawn.
+  - It is **one-directional and cannot move anything**. The wedge is placed at
+    its NATURAL depth first, so `maxRadius` already accounts for it; the
+    post-pass then only ever grows it INTO disk that already exists. Siblings'
+    radii, the ring structure and the disk's own radius are untouched, and a
+    collapsed layout is never larger than the same layout uncollapsed.
+  - Probed on a real 13.8k-node project (88 collapse cases over 41 roots): the
+    stub's `r1` equalled `maxRadius` in every case (mean stretch **156 layout
+    units**), every one of 891 shared arcs at or inside the stub's ring was
+    byte-identical to the uncollapsed layout, no descendant of a collapsed wedge
+    was drawn, and the hit test round-tripped at 2 %, 25 %, 50 %, 75 % and 98 %
+    of the stretched extent.
+- **The tether is a cubic BÉZIER, rim to rim.** It starts on the source disk's
+  rim at the collapsed wedge's mid angle — where that wedge's spoke meets the
+  rim, so the curve continues the wedge rather than attaching to the disk —
+  **leaves radially** (first control arm along the same radius), and **arrives
+  radially** at the nearest point of the expanded disk's rim (second arm along
+  that disk's radius through the arrival point). Both arms are
+  `clamp(gap × 0.42, 8, gap / 2)`, so the curve is symmetric and can never loop
+  back on itself. *Supersedes G2's straight rim-to-rim line*, which read as a
+  chord across the workspace rather than as something leaving one disk for
+  another. Everything else about it stands: quiet slate, thin, solid, under the
+  code edges, always visible, and **nothing is drawn** when the rim anchor falls
+  inside the expanded disk. The geometry is pure and lives in `workspace.ts`
+  (`tetherCurve` / `tetherPointAt` / `tetherPolyline`), so it is probeable
+  without a browser — 243 curves over 52 mid angles × 5 placements: start on the
+  source rim at the mid angle, end on the target rim and demonstrably the
+  NEAREST point of it, both tangents radial to within 1e-9, 17 overlapping
+  placements correctly refused.
+  - When no disk renders the source wedge any more (the source disk was
+    re-rooted away), the tether still leaves the source DISK, from the point of
+    its rim facing the expanded one. The tether carries the close button now, so
+    it has to survive a re-root that hid the wedge it came from.
+- **The close `×` sits ON the tether, at its midpoint.** It appears when the
+  pointer is on the tether (the sampled curve, small screen-space tolerance) and
+  closes the disk on click; the button's own hit area counts as the line's, so
+  the affordance cannot vanish on the way to it. Still screen-sized, still no
+  transitions, still secondary disks only. *Supersedes G2's "the close `×` moved
+  from the rim to the CENTRE"* — and the centre affordance is **gone entirely**.
+  The button belongs to the RELATIONSHIP, not to either disk: the tether is the
+  one mark that means "this disk is an expansion of that wedge", and closing the
+  disk is the undoing of exactly that. In the centre it sat on the disk's own
+  caption and could only be found by hovering the disk itself.
+- **Hover and selection show a node's OWN edges — never its subtree's.** A wedge
+  lights the relations incident to the node it renders, and nothing else: a
+  class with one outgoing and three incoming relations draws exactly four ropes.
+  *Supersedes phase E/F's "hover bundles the arc's SUBTREE's edges"* and phase
+  F's "connectivity is aggregated exactly like the card highlight, the hovered
+  wedge's whole subtree is the source": on a real project a container wedge
+  averaged **38 aggregated relations against 4 of its own** — a hairball with no
+  single subject, in which the wedge's own relations were unfindable. A child
+  rendered as its own wedge owns its own relations through its own hover.
+  - An aggregate `+N` wedge stands for several nodes at once, so it takes each
+    of THEIR own edges — the same rule applied to each node it stands in for.
+  - **The hover DIMMING follows the same rule**, by construction: the dimming
+    set is derived from the very edges just collected, so what stays lit is the
+    hovered wedge plus whatever it actually has a relation with. The hovered
+    wedge's descendants are no longer kept lit for being descendants —
+    containment is what the disk already draws.
+  - Question-card and impact projections are untouched: they highlight node
+    SETS, which is a different question from "what does this one thing touch".
+- **Inside a card view, the hover is scoped to the card.** While a question card
+  carries an edge set, hovering a node shows
+  `intersection(card edges, that node's own edges)` — a card is a view of one
+  answer, and a hover inside it is a question about that answer, not about the
+  graph. With no card active (or a view with no edges of its own, e.g. Changes)
+  the own-edges rule above applies unchanged.
+  - The card's own edge set stays drawn while the card is active — that IS the
+    view. What the scoping removes is the hover's ability to ADD relations the
+    card never claimed; the intersection is what the hover then colours by
+    direction (green in, amber out) and what the dimming reads. Narrowing the
+    picture to the intersection instead would hide the rest of the answer
+    every time the pointer crossed a wedge, which is the answer flickering.
+- **Views are HIGHLIGHTERS: switching one never moves the camera.** Activating
+  or deactivating a card, Changes or Project performs **no fit, no pan, no zoom,
+  no re-root and no reveal** — it only changes what is lit and what is dimmed.
+  *Supersedes phase D's "activating a card frames it" and phase E's "re-root to
+  the deepest node containing every result node"*: the shift came from
+  `focusNodes(result ids)` in the card-activation path (and `setRoot(ROOT_ID)` +
+  `fitView()` on Project), which yanked the picture out from under whatever the
+  user was reading — and, an answer being usually spread wide, generally landed
+  back on the project root anyway, i.e. it paid a full re-root for nothing.
+  Clicking an individual symbol listed IN a card still reveals it: that is an
+  explicit navigation act, and now the only one in this path. `focusNodes` stays
+  on `CanvasController` as navigation API; nothing in the view layer calls it.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all
@@ -998,8 +1103,13 @@ one affordance. No contract item and no endpoint shape changed.
    collapsed to a third-depth stub in the disk they came from (no children, no
    edges) with one always-visible tether to the disk that holds them, the close
    `×` moved to the disk's centre, and the keyboard overlay given the settings
-   dialog's panel. **G3** (named saved views, which is what makes a workspace
-   survive a refresh) follows, along with the AI-composed flow views.
+   dialog's panel. **G3** (built) is the second review round: an expanded wedge
+   stretched out to the rim as a full-height spoke, a cubic-Bézier tether that
+   leaves and arrives radially, the close `×` moved onto the middle of that
+   tether, hover and selection narrowed to a node's own relations (scoped to the
+   active card's edge set inside a card view), and views made pure highlighters
+   that never move the camera. **Named saved views** — what makes a workspace
+   survive a refresh — follow, along with the AI-composed flow views.
 
 ## House rules for every phase
 

@@ -69,9 +69,12 @@ import {
   diskAt,
   fitCamera,
   placeSpawnedDisk,
+  tetherCurve,
+  tetherPolyline,
   toDiskLocal,
   workspaceBounds,
   type DiskPlacement,
+  type TetherCurve,
 } from './workspace';
 
 export interface BreadcrumbEntry {
@@ -165,8 +168,6 @@ const TRANSITION_MS = 260;
 
 /** Relations assembled for one hover / selection / card. */
 const EDGE_BUDGET = 500;
-/** Nodes walked when collecting a subtree's relations. */
-const NODE_SCAN_CAP = 4000;
 
 /** Pointer slop before a drag stops counting as a click. */
 const DRAG_SLOP = 4;
@@ -263,7 +264,11 @@ const CLOSE_HIT_PX = 13;
  * apart from a code edge (those are drawn on demand only).
  */
 const TETHER_COLOR = 'rgba(148, 163, 184, 0.42)';
+/** Same slate, brighter, while the pointer is on the line (its `×` is up). */
+const TETHER_COLOR_HOVER = 'rgba(186, 202, 224, 0.85)';
 const TETHER_WIDTH_PX = 1;
+/** Screen-space tolerance of the tether's own hit test (the `×` affordance). */
+const TETHER_HIT_PX = 6;
 /** Ring around the focused disk's centre, drawn only once there are several. */
 const FOCUS_RING = 'rgba(125, 211, 252, 0.55)';
 
@@ -416,6 +421,8 @@ export class CanvasController {
   private hoveredEdgeKey: string | null = null;
   /** Secondary disk whose `×` the pointer is on, if any. */
   private closeHoverDiskId: string | null = null;
+  /** Secondary disk whose TETHER the pointer is on — what raises that `×`. */
+  private tetherHoverDiskId: string | null = null;
 
   private resultNodes = new Set<string>();
   private changedNodes = new Set<string>();
@@ -723,6 +730,7 @@ export class CanvasController {
       this.callbacks.onArcTooltip(null);
     }
     if (this.closeHoverDiskId === id) this.closeHoverDiskId = null;
+    if (this.tetherHoverDiskId === id) this.tetherHoverDiskId = null;
     if (this.pulseDiskId === id) this.pulseNodeId = null;
     // Its source wedge is whole again — every layout is rebuilt for that.
     this.rebuildAllLayouts();
@@ -1602,49 +1610,71 @@ export class CanvasController {
     if (this.disks.length < 2) return;
     ctx.lineCap = 'round';
     ctx.setLineDash([]);
-    ctx.strokeStyle = TETHER_COLOR;
-    ctx.lineWidth = TETHER_WIDTH_PX / k;
     for (const disk of this.disks) {
-      if (disk.primary || !disk.source) continue;
-      const anchor = this.tetherAnchor(disk);
-      if (!anchor) continue;
-      const radius = disk.layout?.maxRadius ?? MAX_RADIUS;
-      const dx = anchor.x - disk.x;
-      const dy = anchor.y - disk.y;
-      const distance = Math.hypot(dx, dy);
-      // The wedge's rim point is inside this disk — the two overlap, and a line
-      // drawn from inside outward would point the wrong way. Say nothing.
-      if (distance <= radius) continue;
+      const curve = this.tetherOf(disk);
+      if (!curve) continue;
+      const hot = this.tetherHoverDiskId === disk.id;
+      ctx.strokeStyle = hot ? TETHER_COLOR_HOVER : TETHER_COLOR;
+      ctx.lineWidth = (hot ? TETHER_WIDTH_PX * 1.6 : TETHER_WIDTH_PX) / k;
       ctx.beginPath();
-      ctx.moveTo(anchor.x, anchor.y);
-      ctx.lineTo(disk.x + (dx / distance) * radius, disk.y + (dy / distance) * radius);
+      ctx.moveTo(curve.start.x, curve.start.y);
+      ctx.bezierCurveTo(
+        curve.control1.x,
+        curve.control1.y,
+        curve.control2.x,
+        curve.control2.y,
+        curve.end.x,
+        curve.end.y
+      );
       ctx.stroke();
     }
   }
 
   /**
-   * Workspace point a disk's tether leaves from: the rim of the disk that holds
-   * its collapsed wedge, at that wedge's mid angle.
+   * A disk's tether, in workspace coordinates — `null` for the primary disk, a
+   * disk with no source, or a pair that overlaps too far to draw an honest line
+   * between (see {@link tetherCurve}).
    *
-   * The disk the drag STARTED in answers when it still renders the wedge;
-   * otherwise (it was re-rooted away, or closed) any disk that does will do, in
-   * creation order. No disk renders it → no tether, rather than a line from an
-   * arbitrary centre.
+   * The source ANCHOR is the rim of the disk that holds the collapsed wedge, at
+   * that wedge's mid angle — which is where the wedge's own rim-stretched spoke
+   * ends, so the curve continues the wedge outward. The disk the drag STARTED
+   * in answers when it still renders the wedge; otherwise (it was re-rooted
+   * away) any disk that does will do, in creation order. When no disk renders
+   * the wedge at all the source disk still answers, from the point of its rim
+   * facing the expanded disk: the tether is also where the close button lives,
+   * so it must survive a re-root that hid the wedge it came from.
    */
-  private tetherAnchor(disk: DiskState): Point | null {
+  private tetherOf(disk: DiskState): TetherCurve | null {
     const nodeId = disk.source;
-    if (!nodeId) return null;
+    if (disk.primary || !nodeId) return null;
+    const target: DiskPlacement = {
+      id: disk.id,
+      x: disk.x,
+      y: disk.y,
+      radius: disk.layout?.maxRadius ?? MAX_RADIUS,
+    };
     const preferred = this.diskById(disk.sourceDiskId);
     const candidates = preferred ? [preferred, ...this.disks] : this.disks;
     for (const holder of candidates) {
-      if (holder.id === disk.id) continue;
-      const arc = holder.layout?.byNode.get(nodeId);
+      if (holder.id === disk.id || !holder.layout) continue;
+      const arc = holder.layout.byNode.get(nodeId);
       if (!arc) continue;
-      const mid = (arc.a0 + arc.a1) / 2;
-      const radius = holder.layout!.maxRadius;
-      return { x: holder.x + Math.cos(mid) * radius, y: holder.y + Math.sin(mid) * radius };
+      const source: DiskPlacement = {
+        id: holder.id,
+        x: holder.x,
+        y: holder.y,
+        radius: holder.layout.maxRadius,
+      };
+      return tetherCurve(source, (arc.a0 + arc.a1) / 2, target);
     }
-    return null;
+    if (!preferred?.layout) return null;
+    const source: DiskPlacement = {
+      id: preferred.id,
+      x: preferred.x,
+      y: preferred.y,
+      radius: preferred.layout.maxRadius,
+    };
+    return tetherCurve(source, Math.atan2(disk.y - preferred.y, disk.x - preferred.x), target);
   }
 
   /** Paint the relations belonging to one disk (`null` = the cross-disk set). */
@@ -1951,9 +1981,13 @@ export class CanvasController {
     if (this.disks.length < 2) return;
     for (const disk of this.disks) {
       if (disk.primary) continue;
-      const shown = this.hoveredDiskId === disk.id || this.closeHoverDiskId === disk.id;
+      // The `×` belongs to the TETHER: it is up while the pointer is on the
+      // line (or on the button itself), and nowhere else. Hovering the disk
+      // raises nothing — a disk is data, and closing it is not.
+      const shown = this.tetherHoverDiskId === disk.id || this.closeHoverDiskId === disk.id;
       if (!shown) continue;
       const anchor = this.closeAnchorScreen(disk);
+      if (!anchor) continue;
       const hot = this.closeHoverDiskId === disk.id;
       ctx.beginPath();
       ctx.arc(anchor.x, anchor.y, CLOSE_RADIUS_PX, 0, Math.PI * 2);
@@ -2010,26 +2044,20 @@ export class CanvasController {
   // ---------------------------------------------------------------- edges ---
 
   /**
-   * Is this arc the hovered one, or inside its subtree?
+   * Is this arc the hovered one?
    *
-   * Answered by walking the arc's own parent chain (at most `MAX_RINGS` steps)
-   * rather than expanding the hovered subtree, so it stays O(1) per arc. Only
-   * the hovered DISK answers by chain — the other disks light the same nodes
-   * through {@link projectHover}, which is a node-level question.
+   * It used to be "the hovered one **or inside its subtree**", which kept a
+   * whole branch lit. Phase G3 narrowed hovering to a node's OWN edges, and the
+   * dimming follows the same rule: what stays lit is the wedge under the
+   * pointer plus whatever it actually has an edge with. Lighting the subtree
+   * made "what does this touch" answer with "everything it contains", which is
+   * the containment the disk already draws.
    */
   private isUnderHover(disk: DiskState, arc: SunburstArc): boolean {
     const hovered = this.hoveredKey;
     if (!hovered || hovered === CENTRE_KEY) return false;
     if (disk.id !== this.hoveredDiskId) return false;
-    const layout = disk.layout;
-    if (!layout) return false;
-    let current: SunburstArc | undefined = arc;
-    let guard = 0;
-    while (current && guard++ < 16) {
-      if (current.key === hovered) return true;
-      current = current.parentKey ? layout.byKey.get(current.parentKey) : undefined;
-    }
-    return false;
+    return arc.key === hovered;
   }
 
   /**
@@ -2037,9 +2065,20 @@ export class CanvasController {
    *
    * Edges are hidden at rest by design (contract): the disk is the structure,
    * relations are the answer to a question. Three sources ask for them — the
-   * hovered arc's subtree, the current selection, and the active card's
-   * `edgeRefs` — and each is capped, because a hover over the project root
-   * would otherwise ask for every edge in the graph.
+   * hovered wedge, the current selection, and the active card's `edgeRefs`.
+   *
+   * **Hover and selection show a node's OWN edges, never its subtree's** (phase
+   * G3). Aggregating descendants meant hovering a class drew every relation of
+   * every method in it — a hairball with no single subject, in which the class's
+   * own four relations were unfindable. A child rendered as its own wedge has
+   * its own hover; the parent answers for itself. (An aggregate `+N` wedge
+   * stands for several nodes at once, so it takes each of their own edges — the
+   * same rule, applied to each node the wedge is standing in for.)
+   *
+   * **Inside a card view the hover is scoped to the card** (phase G3): while a
+   * question card carries an edge set, a hover shows the intersection of that
+   * set with the hovered node's own edges. A card is a view of one answer, and
+   * hovering inside it is a question about that answer, not about the graph.
    *
    * Phase G routes each relation ONCE: both endpoints are matched against every
    * disk, the best match wins, and the edge is bundled inside a disk when the
@@ -2061,7 +2100,7 @@ export class CanvasController {
       if (edge && this.enabledKinds.has(edge.kind)) wanted.set(key, edge);
       if (wanted.size >= EDGE_BUDGET) break;
     }
-    if (this.selected) this.collectEdges([this.selected], wanted, directions);
+    if (this.selected) this.collectOwnEdges([this.selected], wanted, directions);
 
     const hoverDisk = this.diskById(this.hoveredDiskId);
     const hoverEdges = new Map<string, ModelEdge>();
@@ -2070,10 +2109,13 @@ export class CanvasController {
         ? (hoverDisk.layout?.byKey.get(this.hoveredKey) ?? null)
         : null;
     if (hoveredArc) {
-      this.collectEdges(
+      this.collectOwnEdges(
         hoveredArc.nodeId ? [hoveredArc.nodeId] : hoveredArc.aggregated,
         hoverEdges,
-        directions
+        directions,
+        // A card with an edge set scopes the hover to that set; a view with no
+        // edges of its own (Changes, Project) leaves the hover unfiltered.
+        this.resultEdges.size > 0 ? this.resultEdges : null
       );
       for (const [key, edge] of hoverEdges) {
         if (wanted.size >= EDGE_BUDGET && !wanted.has(key)) break;
@@ -2082,7 +2124,9 @@ export class CanvasController {
     }
 
     // Everything the hover reaches — the dimming set, at NODE level so every
-    // disk can project it onto whatever arc stands in for the node there.
+    // disk can project it onto whatever arc stands in for the node there. It
+    // is derived from the very edges just collected, so the dimming obeys the
+    // own-edges rule (and a card's scoping) by construction.
     if (hoveredArc) {
       const nodes = new Set<string>();
       if (hoveredArc.nodeId) nodes.add(hoveredArc.nodeId);
@@ -2196,33 +2240,36 @@ export class CanvasController {
   }
 
   /**
-   * Walk a subtree and take its relations, recording each one's DIRECTION
-   * relative to the subtree: an edge leaving a node we walked is outgoing, one
-   * arriving at it is incoming. That is the only place the two are
-   * distinguishable for free, so it happens here rather than in the painter.
+   * The relations of the seed nodes THEMSELVES — no subtree walk (phase G3).
+   *
+   * Each edge's DIRECTION is recorded relative to the seed it was found on: one
+   * leaving it is outgoing, one arriving at it is incoming. That is the only
+   * place the two are distinguishable for free, so it happens here rather than
+   * in the painter.
+   *
+   * `only` scopes the result to an edge set the caller already has — the active
+   * card's `edgeRefs`, which is what makes a hover inside a card view a
+   * question about that card's answer rather than about the whole graph.
    */
-  private collectEdges(
+  private collectOwnEdges(
     seeds: string[],
     into: Map<string, ModelEdge>,
-    directions?: Map<string, EdgeDirection>
+    directions?: Map<string, EdgeDirection>,
+    only?: ReadonlySet<string> | null
   ): void {
     const model = this.model;
     if (!model) return;
-    const stack = [...seeds];
-    let scanned = 0;
-    while (stack.length > 0 && scanned < NODE_SCAN_CAP && into.size < EDGE_BUDGET) {
-      const id = stack.pop()!;
-      scanned++;
+    for (const id of seeds) {
       for (const edge of model.edgesOf(id)) {
-        if (into.size >= EDGE_BUDGET) break;
+        if (into.size >= EDGE_BUDGET) return;
         if (!this.enabledKinds.has(edge.kind)) continue;
         if (edge.source === edge.target) continue;
+        if (only && !only.has(edge.key)) continue;
         into.set(edge.key, edge);
         if (directions && !directions.has(edge.key)) {
           directions.set(edge.key, edge.source === id ? 'outgoing' : 'incoming');
         }
       }
-      for (const child of model.childrenOf(id)) stack.push(child);
     }
   }
 
@@ -2267,9 +2314,10 @@ export class CanvasController {
     return { disk, local: toDiskLocal(workspace, placement) };
   }
 
-  /** Screen position of a secondary disk's `×` — its centre, one line down. */
-  private closeAnchorScreen(disk: DiskState): Point {
-    return this.toScreen(closeAnchor({ x: disk.x, y: disk.y }));
+  /** Screen position of a secondary disk's `×` — the middle of its tether. */
+  private closeAnchorScreen(disk: DiskState): Point | null {
+    const curve = this.tetherOf(disk);
+    return curve ? this.toScreen(closeAnchor(curve)) : null;
   }
 
   /** The secondary disk whose `×` a screen point is on, if any. */
@@ -2278,9 +2326,36 @@ export class CanvasController {
     for (const disk of this.disks) {
       if (disk.primary) continue;
       const anchor = this.closeAnchorScreen(disk);
+      if (!anchor) continue;
       if (Math.hypot(screen.x - anchor.x, screen.y - anchor.y) <= CLOSE_HIT_PX) return disk;
     }
     return null;
+  }
+
+  /**
+   * The secondary disk whose TETHER a screen point is on — what raises the `×`.
+   *
+   * The line is the affordance now: hover the thread between a disk and the
+   * wedge it came from and the button to cut it appears on the thread itself.
+   * Tested against the sampled curve with a small tolerance, exactly like an
+   * edge, and it never steals the wedge hover for the same reason edges do not.
+   */
+  private tetherUnder(screen: Point): DiskState | null {
+    if (this.disks.length < 2) return null;
+    const workspace = this.toWorkspace(screen.x, screen.y);
+    const tolerance = TETHER_HIT_PX / this.scale();
+    let best = tolerance;
+    let found: DiskState | null = null;
+    for (const disk of this.disks) {
+      const curve = this.tetherOf(disk);
+      if (!curve) continue;
+      const distance = distanceToPolyline(tetherPolyline(curve), workspace.x, workspace.y);
+      if (distance < best) {
+        best = distance;
+        found = disk;
+      }
+    }
+    return found;
   }
 
   private readonly onPointerMove = (event: PointerEvent): void => {
@@ -2469,6 +2544,7 @@ export class CanvasController {
   private readonly onPointerLeave = (): void => {
     this.drag = null;
     this.closeHoverDiskId = null;
+    this.tetherHoverDiskId = null;
     this.setHover(null, null, null);
   };
 
@@ -2568,16 +2644,19 @@ export class CanvasController {
 
   private updateHover(position: Point): void {
     const closeHover = this.closeButtonUnder(position);
-    if (closeHover?.id !== this.closeHoverDiskId) {
+    // The `×` sits ON the tether, so the button's own hit area always counts as
+    // the line's too — the affordance cannot flicker out from under the pointer
+    // on its way to the thing it raised.
+    const tetherHover = closeHover ?? this.tetherUnder(position);
+    if (closeHover?.id !== this.closeHoverDiskId || tetherHover?.id !== this.tetherHoverDiskId) {
       this.closeHoverDiskId = closeHover?.id ?? null;
+      this.tetherHoverDiskId = tetherHover?.id ?? null;
       this.requestDraw();
     }
     if (closeHover) {
-      // The `×` sits in its disk's CENTRE circle, so the disk stays hovered
-      // (that is what keeps the button on screen) but the WEDGE hover goes: the
-      // pointer is on a button now, and a tooltip about what is under it is a
-      // lie — and the press must not read as the centre's up-navigation.
-      this.setHover(closeHover.id, null, null);
+      // The pointer is on a button: no wedge hover, no tooltip, and the press
+      // must not read as anything the disk underneath would have done.
+      this.setHover(null, null, null);
       this.canvas.style.cursor = 'pointer';
       return;
     }

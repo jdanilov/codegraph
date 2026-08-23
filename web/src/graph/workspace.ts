@@ -89,14 +89,18 @@ export const CROSS_EDGE_SAMPLES = 24;
 const SCAN_START_ANGLE = -Math.PI / 4;
 
 /**
- * How far BELOW a disk's centre its close `×` sits, in layout units (phase G2).
+ * Length of a tether's control arms, as a share of the gap it spans.
  *
- * The centre circle is 62 units and its `N loc` line sits ~10 units down, so 32
- * clears the text and still leaves the button comfortably inside the circle at
- * any zoom. It moved here from the rim, where it competed with the wedges for
- * the eye and shifted every time the disk's radius changed.
+ * Both arms are the same length, so the curve leaves the source rim radially
+ * and arrives at the target rim radially, and it is symmetric between the two.
+ * Capped at half the gap so a pair of disks that almost touch cannot produce a
+ * curve that loops back over itself.
  */
-export const CLOSE_CENTRE_OFFSET = 32;
+export const TETHER_ARM_SHARE = 0.42;
+/** Floor for that arm, so a very short tether still reads as a curve. */
+export const TETHER_MIN_ARM = 8;
+/** Samples along a tether — its polyline is also the `×`'s hit test. */
+export const TETHER_SAMPLES = 24;
 
 // ------------------------------------------------------------------ bounds ---
 
@@ -201,13 +205,96 @@ export function fromDiskLocal(local: Point, disk: DiskPlacement): Point {
   return { x: local.x + disk.x, y: local.y + disk.y };
 }
 
+// -------------------------------------------------------------- tethers ---
+
 /**
- * Where a secondary disk's `×` sits, in workspace coordinates: in the CENTRE
- * circle, one line below the `N loc` caption. Independent of the radius, so it
- * does not move when a re-root changes how far the disk reaches.
+ * The expansion TETHER: the cubic that ties an expanded disk back to the wedge
+ * it was pulled out of (phase G3).
+ *
+ * Geometry, and why it is this and not a straight line:
+ *
+ *  - it **starts on the source disk's rim**, at the collapsed wedge's mid
+ *    angle — which is exactly where that wedge's stretched spoke meets the rim,
+ *    so the line looks like a continuation of the wedge rather than an
+ *    attachment to the disk;
+ *  - it **leaves radially** (the first control arm lies along the same radius),
+ *    so at the rim it reads as "out of here", not "past here";
+ *  - it **arrives radially** at the nearest point of the expanded disk's rim
+ *    (the second arm lies along that disk's radius through the arrival point),
+ *    so it points at the target's centre instead of grazing it.
+ *
+ * `null` when the source rim point falls INSIDE the target disk: the two
+ * overlap far enough that any line would point the wrong way, and saying
+ * nothing is better than saying something false.
  */
-export function closeAnchor(disk: Point): Point {
-  return { x: disk.x, y: disk.y + CLOSE_CENTRE_OFFSET };
+export interface TetherCurve {
+  /** On the source disk's rim, at the collapsed wedge's mid angle. */
+  start: Point;
+  control1: Point;
+  control2: Point;
+  /** Nearest point of the target disk's rim. */
+  end: Point;
+}
+
+export function tetherCurve(
+  source: DiskPlacement,
+  midAngle: number,
+  target: DiskPlacement
+): TetherCurve | null {
+  const start = {
+    x: source.x + Math.cos(midAngle) * source.radius,
+    y: source.y + Math.sin(midAngle) * source.radius,
+  };
+  const dx = start.x - target.x;
+  const dy = start.y - target.y;
+  const distance = Math.hypot(dx, dy);
+  if (distance <= target.radius || distance < 1e-6) return null;
+  const vx = dx / distance;
+  const vy = dy / distance;
+  const end = { x: target.x + vx * target.radius, y: target.y + vy * target.radius };
+
+  const gap = Math.hypot(end.x - start.x, end.y - start.y);
+  const arm = Math.min(Math.max(TETHER_MIN_ARM, gap * TETHER_ARM_SHARE), gap / 2);
+  return {
+    start,
+    control1: { x: start.x + Math.cos(midAngle) * arm, y: start.y + Math.sin(midAngle) * arm },
+    control2: { x: end.x + vx * arm, y: end.y + vy * arm },
+    end,
+  };
+}
+
+/** A tether's point at parameter `t` — the plain cubic Bézier evaluation. */
+export function tetherPointAt(curve: TetherCurve, t: number): Point {
+  const inverse = 1 - t;
+  const a = inverse * inverse * inverse;
+  const b = 3 * inverse * inverse * t;
+  const c = 3 * inverse * t * t;
+  const d = t * t * t;
+  return {
+    x: a * curve.start.x + b * curve.control1.x + c * curve.control2.x + d * curve.end.x,
+    y: a * curve.start.y + b * curve.control1.y + c * curve.control2.y + d * curve.end.y,
+  };
+}
+
+/** Sampled tether, in workspace units — the polyline the `×` is hit-tested on. */
+export function tetherPolyline(curve: TetherCurve, samples = TETHER_SAMPLES): Point[] {
+  const out: Point[] = [];
+  for (let index = 0; index <= samples; index++) out.push(tetherPointAt(curve, index / samples));
+  return out;
+}
+
+/**
+ * Where a secondary disk's `×` sits, in workspace coordinates: **on its own
+ * tether, at the middle of it** (phase G3).
+ *
+ * The button belongs to the relationship, not to either disk: the tether is the
+ * one piece of the picture that means "this disk is an expansion of that
+ * wedge", and closing the disk is exactly the undoing of that. On the rim (G1)
+ * it competed with the wedges; in the centre circle (G2) it sat on top of the
+ * disk's own caption and had to be hunted for by hovering the disk.
+ */
+export function closeAnchor(curve: TetherCurve): Point {
+  return tetherPointAt(curve, 0.5);
 }
 
 // ------------------------------------------------------------- spawn placing ---

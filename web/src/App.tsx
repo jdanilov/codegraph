@@ -10,9 +10,10 @@
  * "apply a card to the canvas" means:
  *
  *  - **Cards.** Two standing views (Project, Changes) plus saved question
- *    cards. Activating one re-roots the disk onto the deepest node containing
- *    every result, selects nothing, glows the result (dimming the rest) and
- *    bundles the result's edges.
+ *    cards. Activating one selects nothing, glows the result (dimming the rest)
+ *    and bundles the result's edges. **A view is a highlighter and never moves
+ *    the camera** (phase G3): no fit, no pan, no zoom, no re-root — switching
+ *    views changes what is lit, never where you are standing.
  *  - **Changes.** `GET /api/changes` refreshed whenever `dataVersion` moves
  *    while the view is active — changed arcs wear a hot rim, impacted ones a
  *    warm one, and a node opened from here shows its diff first.
@@ -49,7 +50,7 @@ import type {
   ChangeMarker,
   ViewSummary,
 } from '@/graph/canvas-controller';
-import { DIRECTORY_KIND, ROOT_ID, type GraphModel, type ModelNode } from '@/graph/model';
+import { DIRECTORY_KIND, type GraphModel, type ModelNode } from '@/graph/model';
 import { useNodeDetail } from '@/graph/use-node-detail';
 import type { ColorMode } from '@/graph/palette';
 import { DEFAULT_SORT_MODE, toSortMode, type SortMode } from '@/graph/sunburst';
@@ -208,9 +209,17 @@ export default function App() {
   }, []);
 
   /**
-   * Put a card's answer on the disk: glow the results, bundle their edges, and
-   * re-root onto the deepest node that contains them all (the controller works
-   * that out — a spread-out answer stays at the project root).
+   * Put a card's answer on the disk: glow the results and bundle their edges.
+   *
+   * **A view is a HIGHLIGHTER — it never moves the camera** (phase G3). No fit,
+   * no pan, no zoom, no re-root, no reveal, in either direction: switching
+   * between Project, a question card and Changes changes what is lit and what
+   * is dimmed, and nothing else. It used to re-root onto the deepest node
+   * containing the whole answer, which yanked the picture out from under
+   * whatever the user was reading — and the answer is usually spread wide
+   * enough that the re-root landed on the project root anyway. Clicking an
+   * individual symbol INSIDE a card still reveals it: that is an explicit
+   * navigation act, and the only one here.
    */
   const applyResult = useCallback(
     (result: ExploreResult | undefined) => {
@@ -220,7 +229,6 @@ export default function App() {
       controller.setHighlight({ nodes: ids, edges: result?.edgeRefs ?? [] });
       controller.setSelected(null);
       setSelectedNode(null);
-      controller.focusNodes(ids);
     },
     [model]
   );
@@ -233,7 +241,6 @@ export default function App() {
       controller.setHighlight({ changed, impacted: payload.impactedNodeIds });
       controller.setSelected(null);
       setSelectedNode(null);
-      controller.focusNodes(changed);
     },
     [model]
   );
@@ -245,11 +252,11 @@ export default function App() {
       if (!controller || !model) return;
 
       if (id === PROJECT_VIEW_ID) {
-        controller.setRoot(ROOT_ID);
+        // Project is "no highlight", not "go home": the camera and the root
+        // stay exactly where the user left them.
         controller.setHighlight(null);
         controller.setSelected(null);
         setSelectedNode(null);
-        controller.fitView();
         return;
       }
       if (id === CHANGES_VIEW_ID) {
