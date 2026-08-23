@@ -14,7 +14,14 @@ import { Check, Loader2, Settings as SettingsIcon, X } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
+import { toSortMode, type SortMode } from '@/graph/sunburst';
 import { fetchSettings, saveSettings, type SettingsView } from '@/lib/api';
+
+/** The two disk orders, with the one-line explanation each needs. */
+const SORT_MODES: Array<{ value: SortMode; label: string; hint: string }> = [
+  { value: 'structural', label: 'structural', hint: 'folders A→Z, symbols in declaration order' },
+  { value: 'size', label: 'size', hint: 'largest first' },
+];
 
 /** Shown under the editor field — the two templates people actually use. */
 const EDITOR_EXAMPLES = ['cursor -g {file}:{line}', 'code -g {file}:{line}'];
@@ -22,11 +29,14 @@ const EDITOR_EXAMPLES = ['cursor -g {file}:{line}', 'code -g {file}:{line}'];
 export interface SettingsDialogProps {
   open: boolean;
   onClose(): void;
+  /** Applied live to the canvas as the user picks it, before any save. */
+  onSortModeChange?(mode: SortMode): void;
 }
 
-export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
+export function SettingsDialog({ open, onClose, onSortModeChange }: SettingsDialogProps) {
   const [editorCommand, setEditorCommand] = useState('');
   const [model, setModel] = useState('');
+  const [sortMode, setSortMode] = useState<SortMode>('structural');
   const [apiKey, setApiKey] = useState('');
   /** True once the user types in the key field — only then is the key sent. */
   const [keyDirty, setKeyDirty] = useState(false);
@@ -38,6 +48,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const apply = (view: SettingsView): void => {
     setEditorCommand(view.editorCommand ?? '');
     setModel(view.model ?? '');
+    setSortMode(toSortMode(view.sortMode));
     setApiKey(view.anthropicApiKey ?? '');
     setKeyDirty(false);
   };
@@ -70,6 +81,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
       const patch: Record<string, string | null> = {
         editorCommand: editorCommand.trim() || null,
         model: model.trim() || null,
+        sortMode,
       };
       // Omitting the key leaves the stored one alone; sending "" clears it.
       if (keyDirty) patch['anthropicApiKey'] = apiKey.trim() || null;
@@ -127,6 +139,33 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 spellCheck={false}
                 className="w-full rounded-md border border-border bg-background/60 px-2.5 py-1.5 font-mono text-xs outline-none focus:border-accent"
               />
+            </Field>
+
+            <Field
+              label="Graph order"
+              hint="How siblings are arranged around the disk. The wedge size is always the share of lines of code — this only changes the order."
+            >
+              <div className="flex gap-1.5">
+                {SORT_MODES.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    onClick={() => {
+                      setSortMode(option.value);
+                      onSortModeChange?.(option.value);
+                    }}
+                    data-testid={`settings-sort-${option.value}`}
+                    title={option.hint}
+                    className={
+                      sortMode === option.value
+                        ? 'rounded-md border border-accent bg-accent/15 px-2.5 py-1 text-xs text-foreground'
+                        : 'rounded-md border border-border px-2.5 py-1 text-xs text-muted transition-colors hover:text-foreground'
+                    }
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
             </Field>
 
             <Field

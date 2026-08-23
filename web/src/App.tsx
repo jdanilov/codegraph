@@ -40,6 +40,7 @@ import { StatusPanel } from '@/components/graph/status-panel';
 import type { CanvasController } from '@/graph/canvas-controller';
 import { ROOT_ID, type GraphModel, type ModelNode } from '@/graph/model';
 import type { ColorMode } from '@/graph/palette';
+import { DEFAULT_SORT_MODE, toSortMode, type SortMode } from '@/graph/sunburst';
 import { useGraphData } from '@/graph/use-graph-data';
 import {
   askQuestion,
@@ -67,6 +68,10 @@ export default function App() {
   const [askError, setAskError] = useState<string | null>(null);
   const [askAvailable, setAskAvailable] = useState(false);
   const [colorMode, setColorMode] = useState<ColorMode>('kind');
+  // Sibling order lives in the user's settings (`~/.codegraph/ui.json`), not in
+  // the URL: it is how this person likes to read a disk, not part of the view
+  // they would share with someone else.
+  const [sortMode, setSortMode] = useState<SortMode>(DEFAULT_SORT_MODE);
   const [selectedNode, setSelectedNode] = useState<ModelNode | null>(null);
 
   const [changes, setChanges] = useState<ChangesPayload | null>(null);
@@ -91,13 +96,15 @@ export default function App() {
       .catch(() => {
         /* a project with no cards file is the normal empty state */
       });
-    void refreshAskAvailability();
+    void refreshSettings();
   }, []);
 
-  const refreshAskAvailability = useCallback(async () => {
+  /** One settings read feeds both the ask button and the disk's order. */
+  const refreshSettings = useCallback(async () => {
     try {
       const view = await fetchSettings();
       setAskAvailable(view.anthropicApiKeySet);
+      setSortMode(toSortMode(view.sortMode));
     } catch {
       setAskAvailable(false);
     }
@@ -365,6 +372,7 @@ export default function App() {
         model={model}
         colorMode={colorMode}
         onColorModeChange={setColorMode}
+        sortMode={sortMode}
         onViewChange={scheduleUrlUpdate}
         onController={(controller) => {
           controllerRef.current = controller;
@@ -434,9 +442,10 @@ export default function App() {
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} onPick={navigate} />
       <SettingsDialog
         open={settingsOpen}
+        onSortModeChange={setSortMode}
         onClose={() => {
           setSettingsOpen(false);
-          void refreshAskAvailability();
+          void refreshSettings();
         }}
       />
       <FeedbackDialog

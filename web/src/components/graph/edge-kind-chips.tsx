@@ -8,7 +8,6 @@
  * being silently undrawable.
  */
 import { cn } from '@/lib/utils';
-import { colorForEdgeKind } from '@/graph/palette';
 
 export interface EdgeKindChipsProps {
   kinds: string[];
@@ -35,10 +34,14 @@ export function EdgeKindChips({ kinds, enabled, onToggle }: EdgeKindChipsProps) 
                 : 'border-border/50 text-muted/60 hover:text-muted'
             )}
           >
+            {/* The dot is on/off, not a colour key: edge colour means
+                DIRECTION now (green in, amber out), so a per-kind swatch here
+                would advertise an encoding the canvas no longer uses. */}
             <span
-              className="h-1.5 w-1.5 rounded-full"
-              style={{ backgroundColor: on ? colorForEdgeKind(kind) : 'transparent',
-                       boxShadow: on ? 'none' : `inset 0 0 0 1px ${colorForEdgeKind(kind)}` }}
+              className={cn(
+                'h-1.5 w-1.5 rounded-full',
+                on ? 'bg-accent' : 'ring-1 ring-inset ring-muted/60'
+              )}
             />
             {kind}
           </button>

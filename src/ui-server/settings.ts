@@ -10,6 +10,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
+/** Sibling order on the graph disk. Mirrors the web app's `SortMode`. */
+export type UiSortMode = 'structural' | 'size';
+
 export interface UiSettings {
   /** Editor command template, e.g. `code -g {file}:{line}`. */
   editorCommand?: string;
@@ -17,12 +20,19 @@ export interface UiSettings {
   anthropicApiKey?: string;
   /** Model id for the question box. */
   model?: string;
+  /**
+   * Graph sibling order: `structural` (source-tree order, the default) or
+   * `size` (largest wedge first). Per-user like everything else here — it is a
+   * reading preference, not a property of a project.
+   */
+  sortMode?: UiSortMode;
 }
 
 /** What `GET /api/settings` returns — the key masked, never in full. */
 export interface UiSettingsView {
   editorCommand: string | null;
   model: string | null;
+  sortMode: UiSortMode;
   /** Masked key (`••••••abcd`), or null when unset. */
   anthropicApiKey: string | null;
   anthropicApiKeySet: boolean;
@@ -44,6 +54,9 @@ export function readSettings(): UiSettings {
     if (typeof value['editorCommand'] === 'string') settings.editorCommand = value['editorCommand'];
     if (typeof value['anthropicApiKey'] === 'string') settings.anthropicApiKey = value['anthropicApiKey'];
     if (typeof value['model'] === 'string') settings.model = value['model'];
+    if (value['sortMode'] === 'structural' || value['sortMode'] === 'size') {
+      settings.sortMode = value['sortMode'];
+    }
     return settings;
   } catch {
     return {};
@@ -75,6 +88,7 @@ export function settingsView(settings: UiSettings): UiSettingsView {
   return {
     editorCommand: settings.editorCommand ?? null,
     model: settings.model ?? null,
+    sortMode: settings.sortMode ?? 'structural',
     anthropicApiKey: maskKey(settings.anthropicApiKey),
     anthropicApiKeySet: Boolean(settings.anthropicApiKey),
   };
@@ -91,7 +105,7 @@ export function settingsView(settings: UiSettings): UiSettingsView {
 export function mergeSettings(current: UiSettings, patch: Record<string, unknown>): UiSettings {
   const next: UiSettings = { ...current };
 
-  const applyString = (field: keyof UiSettings): void => {
+  const applyString = (field: 'editorCommand' | 'model' | 'anthropicApiKey'): void => {
     if (!(field in patch)) return;
     const value = patch[field];
     if (value === null || value === '') {
@@ -103,6 +117,12 @@ export function mergeSettings(current: UiSettings, patch: Record<string, unknown
 
   applyString('editorCommand');
   applyString('model');
+
+  if ('sortMode' in patch) {
+    const value = patch['sortMode'];
+    if (value === 'structural' || value === 'size') next.sortMode = value;
+    else if (value === null || value === '') delete next.sortMode;
+  }
 
   if ('anthropicApiKey' in patch) {
     const value = patch['anthropicApiKey'];

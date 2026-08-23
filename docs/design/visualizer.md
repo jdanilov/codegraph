@@ -93,7 +93,7 @@ All JSON under `/api/`; everything else serves `dist/ui-web/` static files
 | `GET /api/changes` | `{ changedNodes: [{ id, status: added\|modified\|deleted }], impactedNodeIds, hunks }` — git diff vs HEAD mapped onto node spans, plus impact radius via `getImpactRadius` |
 | `POST /api/index` | Spawn `codegraph index` for the root; streams progress (chunked) |
 | `POST /api/open` | `{ file, line }` → run the configured editor command template; `409` when unset (client then uses `vscode://`) |
-| `GET/PUT /api/settings` | `~/.codegraph/ui.json`: `{ editorCommand?, anthropicApiKey?, model? }`. The key is never echoed back in full (masked) |
+| `GET/PUT /api/settings` | `~/.codegraph/ui.json`: `{ editorCommand?, anthropicApiKey?, model?, sortMode? }` (`sortMode` added in phase F). The key is never echoed back in full (masked) |
 
 ### Phase A clarifications (additive — no contract item changed)
 
@@ -323,6 +323,73 @@ numbers and shapes it pins down:
   the hand-rolled TOML writer) and keeps the frontend dependency-free beyond
   React/Tailwind.
 
+### Phase F clarifications (canvas review — additive to phase E)
+
+The sunburst was reviewed on a real project and kept; phase F is the round of
+corrections that came out of that review. Everything below refines phase E's
+numbers — no contract item changed.
+
+- **Radial depth encodes the kind.** A directory wedge owns its whole ring
+  band, a **file** ¾ of it, a **symbol** ½ (`depthFactor`). Bands still pack
+  from the inside out: a band ends at its *tallest* wedge and the next band
+  begins there (plus the 2-unit gap), so a ring of nothing but symbols is
+  genuinely thinner, a mixed ring keeps its directories touching the ring
+  outside them, and a shorter wedge simply leaves space toward the outside of
+  its own band. Hit testing is against the **band**, not the wedge's painted
+  outer radius — shrinking the click target with the paint would make symbols
+  measurably harder to hit. An aggregate (`+N smaller`) arc takes the deepest
+  factor among the children it folded.
+- **Sibling order is a mode; the angle is not.** `SortMode` is `structural`
+  (**the default**) or `size`. Structural reads like the source tree: a
+  directory's children alphabetically, a file's (or a class's) members in
+  **declaration order**. `size` is phase E's largest-first order. The angular
+  extent is the LoC share in *both* modes — only the order around the disk
+  changes. The fold into `+N smaller` is still decided by **fit** and still
+  drops the *smallest* children, but the survivors keep the mode's order and the
+  aggregate arc is always drawn last. The mode is a **user setting**
+  (`sortMode` in `~/.codegraph/ui.json`, `GET/PUT /api/settings`), not URL
+  state: it is how a person likes to read a disk, not part of a view they would
+  share.
+- **Label fallback.** Curved-along-the-arc is still the first choice. When the
+  wedge is too short (<38px of arc) or too thin (<11px) for it, the name is
+  drawn **horizontally, screen-aligned, through the wedge's centroid**. The
+  available room is the horizontal/vertical chord of the wedge's centroid
+  rectangle (radial × tangential half-extents rotated to the mid angle — two
+  divisions, evaluated before any `measureText`); the label needs ≥18px of
+  width, ≥8px of height and a fit that leaves **≥3 characters** (plus the
+  ellipsis). Otherwise the wedge stays bare and the hover tooltip carries the
+  name.
+- **The centre circle names its destination.** It shows the **parent** you land
+  on by clicking it (`▲ <name>`), or the project root's own name when there is
+  nowhere up — with the **LoC of the current root** underneath, grouped
+  (`5,176 loc`). The old bare "up" caption is gone.
+- **Colours.** Directories are **grey in every colour mode** — structure is
+  scaffolding and should not outshout the code in it. In the layer mode
+  "no layer" is a **distinct non-grey** colour and directories get their own
+  legend row, so the two can never be read as the same thing.
+- **Hover dims by connectivity, instantly.** Hovering a wedge dims everything
+  it has no edge with — same alpha as phase D's card dimming, no transition.
+  Connectivity is aggregated exactly like the card highlight: the hovered
+  wedge's whole subtree is the source, and each relation's far endpoint lights
+  the deepest **rendered** arc standing in for it.
+- **Labels survive dimming.** A dimmed wedge still draws its label (in quiet
+  ink). They used to disappear the moment a card dimmed the disk, which is
+  precisely when the user needs them to navigate back out.
+- **Edges: direction, not kind.** Colour is the relation's direction relative
+  to the focused (hovered, else selected) wedge — **incoming = green, outgoing =
+  amber**; edges with no single focus (a card's `edgeRefs`) are neutral. The
+  provenance distinction is untouched: parsed solid, `heuristic` **dashed**. The
+  two colours, their meaning and the provenance rows are exported from
+  `web/src/graph/palette.ts` (`EDGE_DIRECTION_COLORS`, `EDGE_DIRECTION_LEGEND`,
+  `EDGE_PROVENANCE_LEGEND`) so the legend panel and the canvas cannot drift.
+- **Edges never raise a tooltip.** Hovering a rope may highlight it; the tooltip
+  is a **wedge-only** affordance now (`CanvasCallbacks` lost `onEdgeTooltip`).
+  A bundled rope put a tooltip under the pointer everywhere the user was aiming
+  at an arc.
+- **No renderer telemetry on screen.** The arcs/budget, ring-count and
+  edge-count readout is gone. `ViewSummary` still carries the numbers for the
+  shell; nothing paints them.
+
 Standing views (always-present cards, client-side): **Project** (whole graph)
 and **Changes** (`/api/changes`, refreshed on `dataVersion` change).
 
@@ -347,6 +414,10 @@ paths, line spans, user note) to paste into an agent prompt. Client-side only.
 5. **E — sunburst**: replace the force canvas with the radial disk +
    hierarchical edge bundling (canvas 2D, no rendering dependency); re-root
    navigation, breadcrumb, arc labels, rims/glow, root-based URL state.
+6. **F — canvas review**: depth by kind, sort modes (structural default),
+   horizontal label fallback, destination-naming centre circle, grey
+   directories, hover connectivity dimming, direction-coloured edges, no edge
+   tooltips, no on-canvas telemetry. *(Panels/dialog work is a separate pass.)*
 
 ## House rules for every phase
 

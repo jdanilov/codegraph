@@ -21,15 +21,24 @@
  * current selection, or the active card's `edgeRefs` — bundled along the
  * hierarchy so a hundred relations read as one rope (`bundling.ts`).
  */
+import { formatNumber } from '@/lib/utils';
+
 import {
   bundleControlPoints,
   bundleCurve,
   distanceToPolyline,
 } from './bundling';
 import { DIRECTORY_KIND, ROOT_ID, type GraphModel, type ModelEdge, type ModelNode } from './model';
-import { colorForEdgeKind, colorForNode, type ColorMode } from './palette';
+import {
+  DIRECTORY_LEGEND_KEY,
+  colorForEdgeDirection,
+  colorForNode,
+  type ColorMode,
+  type EdgeDirection,
+} from './palette';
 import {
   AGGREGATE_KIND,
+  DEFAULT_SORT_MODE,
   MAX_ARCS,
   MAX_RADIUS,
   arcAt,
@@ -37,6 +46,7 @@ import {
   deepestCommonAncestor,
   initialRoot,
   type Point,
+  type SortMode,
   type SunburstArc,
   type SunburstLayout,
 } from './sunburst';
@@ -64,18 +74,6 @@ export interface ViewSummary {
   /** Project root → … → current root. */
   breadcrumb: BreadcrumbEntry[];
   zoom: number;
-}
-
-export interface EdgeTooltip {
-  x: number;
-  y: number;
-  kind: string;
-  sourceName: string;
-  targetName: string;
-  heuristic: boolean;
-  synthesizedBy?: string;
-  registeredAt?: string;
-  line?: number;
 }
 
 /** Hover readout for an arc: what it is, how big, and what it hides. */
@@ -113,7 +111,12 @@ export interface CanvasHighlight {
 export interface CanvasCallbacks {
   onSelect(node: ModelNode | null): void;
   onViewChange(summary: ViewSummary): void;
-  onEdgeTooltip(tooltip: EdgeTooltip | null): void;
+  /**
+   * Tooltips are for WEDGES ONLY (phase F). An edge never raises one: a rope of
+   * bundled curves put a tooltip under the pointer everywhere the user was
+   * trying to aim at an arc, and the edge's own information (kind, provenance,
+   * wiring site) belongs to the node panel, which has room for it.
+   */
   onArcTooltip(tooltip: ArcTooltip | null): void;
 }
 
@@ -138,11 +141,30 @@ const NODE_SCAN_CAP = 4000;
 /** Pointer slop before a drag stops counting as a click. */
 const DRAG_SLOP = 4;
 
-/** Arc must be this long (screen px) before it earns a label. */
+/** Arc must be this long (screen px) before it earns a curved label. */
 const LABEL_MIN_ARC_PX = 38;
 const LABEL_MIN_THICKNESS_PX = 11;
 /** A truncation that leaves fewer than this many characters is not a label. */
 const LABEL_MIN_CHARS = 5;
+
+/**
+ * Horizontal fallback (phase F): when a wedge cannot carry text along its arc,
+ * the name is drawn screen-aligned through the wedge's centroid instead. Two
+ * cheap gates keep it off the hot path — the horizontal room inside the wedge
+ * must beat {@link HLABEL_MIN_WIDTH_PX}, the vertical room
+ * {@link HLABEL_MIN_HEIGHT_PX} — and a fit that leaves fewer than
+ * {@link HLABEL_MIN_CHARS} characters (ellipsis included) is dropped: three
+ * letters name something, one plus a dot names nothing.
+ */
+const HLABEL_MIN_WIDTH_PX = 18;
+const HLABEL_MIN_HEIGHT_PX = 8;
+const HLABEL_MIN_CHARS = 4;
+const HLABEL_MAX_FONT_PX = 12;
+
+/** Opacity multiplier for anything the current focus dims. */
+const DIM_ALPHA = 0.26;
+/** Dimmed wedges keep their labels — quieter, but still readable. */
+const DIM_LABEL_COLOR = 'rgba(226, 232, 240, 0.62)';
 
 const BACKGROUND = '#080b12';
 const AGGREGATE_FILL = '#46516a';
@@ -155,6 +177,8 @@ const CENTRE_STROKE = 'rgba(140, 165, 205, 0.45)';
 interface DrawnEdge {
   edge: ModelEdge;
   points: Point[];
+  /** Relative to the hovered / selected wedge — green in, amber out. */
+  direction: EdgeDirection;
 }
 
 export class CanvasController {
@@ -169,6 +193,7 @@ export class CanvasController {
   private layout: SunburstLayout | null = null;
 
   private colorMode: ColorMode = 'kind';
+  private sortMode: SortMode = DEFAULT_SORT_MODE;
   private enabledKinds = new Set<string>();
 
   private selected: string | null = null;
@@ -184,6 +209,13 @@ export class CanvasController {
   private resultArcs = new Set<string>();
   private changedArcs = new Set<string>();
   private impactedArcs = new Set<string>();
+
+  /**
+   * Arcs the hovered wedge is related to by an edge — `null` when nothing is
+   * hovered. Non-null means the disk is dimmed down to this set, instantly:
+   * connectivity is the question a hover asks, and a fade would answer it late.
+   */
+  private hoverConnectedArcs: Set<string> | null = null;
 
   private drawnEdges: DrawnEdge[] = [];
   private edgesDirty = true;
@@ -267,6 +299,20 @@ export class CanvasController {
     this.emitSummary();
   }
 
+  /**
+   * Sibling order on the disk. Changing it re-runs the (pure) layout — the
+   * wedges keep their angles and swap places, nothing is added or removed.
+   */
+  setSortMode(mode: SortMode): void {
+    if (this.sortMode === mode) return;
+    this.sortMode = mode;
+    if (this.model) this.rebuildLayout();
+  }
+
+  sortModeValue(): SortMode {
+    return this.sortMode;
+  }
+
   setEdgeKinds(kinds: Iterable<string>): void {
     this.enabledKinds = new Set(kinds);
     this.edgesDirty = true;
@@ -308,8 +354,8 @@ export class CanvasController {
     this.panY = 0;
     this.hoveredKey = null;
     this.hoveredEdgeKey = null;
+    this.hoverConnectedArcs = null;
     this.callbacks.onArcTooltip(null);
-    this.callbacks.onEdgeTooltip(null);
     if (animate) {
       // Drilling in starts wide and settles; stepping out starts small and
       // grows. Both are pure opacity + scale on a layout that never moves.
@@ -451,7 +497,7 @@ export class CanvasController {
   private rebuildLayout(): void {
     const model = this.model;
     if (!model) return;
-    this.layout = computeSunburst(model, this.rootId);
+    this.layout = computeSunburst(model, this.rootId, { sort: this.sortMode });
     this.rootId = this.layout.rootId;
     this.projectHighlight();
     this.edgesDirty = true;
@@ -613,21 +659,16 @@ export class CanvasController {
     model: GraphModel,
     k: number
   ): void {
-    const dimming = this.resultArcs.size > 0;
-
     for (const arc of layout.arcs) {
       const pad = Math.min(0.0022, (arc.a1 - arc.a0) * 0.14);
       const a0 = arc.a0 + pad;
       const a1 = arc.a1 - pad;
       if (a1 <= a0) continue;
 
-      const emphasised =
-        this.resultArcs.has(arc.key) ||
-        this.isUnderHover(arc) ||
-        (this.selected !== null && arc.nodeId === this.selected);
+      const emphasised = this.isEmphasised(arc);
       let alpha = 0.94 - 0.055 * (arc.ring - 1);
-      if (dimming && !emphasised) alpha *= 0.26;
-      else if (emphasised) alpha = 1;
+      if (emphasised) alpha = 1;
+      else if (this.hasFocus()) alpha *= DIM_ALPHA;
 
       ctx.beginPath();
       ctx.arc(0, 0, arc.r0, a0, a1);
@@ -660,6 +701,36 @@ export class CanvasController {
     }
   }
 
+  /**
+   * Is this wedge part of what the user is currently looking AT?
+   *
+   * Three sources, all additive: a card's result, the hovered subtree (plus
+   * everything an edge connects it to), and the selection.
+   */
+  private isEmphasised(arc: SunburstArc): boolean {
+    if (this.resultArcs.has(arc.key)) return true;
+    if (this.selected !== null && arc.nodeId === this.selected) return true;
+    if (this.isUnderHover(arc)) return true;
+    return this.hoverConnectedArcs?.has(arc.key) ?? false;
+  }
+
+  /**
+   * Is this wedge pushed to the background right now?
+   *
+   * Two independent focus channels dim: a card's result set (phase D) and, as
+   * of phase F, a HOVER — everything the hovered wedge has no edge with fades
+   * out at once, so "what does this touch" is answered by looking, not by
+   * reading a list. Both use the same {@link DIM_ALPHA}, and neither animates.
+   */
+  private isDimmed(arc: SunburstArc): boolean {
+    return this.hasFocus() && !this.isEmphasised(arc);
+  }
+
+  /** Is anything focused right now — a card's result, or a hover? */
+  private hasFocus(): boolean {
+    return this.resultArcs.size > 0 || this.hoverConnectedArcs !== null;
+  }
+
   /** Rim on the OUTER boundary: hot for changed, warm for impacted. */
   private strokeRim(
     ctx: CanvasRenderingContext2D,
@@ -685,19 +756,25 @@ export class CanvasController {
     ctx.lineWidth = 1.4 / k;
     ctx.stroke();
 
-    const canGoUp = Boolean(layout.root.parent);
-    const nameSize = 12.5 / k;
+    // The centre is a BUTTON, so it names its destination rather than itself
+    // (phase F): the parent you land on by clicking it. At the project root
+    // there is nowhere up, so it names the root directory — and either way the
+    // second line is the LoC the disk in front of you actually weighs.
+    const parentId = layout.root.parent;
+    const parent = parentId ? this.model?.get(parentId) : undefined;
+    const canGoUp = Boolean(parent);
+    const title = (parent ?? layout.root).name || 'project';
+    const width = (layout.centreRadius - 12) * 2;
+
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = '#dbe4f2';
-    ctx.font = `600 ${nameSize}px ui-sans-serif, system-ui, sans-serif`;
-    const label = fitText(ctx, layout.root.name || 'project', (layout.centreRadius - 12) * 2);
-    ctx.fillText(label, 0, canGoUp ? 4 / k : 0);
-    if (canGoUp) {
-      ctx.font = `500 ${9.5 / k}px ui-sans-serif, system-ui, sans-serif`;
-      ctx.fillStyle = 'rgba(190, 205, 230, 0.7)';
-      ctx.fillText('▲ up', 0, -13 / k);
-    }
+    ctx.font = `600 ${12.5 / k}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.fillText(fitText(ctx, canGoUp ? `▲ ${title}` : title, width), 0, -5 / k);
+
+    ctx.font = `500 ${10 / k}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.fillStyle = 'rgba(190, 205, 230, 0.72)';
+    ctx.fillText(fitText(ctx, `${formatNumber(layout.rootLoc)} loc`, width), 0, 10 / k);
   }
 
   private drawEdges(ctx: CanvasRenderingContext2D, k: number): void {
@@ -711,8 +788,10 @@ export class CanvasController {
       for (let i = 1; i < drawn.points.length; i++) {
         ctx.lineTo(drawn.points[i]!.x, drawn.points[i]!.y);
       }
-      const color = colorForEdgeKind(drawn.edge.kind);
-      ctx.strokeStyle = withAlpha(color, hovered ? 0.98 : 0.62);
+      // Colour is DIRECTION relative to the focused wedge (green in, amber
+      // out), never the edge kind — see `palette.ts`.
+      const color = colorForEdgeDirection(drawn.direction);
+      ctx.strokeStyle = withAlpha(color, hovered ? 0.98 : 0.68);
       ctx.lineWidth = (hovered ? 2.4 : 1.3) / k;
       // Provenance: a synthesized (heuristic) relation is dashed, always.
       if (drawn.edge.heuristic) ctx.setLineDash([6 / k, 4 / k]);
@@ -722,53 +801,75 @@ export class CanvasController {
     ctx.setLineDash([]);
   }
 
+  /**
+   * Labels are drawn for EVERY wedge, dimmed ones included (phase F).
+   *
+   * They used to disappear the moment a card dimmed the disk, which is exactly
+   * when the user needs them: the dimmed ring is what they are navigating back
+   * through. A dimmed label is drawn in quiet ink instead of hidden.
+   */
   private drawLabels(
     ctx: CanvasRenderingContext2D,
     layout: SunburstLayout,
     model: GraphModel,
     k: number
   ): void {
-    const dimming = this.resultArcs.size > 0;
     for (const arc of layout.arcs) {
-      if (dimming && !this.resultArcs.has(arc.key) && arc.key !== this.hoveredKey) continue;
-      this.drawArcLabel(ctx, arc, model, k);
+      this.drawArcLabel(ctx, arc, model, k, this.isDimmed(arc));
     }
   }
 
   /**
-   * A label follows its arc, one glyph at a time.
+   * Name a wedge — along its arc when that fits, horizontally when it doesn't.
    *
-   * Straight text in a ring is either tiny or crooked; curved text reads at the
-   * ring thickness the arc actually has. Labels on the bottom half are flipped
-   * so they are never upside down, and anything that cannot fit legibly is
-   * simply not drawn — a truncated `sr…` is worse than nothing.
+   * Curved text is the first choice: it reads at the ring thickness the wedge
+   * actually has and never crosses a neighbour. When the wedge is too short or
+   * too thin for it, the name is drawn screen-aligned through the wedge's
+   * centroid instead (phase F) — which is how a deep, narrow symbol wedge gets
+   * to keep its name. Only when neither fits legibly does the wedge stay bare
+   * and the hover tooltip carry the name.
    */
   private drawArcLabel(
     ctx: CanvasRenderingContext2D,
     arc: SunburstArc,
     model: GraphModel,
-    k: number
+    k: number,
+    dimmed: boolean
   ): void {
     const midRadius = (arc.r0 + arc.r1) / 2;
     const span = arc.a1 - arc.a0;
-    if (span * midRadius * k < LABEL_MIN_ARC_PX) return;
     const thicknessPx = (arc.r1 - arc.r0) * k;
-    if (thicknessPx < LABEL_MIN_THICKNESS_PX) return;
+    const ink = dimmed ? DIM_LABEL_COLOR : readableOn(this.fillFor(arc, model));
 
-    const fontPx = Math.max(9, Math.min(12.5, thicknessPx * 0.34));
-    ctx.font = `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
-    const maxWidth = span * 0.9 * midRadius;
-    const text = fitText(ctx, arc.label, maxWidth);
-    // `ex…` names nothing. Either the label is legible or the arc stays bare
-    // and the hover tooltip carries the name instead.
-    if (!text || (text.endsWith('…') && text.length < LABEL_MIN_CHARS)) return;
+    if (span * midRadius * k >= LABEL_MIN_ARC_PX && thicknessPx >= LABEL_MIN_THICKNESS_PX) {
+      const fontPx = Math.max(9, Math.min(12.5, thicknessPx * 0.34));
+      ctx.font = `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
+      const text = fitText(ctx, arc.label, span * 0.9 * midRadius);
+      // `ex…` names nothing — fall through to the horizontal attempt instead.
+      if (text && !(text.endsWith('…') && text.length < LABEL_MIN_CHARS)) {
+        this.drawCurvedLabel(ctx, text, (arc.a0 + arc.a1) / 2, midRadius, ink);
+        return;
+      }
+    }
+    this.drawHorizontalLabel(ctx, arc, midRadius, span, k, ink);
+  }
 
-    const mid = (arc.a0 + arc.a1) / 2;
+  /**
+   * A label following its arc, one glyph at a time. Labels on the bottom half
+   * are flipped so they are never upside down.
+   */
+  private drawCurvedLabel(
+    ctx: CanvasRenderingContext2D,
+    text: string,
+    mid: number,
+    midRadius: number,
+    ink: string
+  ): void {
     const flip = Math.sin(mid) > 0;
     const total = ctx.measureText(text).width;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillStyle = readableOn(this.fillFor(arc, model));
+    ctx.fillStyle = ink;
 
     let angle = flip ? mid + total / midRadius / 2 : mid - total / midRadius / 2;
     for (const character of text) {
@@ -782,6 +883,53 @@ export class CanvasController {
       ctx.restore();
       angle = flip ? angle - step : angle + step;
     }
+  }
+
+  /**
+   * Screen-aligned fallback: how much horizontal room is there *inside* this
+   * wedge?
+   *
+   * The wedge is approximated by the rectangle through its centroid with the
+   * radial and tangential half-extents it actually has, rotated to the wedge's
+   * mid angle. A horizontal line through the centre of that rectangle runs out
+   * at `min(radialHalf / |cos|, tangentialHalf / |sin|)` — two divisions, no
+   * allocation, which is what keeps this affordable once per wedge per frame.
+   * Both gates are checked BEFORE any `measureText`.
+   */
+  private drawHorizontalLabel(
+    ctx: CanvasRenderingContext2D,
+    arc: SunburstArc,
+    midRadius: number,
+    span: number,
+    k: number,
+    ink: string
+  ): void {
+    const mid = (arc.a0 + arc.a1) / 2;
+    const cos = Math.abs(Math.cos(mid));
+    const sin = Math.abs(Math.sin(mid));
+    const radialHalf = (arc.r1 - arc.r0) / 2;
+    const tangentHalf = (span * midRadius) / 2;
+    const halfWidth = Math.min(
+      cos > 1e-6 ? radialHalf / cos : Infinity,
+      sin > 1e-6 ? tangentHalf / sin : Infinity
+    );
+    const halfHeight = Math.min(
+      sin > 1e-6 ? radialHalf / sin : Infinity,
+      cos > 1e-6 ? tangentHalf / cos : Infinity
+    );
+    const widthPx = halfWidth * 2 * k;
+    const heightPx = halfHeight * 2 * k;
+    if (widthPx < HLABEL_MIN_WIDTH_PX || heightPx < HLABEL_MIN_HEIGHT_PX) return;
+
+    const fontPx = Math.max(8, Math.min(HLABEL_MAX_FONT_PX, heightPx * 0.8));
+    ctx.font = `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
+    const text = fitText(ctx, arc.label, halfWidth * 2 * 0.92);
+    if (!text || (text.endsWith('…') && text.length < HLABEL_MIN_CHARS)) return;
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = ink;
+    ctx.fillText(text, Math.cos(mid) * midRadius, Math.sin(mid) * midRadius);
   }
 
   private fillFor(arc: SunburstArc, model: GraphModel): string {
@@ -830,28 +978,66 @@ export class CanvasController {
     if (!model || !layout) return;
 
     const wanted = new Map<string, ModelEdge>();
+    // Direction is meaningful only against a FOCUS — the hovered wedge, else
+    // the selection. A card's edges have no single endpoint to be relative to,
+    // so they stay neutral rather than claiming a direction they don't have.
+    const directions = new Map<string, EdgeDirection>();
     for (const key of this.resultEdges) {
       const edge = model.edgeByKey.get(key);
       if (edge && this.enabledKinds.has(edge.kind)) wanted.set(key, edge);
       if (wanted.size >= EDGE_BUDGET) break;
     }
-    if (this.selected) this.collectEdges([this.selected], wanted);
-    if (this.hoveredKey && this.hoveredKey !== CENTRE_KEY) {
-      const arc = layout.byKey.get(this.hoveredKey);
-      if (arc) this.collectEdges(arc.nodeId ? [arc.nodeId] : arc.aggregated, wanted);
+    if (this.selected) this.collectEdges([this.selected], wanted, directions);
+
+    const hoverEdges = new Map<string, ModelEdge>();
+    const hoveredArc =
+      this.hoveredKey && this.hoveredKey !== CENTRE_KEY
+        ? (layout.byKey.get(this.hoveredKey) ?? null)
+        : null;
+    if (hoveredArc) {
+      this.collectEdges(
+        hoveredArc.nodeId ? [hoveredArc.nodeId] : hoveredArc.aggregated,
+        hoverEdges,
+        directions
+      );
+      for (const [key, edge] of hoverEdges) {
+        if (wanted.size >= EDGE_BUDGET && !wanted.has(key)) break;
+        wanted.set(key, edge);
+      }
     }
 
-    for (const edge of wanted.values()) {
+    // Everything the hover reaches — the dimming set. Both endpoints are mapped
+    // onto the arcs that actually render them, so a relation into a folded
+    // subtree still lights the arc standing in for it.
+    this.hoverConnectedArcs = hoveredArc ? new Set<string>([hoveredArc.key]) : null;
+
+    for (const [key, edge] of wanted) {
       const from = this.resolveArc(edge.source);
       const to = this.resolveArc(edge.target);
+      if (this.hoverConnectedArcs && hoverEdges.has(key)) {
+        if (from) this.hoverConnectedArcs.add(from.key);
+        if (to) this.hoverConnectedArcs.add(to.key);
+      }
       if (!from && !to) continue;
       if (from && to && from.key === to.key) continue;
       const points = bundleCurve(bundleControlPoints(from, to, layout));
-      if (points.length >= 2) this.drawnEdges.push({ edge, points });
+      if (points.length >= 2) {
+        this.drawnEdges.push({ edge, points, direction: directions.get(key) ?? 'neutral' });
+      }
     }
   }
 
-  private collectEdges(seeds: string[], into: Map<string, ModelEdge>): void {
+  /**
+   * Walk a subtree and take its relations, recording each one's DIRECTION
+   * relative to the subtree: an edge leaving a node we walked is outgoing, one
+   * arriving at it is incoming. That is the only place the two are
+   * distinguishable for free, so it happens here rather than in the painter.
+   */
+  private collectEdges(
+    seeds: string[],
+    into: Map<string, ModelEdge>,
+    directions?: Map<string, EdgeDirection>
+  ): void {
     const model = this.model;
     if (!model) return;
     const stack = [...seeds];
@@ -864,6 +1050,9 @@ export class CanvasController {
         if (!this.enabledKinds.has(edge.kind)) continue;
         if (edge.source === edge.target) continue;
         into.set(edge.key, edge);
+        if (directions && !directions.has(edge.key)) {
+          directions.set(edge.key, edge.source === id ? 'outgoing' : 'incoming');
+        }
       }
       for (const child of model.childrenOf(id)) stack.push(child);
     }
@@ -1068,27 +1257,8 @@ export class CanvasController {
     const layout = this.layout;
     if (!model || !layout) return;
 
-    if (this.hoveredEdgeKey) {
-      const edge = model.edgeByKey.get(this.hoveredEdgeKey);
-      if (edge) {
-        const tooltip: EdgeTooltip = {
-          x,
-          y,
-          kind: edge.kind,
-          sourceName: model.get(edge.source)?.name ?? edge.source,
-          targetName: model.get(edge.target)?.name ?? edge.target,
-          heuristic: edge.heuristic,
-        };
-        if (edge.synthesizedBy) tooltip.synthesizedBy = edge.synthesizedBy;
-        if (edge.registeredAt) tooltip.registeredAt = edge.registeredAt;
-        if (edge.line !== undefined) tooltip.line = edge.line;
-        this.callbacks.onEdgeTooltip(tooltip);
-        this.callbacks.onArcTooltip(null);
-        return;
-      }
-    }
-    this.callbacks.onEdgeTooltip(null);
-
+    // An edge under the pointer highlights its rope and NOTHING else — phase F
+    // removed the edge tooltip outright (see `CanvasCallbacks.onArcTooltip`).
     if (!this.hoveredKey || this.hoveredKey === CENTRE_KEY) {
       this.callbacks.onArcTooltip(null);
       return;
@@ -1124,7 +1294,13 @@ export class CanvasController {
       if (!arc.nodeId) continue;
       const node = model.get(arc.nodeId);
       if (!node) continue;
-      present.add(this.colorMode === 'layer' ? (node.layer ?? '') : node.kind);
+      if (this.colorMode !== 'layer') {
+        present.add(node.kind);
+        continue;
+      }
+      // In the layer mode a directory is grey, not "no layer" — it gets its own
+      // legend row so the two greys/teals can't be confused (phase F).
+      present.add(node.kind === DIRECTORY_KIND ? DIRECTORY_LEGEND_KEY : (node.layer ?? ''));
     }
     this.emittedEdges = this.drawnEdges.length;
     this.callbacks.onViewChange({

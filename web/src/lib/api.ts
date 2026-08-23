@@ -4,6 +4,7 @@
  * Shapes mirror `docs/design/visualizer.md`; keep them in sync with
  * `src/ui-server/` when the contract grows.
  */
+import type { SortMode } from '@/graph/sunburst';
 
 export interface Status {
   indexed: boolean;
@@ -151,6 +152,8 @@ export interface SearchHit {
 export interface SettingsView {
   editorCommand: string | null;
   model: string | null;
+  /** Sibling order on the disk: `structural` (default) or `size`. */
+  sortMode: SortMode;
   anthropicApiKey: string | null;
   anthropicApiKeySet: boolean;
 }
