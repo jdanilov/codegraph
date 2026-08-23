@@ -335,14 +335,53 @@ interface DrawnEdge {
  * which composes a pan and a cursor-anchored zoom alike. The device pixel ratio
  * and the CSS size ride along because a change to either means the snapshot's
  * pixels no longer describe this canvas at all.
+ *
+ * The snapshot IS the scene canvas, which is the viewport grown by
+ * {@link SceneFrame} on every side, so the margin travels with it: `origin` is
+ * still in VIEWPORT coordinates, and the snapshot's own top-left sits at
+ * `(−marginX, −marginY)` in that frame.
  */
-interface SnapshotCamera {
+export interface SnapshotCamera {
   originX: number;
   originY: number;
   scale: number;
   ratio: number;
+  /** The viewport's CSS size, i.e. the centre quadrant of the snapshot. */
   width: number;
   height: number;
+  /** Margin painted on each side, in CSS px. */
+  marginX: number;
+  marginY: number;
+  /** The snapshot's full CSS size — the viewport plus both of its margins. */
+  spanWidth: number;
+  spanHeight: number;
+}
+
+/**
+ * The offscreen frame a full redraw paints into: the viewport plus a margin of
+ * half a viewport on each side, so the rendered area is 2w × 2h with the real
+ * viewport as its centre quadrant.
+ *
+ * Everything below the compositing step is written in VIEWPORT coordinates and
+ * never learns about the margin — the frame's base transform carries it, and it
+ * is an exact whole number of DEVICE pixels (`marginDeviceX/Y`) so that the
+ * centre quadrant rasterises identically to painting straight onto the canvas.
+ *
+ * `offscreen: false` is the degraded path (no second 2D context available): the
+ * frame is the visible canvas itself with no margin, which paints correctly and
+ * simply cannot be blitted.
+ */
+interface SceneFrame {
+  ctx: CanvasRenderingContext2D;
+  offscreen: boolean;
+  /** Margin per side, in CSS px and in device px — the latter is integral. */
+  marginX: number;
+  marginY: number;
+  marginDeviceX: number;
+  marginDeviceY: number;
+  /** The frame's full CSS size, exactly `viewport + 2 × margin`. */
+  spanWidth: number;
+  spanHeight: number;
 }
 
 /**
@@ -578,8 +617,13 @@ export class CanvasController {
   private sceneDirty = true;
   /** When a camera-ONLY gesture last moved the camera. */
   private cameraGestureAt = -Infinity;
-  /** The last full frame's pixels, at the backing-store resolution. */
-  private snapshotCanvas: HTMLCanvasElement | null = null;
+  /**
+   * Where a full redraw paints: the viewport grown by half of itself on every
+   * side, at the backing-store resolution. It is also the snapshot — the frame
+   * is never copied anywhere, the visible canvas takes its centre quadrant.
+   */
+  private sceneCanvas: HTMLCanvasElement | null = null;
+  private sceneCtx: CanvasRenderingContext2D | null = null;
   /** The camera those pixels were painted under — `null` when they are stale. */
   private snapshotCamera: SnapshotCamera | null = null;
   /**
@@ -1183,9 +1227,10 @@ export class CanvasController {
     if (this.frame !== null) cancelAnimationFrame(this.frame);
     this.resizeObserver.disconnect();
     this.canvas.remove();
-    // The snapshot is a second backing store the size of the canvas — let it go
-    // with the canvas it mirrors.
-    this.snapshotCanvas = null;
+    // The scene canvas is a second backing store, four times the visible pixel
+    // count — let it go with the canvas it feeds.
+    this.sceneCanvas = null;
+    this.sceneCtx = null;
     this.snapshotCamera = null;
   }
 
@@ -1521,7 +1566,6 @@ export class CanvasController {
   }
 
   private draw(): void {
-    const ctx = this.ctx;
     const ratio = window.devicePixelRatio || 1;
 
     // A hit test the camera's motion deferred lands here, on the first settled
@@ -1543,14 +1587,22 @@ export class CanvasController {
     // frame is a real redraw and the snapshot below is skipped.
     this.sceneDirty = false;
 
+    // The frame is painted into the expanded scene canvas and composited at the
+    // end. Everything from here down is written in VIEWPORT coordinates: the
+    // margin lives in the base transform, which is why nothing else in the
+    // painter — chrome, ghost, labels — has to know about it.
+    const frame = this.sceneFrame(ratio);
+    const ctx = frame.ctx;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    ctx.clearRect(0, 0, this.width, this.height);
+    ctx.clearRect(0, 0, frame.spanWidth, frame.spanHeight);
     ctx.fillStyle = BACKGROUND;
-    ctx.fillRect(0, 0, this.width, this.height);
+    ctx.fillRect(0, 0, frame.spanWidth, frame.spanHeight);
+    ctx.setTransform(ratio, 0, 0, ratio, frame.marginDeviceX, frame.marginDeviceY);
 
     const model = this.model;
     if (!model) {
       this.snapshotCamera = null;
+      this.composite(frame);
       return;
     }
 
@@ -1582,7 +1634,7 @@ export class CanvasController {
       // are culled by their own curve below, since either can cross a viewport
       // that neither of its two disks touches.
       const k = scale * animationScale;
-      const cull = this.cullFor(origin.x + disk.x * scale, origin.y + disk.y * scale, k);
+      const cull = this.cullFor(frame, origin.x + disk.x * scale, origin.y + disk.y * scale, k);
       if (cull.dMin > layout.maxRadius) continue;
 
       ctx.save();
@@ -1601,7 +1653,7 @@ export class CanvasController {
     // Cross-disk relations live in workspace space and are drawn once, over the
     // disks: a curve that vanished under an opaque wedge would claim a
     // connection it never showed.
-    const workspaceCull = this.cullFor(origin.x, origin.y, scale);
+    const workspaceCull = this.cullFor(frame, origin.x, origin.y, scale);
     ctx.save();
     ctx.translate(origin.x, origin.y);
     ctx.scale(scale, scale);
@@ -1613,6 +1665,8 @@ export class CanvasController {
     this.drawDiskChrome(ctx);
     this.drawGhost(ctx);
 
+    this.composite(frame);
+
     // Two things keep the frame loop alive on their own: the ⌘P pulse, and the
     // camera-settle window that owes the labels one more (full) pass.
     if (this.pulseNodeId !== null || this.cameraSettling()) this.scheduleFrame();
@@ -1620,7 +1674,7 @@ export class CanvasController {
     // The edge count is part of the summary, and it only ever changes here.
     if (this.drawnEdges.length !== this.emittedEdges) this.emitSummary();
 
-    this.captureSnapshot(ratio, origin, scale);
+    this.captureSnapshot(frame, ratio, origin, scale);
   }
 
   /**
@@ -1632,6 +1686,12 @@ export class CanvasController {
    * until the gesture stops — the same trade the label plan already makes, and
    * for the same reason: the settled frame that follows is the real one.
    *
+   * The snapshot is the EXPANDED frame ({@link SceneFrame}), so a gesture can
+   * travel half a viewport in any direction — or zoom out to about half — and
+   * still be reading pixels that were painted. Past that the snapshot simply
+   * runs out and the background shows through, which the settled redraw fills
+   * in within {@link LABEL_SETTLE_MS}.
+   *
    * Every condition below is a reason the snapshot cannot describe this frame:
    * the scene changed, a disk is animating, the pulse is breathing, the canvas
    * or its device pixel ratio moved under it, a NON-camera drag is in flight
@@ -1639,11 +1699,22 @@ export class CanvasController {
    */
   private blitFrame(ratio: number): boolean {
     const snapshot = this.snapshotCamera;
-    const source = this.snapshotCanvas;
+    const source = this.sceneCanvas;
     if (!snapshot || !source || this.sceneDirty) return false;
     if (performance.now() - this.cameraGestureAt >= BLIT_GESTURE_MS) return false;
     if (snapshot.ratio !== ratio) return false;
     if (snapshot.width !== this.width || snapshot.height !== this.height) return false;
+    // The size check is against the EXPANDED frame, which is what the snapshot
+    // actually is: a scene canvas resized under it (a viewport resize, a ratio
+    // change) holds pixels for a geometry this camera cannot describe.
+    const metrics = this.sceneMetrics(ratio);
+    if (snapshot.marginX !== metrics.marginX || snapshot.marginY !== metrics.marginY) return false;
+    if (snapshot.spanWidth !== metrics.spanWidth || snapshot.spanHeight !== metrics.spanHeight) {
+      return false;
+    }
+    if (source.width !== metrics.backingWidth || source.height !== metrics.backingHeight) {
+      return false;
+    }
     if (this.pulseNodeId !== null) return false;
     if (this.drag !== null && this.drag.mode !== 'pan') return false;
     if (this.disks.some((disk) => disk.transitionStart > 0)) return false;
@@ -1654,61 +1725,119 @@ export class CanvasController {
 
     const ctx = this.ctx;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    ctx.clearRect(0, 0, this.width, this.height);
+    // Whatever the snapshot does not reach — a pan past the margin — is
+    // background, never stale pixels.
     ctx.fillStyle = BACKGROUND;
     ctx.fillRect(0, 0, this.width, this.height);
-    // `new = newOrigin + (old − oldOrigin) × factor`, written as the rectangle
-    // the whole snapshot lands in.
-    ctx.drawImage(
-      source,
-      origin.x - snapshot.originX * factor,
-      origin.y - snapshot.originY * factor,
-      snapshot.width * factor,
-      snapshot.height * factor
-    );
+    const placement = blitPlacement(snapshot, origin, factor);
+    ctx.drawImage(source, placement.x, placement.y, placement.width, placement.height);
 
     // The settle window owes this frame a real redraw; keep the loop alive.
     if (this.pulseNodeId !== null || this.cameraSettling()) this.scheduleFrame();
     return true;
   }
 
+  /** {@link sceneMetrics} for the canvas as it is sized right now. */
+  private sceneMetrics(ratio: number): SceneMetrics {
+    return sceneMetrics(this.canvas.width, this.canvas.height, ratio);
+  }
+
+  /**
+   * The offscreen frame this redraw paints into, sized to the current viewport.
+   *
+   * Falls back to the visible canvas with no margin when a second 2D context is
+   * unavailable — the picture is then exactly what it was before this round
+   * (viewport-sized, culled to the viewport) and simply cannot be blitted,
+   * which {@link captureSnapshot} enforces by dropping the camera.
+   */
+  private sceneFrame(ratio: number): SceneFrame {
+    const metrics = this.sceneMetrics(ratio);
+    let canvas = this.sceneCanvas;
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      this.sceneCanvas = canvas;
+      this.sceneCtx = null;
+    }
+    if (canvas.width !== metrics.backingWidth || canvas.height !== metrics.backingHeight) {
+      canvas.width = metrics.backingWidth;
+      canvas.height = metrics.backingHeight;
+      // A resized canvas is a cleared canvas: the pixels the snapshot pointed
+      // at are gone whether or not the camera says so.
+      this.snapshotCamera = null;
+    }
+    const ctx = this.sceneCtx ?? canvas.getContext('2d');
+    if (!ctx) {
+      return {
+        ctx: this.ctx,
+        offscreen: false,
+        marginX: 0,
+        marginY: 0,
+        marginDeviceX: 0,
+        marginDeviceY: 0,
+        spanWidth: this.width,
+        spanHeight: this.height,
+      };
+    }
+    this.sceneCtx = ctx;
+    return {
+      ctx,
+      offscreen: true,
+      marginX: metrics.marginX,
+      marginY: metrics.marginY,
+      marginDeviceX: metrics.marginDeviceX,
+      marginDeviceY: metrics.marginDeviceY,
+      spanWidth: metrics.spanWidth,
+      spanHeight: metrics.spanHeight,
+    };
+  }
+
+  /**
+   * Put the frame's centre quadrant — the real viewport — on screen.
+   *
+   * One `drawImage` in DEVICE pixels, source and destination the same size, so
+   * it is a straight copy and the visible canvas is byte-identical to what the
+   * pre-margin painter produced. Canvas → canvas, never `getImageData`.
+   */
+  private composite(frame: SceneFrame): void {
+    const source = this.sceneCanvas;
+    if (!frame.offscreen || !source) return;
+    const width = this.canvas.width;
+    const height = this.canvas.height;
+    if (width === 0 || height === 0) return;
+    const ctx = this.ctx;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.drawImage(
+      source,
+      frame.marginDeviceX,
+      frame.marginDeviceY,
+      width,
+      height,
+      0,
+      0,
+      width,
+      height
+    );
+  }
+
   /**
    * Keep the frame just painted, with the camera it was painted under.
    *
-   * Skipped — and the previous snapshot dropped — while anything is animating:
-   * a transition or pulse frame is a moment in an animation, not a scene at
-   * rest, and blitting one after the animation finished would show the picture
-   * mid-morph. Dropping rather than keeping is the safe direction: no snapshot
-   * simply means the next gesture frame is a full redraw.
+   * The frame IS the snapshot — nothing is copied — so this only records the
+   * camera that makes those pixels readable. Skipped, and the previous camera
+   * dropped, while anything is animating: a transition or pulse frame is a
+   * moment in an animation, not a scene at rest, and blitting one after the
+   * animation finished would show the picture mid-morph. Dropping rather than
+   * keeping is the safe direction: no snapshot simply means the next gesture
+   * frame is a full redraw.
    */
-  private captureSnapshot(ratio: number, origin: Point, scale: number): void {
+  private captureSnapshot(frame: SceneFrame, ratio: number, origin: Point, scale: number): void {
     const animating =
       this.sceneDirty || this.pulseNodeId !== null || this.disks.some((d) => d.transitionStart > 0);
-    const width = this.canvas.width;
-    const height = this.canvas.height;
-    if (animating || width === 0 || height === 0) {
+    if (animating || !frame.offscreen || this.canvas.width === 0 || this.canvas.height === 0) {
       this.snapshotCamera = null;
       return;
     }
-    let target = this.snapshotCanvas;
-    if (!target) {
-      target = document.createElement('canvas');
-      this.snapshotCanvas = target;
-    }
-    if (target.width !== width || target.height !== height) {
-      target.width = width;
-      target.height = height;
-    }
-    const ctx = target.getContext('2d');
-    if (!ctx) {
-      this.snapshotCamera = null;
-      return;
-    }
-    // Canvas → canvas, never `getImageData`: this is a GPU blit, a readback is
-    // a synchronisation point.
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, width, height);
-    ctx.drawImage(this.canvas, 0, 0);
     this.snapshotCamera = {
       originX: origin.x,
       originY: origin.y,
@@ -1716,20 +1845,32 @@ export class CanvasController {
       ratio,
       width: this.width,
       height: this.height,
+      marginX: frame.marginX,
+      marginY: frame.marginY,
+      spanWidth: frame.spanWidth,
+      spanHeight: frame.spanHeight,
     };
   }
 
   /**
-   * The viewport in the local units of a frame whose origin sits at screen
-   * `(cx, cy)` and whose unit is `k` screen px — a disk's frame, or the
+   * The EXPANDED viewport in the local units of a frame whose origin sits at
+   * screen `(cx, cy)` and whose unit is `k` screen px — a disk's frame, or the
    * workspace's.
+   *
+   * The rect is the frame that was actually painted, margin included, which is
+   * what makes the snapshot cover a pan of half a screen in any direction: cull
+   * to the viewport and a pan drags black in behind it. {@link CULL_MARGIN_PX}
+   * still rides on top, for the strokes and glyphs that sit slightly outside
+   * their wedge at the rect's own edge.
    */
-  private cullFor(cx: number, cy: number, k: number): ViewCull {
+  private cullFor(frame: SceneFrame, cx: number, cy: number, k: number): ViewCull {
+    const padX = frame.marginX + CULL_MARGIN_PX;
+    const padY = frame.marginY + CULL_MARGIN_PX;
     return makeCull(
-      (-CULL_MARGIN_PX - cx) / k,
-      (-CULL_MARGIN_PX - cy) / k,
-      (this.width + CULL_MARGIN_PX - cx) / k,
-      (this.height + CULL_MARGIN_PX - cy) / k
+      (-padX - cx) / k,
+      (-padY - cy) / k,
+      (this.width + padX - cx) / k,
+      (this.height + padY - cy) / k
     );
   }
 
@@ -3390,6 +3531,81 @@ function fontSpec(fontPx: number, k: number): string {
 
 /** Entries the text-metrics cache holds before it stops growing. */
 const TEXT_CACHE_MAX = 4000;
+
+// ------------------------------------------------------------------ scene ---
+
+/** The scene canvas's geometry — see {@link sceneMetrics}. */
+export interface SceneMetrics {
+  marginX: number;
+  marginY: number;
+  marginDeviceX: number;
+  marginDeviceY: number;
+  spanWidth: number;
+  spanHeight: number;
+  backingWidth: number;
+  backingHeight: number;
+}
+
+/**
+ * The scene canvas's geometry for a visible backing store of
+ * `backingWidth × backingHeight` device px at `ratio` device px per CSS px.
+ *
+ * The margin is half the VISIBLE backing store on each side, so the frame is
+ * 2w × 2h with the viewport as its centre quadrant. It is rounded to a whole
+ * DEVICE pixel, which is what lets the frame's base transform be an exact
+ * integer translation — so the centre quadrant rasterises exactly as it would
+ * have without a margin at all, and the composite is a straight copy. The CSS
+ * span is taken back out of the backing size rather than from the viewport's
+ * CSS size so that the two agree to the pixel at a fractional ratio.
+ */
+export function sceneMetrics(
+  backingWidth: number,
+  backingHeight: number,
+  ratio: number
+): SceneMetrics {
+  const marginDeviceX = Math.round(backingWidth / 2);
+  const marginDeviceY = Math.round(backingHeight / 2);
+  const spanBackingWidth = backingWidth + marginDeviceX * 2;
+  const spanBackingHeight = backingHeight + marginDeviceY * 2;
+  return {
+    marginX: marginDeviceX / ratio,
+    marginY: marginDeviceY / ratio,
+    marginDeviceX,
+    marginDeviceY,
+    spanWidth: spanBackingWidth / ratio,
+    spanHeight: spanBackingHeight / ratio,
+    backingWidth: spanBackingWidth,
+    backingHeight: spanBackingHeight,
+  };
+}
+
+// ------------------------------------------------------------------- blit ---
+
+/**
+ * Where the whole snapshot lands on screen under a new camera, in CSS px.
+ *
+ * `new = newOrigin + (old − oldOrigin) × factor`, applied to the snapshot's own
+ * top-left. That corner is NOT the viewport's `(0, 0)` — the snapshot is the
+ * viewport grown by its margin, so in the (viewport) coordinates the two
+ * cameras are written in it sits at `(−marginX, −marginY)`.
+ *
+ * With the camera unmoved this is an identity: `factor` is 1 and the corner
+ * lands back on `(−marginX, −marginY)`, i.e. the snapshot's centre quadrant
+ * lands exactly on `(0, 0, width, height)` — the same pixels the composite of a
+ * full redraw puts there.
+ */
+export function blitPlacement(
+  snapshot: SnapshotCamera,
+  origin: Point,
+  factor: number
+): { x: number; y: number; width: number; height: number } {
+  return {
+    x: origin.x + (-snapshot.marginX - snapshot.originX) * factor,
+    y: origin.y + (-snapshot.marginY - snapshot.originY) * factor,
+    width: snapshot.spanWidth * factor,
+    height: snapshot.spanHeight * factor,
+  };
+}
 
 // ---------------------------------------------------------------- culling ---
 

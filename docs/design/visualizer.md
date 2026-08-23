@@ -1296,6 +1296,55 @@ gesture the user makes constantly. All three fixes live in the controller;
   Neither is required by anything above, and both would be judged on their own
   measurements.
 
+### Performance round (G5.1) — the frame is a 50% margin wider than the viewport
+
+G5 as written above culled the redraw to the viewport and snapshotted the
+viewport, which made a pan drag **drag black into view**: the pixels beyond the
+edge were never painted, so the blit had nothing to stamp there until the
+gesture settled 100ms later. The margin is the fix, and it changes only where a
+frame is painted — the picture, the cull predicate's correctness rule, and every
+invalidation rule above are untouched.
+
+- **A full redraw paints into a virtual viewport expanded by 50% of its own
+  width and height on EVERY side** — a rendered area of 2w × 2h with the real
+  viewport as its centre quadrant. It goes to an offscreen scene canvas at the
+  current device pixel ratio, whose base transform carries the shift, so nothing
+  below the compositing step (arcs, ropes, labels, the close `×`, the drag
+  ghost) knows the margin exists: it is all still written in viewport
+  coordinates. The visible canvas then gets **one `drawImage`** of the centre
+  quadrant. The margin is rounded to a whole DEVICE pixel, which is what makes
+  that composite a straight copy rather than a resample — **at rest the visible
+  pixels are byte-identical to G5's**.
+- **The scene canvas IS the snapshot.** G5 copied the finished frame into a
+  second offscreen canvas; there is nothing left to copy, since the frame was
+  already painted offscreen. The stored camera (`origin`, `scale`, ratio, size)
+  survives unchanged in meaning, plus the margin it was painted with — the
+  origin is still in viewport coordinates, and the snapshot's own top-left sits
+  at `(−marginX, −marginY)` in them, which is the whole of the change to the
+  blit's arithmetic.
+- **The cull rect is the expanded rect**, at every site that takes one: the
+  per-disk bounding-circle reject, the arc windows, the rope and tether boxes,
+  and — this one matters as much as the pixels — **the label plan**, which would
+  otherwise fill the margin with bare wedges whose labels only appear on settle.
+  The 24px `CULL_MARGIN_PX` still rides on top of the margin, for the strokes
+  and glyphs that sit slightly outside their wedge at the rect's own edge.
+- **What it buys:** a pan of up to **half a viewport in any direction**, and a
+  zoom **out to ~0.5×**, read entirely from painted pixels — no black, at any
+  point in the gesture. Past that the snapshot runs out and the background shows
+  through (never stale or garbage pixels), and the settled redraw fills it in.
+  Probed over the real exported `sceneMetrics` / `blitPlacement`: **30,000**
+  cases across 8 viewport sizes × 5 device pixel ratios × log-uniform scales —
+  **0 identity violations** (camera unmoved ⇒ the centre quadrant maps onto
+  `(0, 0, w, h)`, worst error 2.3e-13 px), **0 coverage violations** for pans up
+  to ±½ viewport in each axis (worst slack 8.7e-6 px, i.e. the bound is exactly
+  ½) and for a 0.5× zoom-out about the viewport centre (slack exactly 0, the
+  documented edge); a mutation control that sets the margin back to zero is
+  caught on 2,000 of 2,000 cases, so "0" is a result and not a tautology.
+- **The cost is memory, and it is accepted:** at ratio 2 the scene canvas is 4×
+  the visible pixel count. No downshift and no tiling — both would trade
+  sharpness or complexity for a budget nobody has complained about, and the
+  round's whole point is that the gesture reads pixels that are already there.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all
