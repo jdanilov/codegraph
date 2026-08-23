@@ -173,6 +173,37 @@ const RLABEL_MIN_HEIGHT_PX = 8;
 const RLABEL_MIN_CHARS = 4;
 const RLABEL_MAX_FONT_PX = 12;
 
+/**
+ * How long the camera must sit still before the full label pass runs again.
+ *
+ * Zooming used to re-run the whole label layout on every frame — an orientation
+ * choice plus one `measureText` per candidate arc per tick — which is what made
+ * a zoom gesture judder the moment labels came into range. While the camera is
+ * moving the painter now replays the LAST plan through cheap arithmetic gates
+ * only (no `measureText`, no font assignment), and the real pass runs once the
+ * gesture stops. At rest the output is byte-identical to the old path.
+ */
+const LABEL_SETTLE_MS = 100;
+
+/** ⌘P reveal pulse: three gentle breaths on the wedge the user landed on. */
+const PULSE_MS = 1000;
+const PULSE_CYCLES = 3;
+
+/**
+ * Change markers: two thin bars on the OUTER rim of a changed file's wedge.
+ *
+ * Stacked radially — green (added) outermost, red (removed) directly inside it
+ * — rather than side by side angularly, because the angle already means "how
+ * much code is here" and re-using it for "how much changed" would make a small
+ * heavily-edited file read as a big one. Each bar's LENGTH along the arc is the
+ * share of the file's lines it accounts for, so the pair reads as two little
+ * progress bars against the wedge they sit on.
+ */
+const MARKER_MAX_THICKNESS = 2.4;
+const MARKER_DEPTH_SHARE = 0.12;
+const MARKER_ADDED = '#4ade80';
+const MARKER_REMOVED = '#f87171';
+
 /** Opacity multiplier for anything the current focus dims. */
 const DIM_ALPHA = 0.26;
 /** Dimmed wedges keep their labels — quieter, but still readable. */
@@ -191,6 +222,43 @@ interface DrawnEdge {
   points: Point[];
   /** Relative to the hovered / selected wedge — green in, amber out. */
   direction: EdgeDirection;
+}
+
+/**
+ * Everything about a wedge a label needs that does NOT depend on the camera.
+ *
+ * Computed once per layout (`rebuildLayout`), never per frame: the mid angle,
+ * its sine/cosine, the label radius and the wedge's two extents in LAYOUT
+ * units. Multiplying by the current scale is the only per-frame arithmetic.
+ */
+interface ArcLabelGeom {
+  arc: SunburstArc;
+  mid: number;
+  cos: number;
+  sin: number;
+  midRadius: number;
+  span: number;
+  /** Arc length at the label radius (`span × midRadius`), layout units. */
+  tangential: number;
+  /** Radial depth (`r1 − r0`), layout units. */
+  radial: number;
+}
+
+/** One label, as the last full pass decided to draw it. */
+interface PlannedLabel {
+  geom: ArcLabelGeom;
+  text: string;
+  orientation: 'curved' | 'radial';
+  /** Font size in SCREEN px the plan was measured at (bucketed). */
+  fontPx: number;
+  /** What the text measured at that size, in SCREEN px. */
+  widthPx: number;
+}
+
+/** Added/removed share of a changed file's own line count, each clamped to 1. */
+export interface ChangeMarker {
+  added: number;
+  removed: number;
 }
 
 export class CanvasController {
@@ -217,10 +285,40 @@ export class CanvasController {
   private impactedNodes = new Set<string>();
   private resultEdges = new Set<string>();
 
+  /**
+   * The per-node IMPACT mode (round 4): a node plus everything that transitively
+   * depends on it, dimming the rest exactly like a card's result does. The set
+   * is computed by the shell from the model's own edges and handed over whole.
+   */
+  private impactModeNodes = new Set<string>();
+
   /** Arc keys the result/changed sets resolve to — recomputed per layout. */
   private resultArcs = new Set<string>();
   private changedArcs = new Set<string>();
   private impactedArcs = new Set<string>();
+  private impactModeArcs = new Set<string>();
+
+  /**
+   * Legend categories the user switched OFF (round 4). A wedge whose colour key
+   * is in here is not painted, not labelled and not hit-tested — but the LAYOUT
+   * is untouched, so it keeps its angular space and nothing else moves.
+   */
+  private hiddenColorKeys = new Set<string>();
+
+  /** File node id → what changed in it, for the outer-rim change markers. */
+  private changeMarkers = new Map<string, ChangeMarker>();
+
+  /** Per-layout label geometry, and the last full label pass's decisions. */
+  private labelGeom: ArcLabelGeom[] = [];
+  private labelPlan: PlannedLabel[] | null = null;
+  /** `(font bucket, text)` → measured width in SCREEN px. */
+  private readonly textWidths = new Map<string, number>();
+  /** When the camera last moved — the label pass waits for this to go stale. */
+  private cameraMovedAt = -Infinity;
+
+  /** ⌘P landing pulse: which node, and when the pulse starts. */
+  private pulseNodeId: string | null = null;
+  private pulseStart = 0;
 
   /**
    * Arcs the hovered wedge is related to by an edge — `null` when nothing is
@@ -342,6 +440,51 @@ export class CanvasController {
     this.requestDraw();
   }
 
+  /**
+   * Switch legend categories off (round 4).
+   *
+   * "Off" means INVISIBLE, not dimmed: the wedge is not painted, carries no
+   * label and no tooltip, and the pointer goes straight through it. What it
+   * does NOT mean is re-laying out the disk — the wedge keeps its angular
+   * space, so switching a category off never moves anything else. A filter that
+   * re-flows the picture is a filter you cannot use to compare two states.
+   */
+  setHiddenColorKeys(keys: Iterable<string>): void {
+    const next = new Set(keys);
+    if (next.size === this.hiddenColorKeys.size && [...next].every((k) => this.hiddenColorKeys.has(k))) {
+      return;
+    }
+    this.hiddenColorKeys = next;
+    this.labelPlan = null;
+    this.requestDraw();
+  }
+
+  /**
+   * Uncommitted-change markers, keyed by FILE node id (round 4).
+   *
+   * Always on in the normal view — it costs two thin bars on the handful of
+   * wedges that actually changed, and "what have I touched" is the question a
+   * developer opens this UI with more often than any other.
+   */
+  setChangeMarkers(markers: Iterable<[string, ChangeMarker]>): void {
+    this.changeMarkers = new Map(markers);
+    this.requestDraw();
+  }
+
+  /**
+   * Per-node IMPACT mode: light `ids` (the node and its transitive dependents)
+   * and dim everything else. `null` clears it.
+   */
+  setImpact(ids: Iterable<string> | null): void {
+    const model = this.model;
+    const next = new Set<string>();
+    for (const id of ids ?? []) if (!model || model.nodes.has(id)) next.add(id);
+    this.impactModeNodes = next;
+    this.projectHighlight();
+    this.edgesDirty = true;
+    this.requestDraw();
+  }
+
   // ---------------------------------------------------------- navigation ---
 
   getRoot(): string {
@@ -412,7 +555,7 @@ export class CanvasController {
    * the node ITSELF: the centre disk always renders the root, so ⌘P can reach
    * anything in the graph.
    */
-  reveal(id: string): boolean {
+  reveal(id: string, pulse = false): boolean {
     const model = this.model;
     if (!model) return false;
     const node = model.get(id);
@@ -425,6 +568,84 @@ export class CanvasController {
     }
 
     this.selected = id;
+    if (pulse) {
+      // The pulse only means anything once the wedge is where it is going to
+      // stay, so it starts when the re-root transition ENDS (immediately when
+      // there was no re-root to make).
+      this.pulseNodeId = id;
+      this.pulseStart =
+        this.transitionStart > 0 ? this.transitionStart + TRANSITION_MS : performance.now();
+    }
+    this.edgesDirty = true;
+    this.requestDraw();
+    this.callbacks.onSelect(node);
+    return true;
+  }
+
+  /**
+   * Arrow-key navigation over the disk (round 4).
+   *
+   * The disk is a tree drawn as rings, so the four directions read off the
+   * geometry directly: left/right walk the SIBLINGS in display order (the order
+   * they are drawn around the ring, which is the sort mode's order), up is the
+   * containing wedge, down is the first child. Left/right wrap, because a ring
+   * is a circle and stopping at "the last one" is an arbitrary place to stop.
+   *
+   * With nothing selected, any direction lands on the first wedge of ring 1 —
+   * the keyboard must have a way in that does not require a click first.
+   */
+  moveSelection(direction: 'prev' | 'next' | 'up' | 'down'): boolean {
+    const layout = this.layout;
+    const model = this.model;
+    if (!layout || !model) return false;
+
+    const current = this.selected ? layout.byNode.get(this.selected) : undefined;
+    if (!current) {
+      const first = this.visibleRing(1)[0];
+      return first ? this.selectArc(first) : false;
+    }
+
+    if (direction === 'up') {
+      const parent = current.parentKey ? layout.byKey.get(current.parentKey) : undefined;
+      return parent && !this.isHiddenArc(parent) ? this.selectArc(parent) : false;
+    }
+    if (direction === 'down') {
+      const child = this.visibleRing(current.ring + 1).find(
+        (arc) => arc.parentKey === current.key
+      );
+      return child ? this.selectArc(child) : false;
+    }
+
+    const siblings = this.visibleRing(current.ring).filter(
+      (arc) => arc.parentKey === current.parentKey && arc.parentNodeId === current.parentNodeId
+    );
+    if (siblings.length === 0) return false;
+    const index = siblings.indexOf(current);
+    if (index < 0) return false;
+    const step = direction === 'next' ? 1 : -1;
+    const next = siblings[(index + step + siblings.length) % siblings.length]!;
+    return next === current ? false : this.selectArc(next);
+  }
+
+  /** Enter: re-root onto the selected wedge, which is the drill-in gesture. */
+  enterSelected(): boolean {
+    const id = this.selected;
+    if (!id || !this.model?.nodes.has(id) || id === this.rootId) return false;
+    this.setRoot(id);
+    return true;
+  }
+
+  /** Arcs of one ring in display order, minus the categories switched off. */
+  private visibleRing(ring: number): SunburstArc[] {
+    const arcs = this.layout?.byRing[ring] ?? [];
+    return arcs.filter((arc) => !this.isHiddenArc(arc));
+  }
+
+  /** Select the node an arc renders (a `+N` arc has none) and publish it. */
+  private selectArc(arc: SunburstArc): boolean {
+    const node = arc.nodeId ? this.model?.get(arc.nodeId) : undefined;
+    if (!node) return false;
+    this.selected = node.id;
     this.edgesDirty = true;
     this.requestDraw();
     this.callbacks.onSelect(node);
@@ -493,6 +714,7 @@ export class CanvasController {
     this.zoom = 1;
     this.panX = 0;
     this.panY = 0;
+    this.cameraMoved();
     this.requestDraw();
     this.emitSummary();
   }
@@ -511,10 +733,56 @@ export class CanvasController {
     if (!model) return;
     this.layout = computeSunburst(model, this.rootId, { sort: this.sortMode });
     this.rootId = this.layout.rootId;
+    this.buildLabelGeometry();
     this.projectHighlight();
     this.edgesDirty = true;
     this.requestDraw();
     this.emitSummary();
+  }
+
+  /**
+   * Everything a label needs that the camera cannot change, once per layout.
+   *
+   * The trigonometry and the two extents are properties of the WEDGE, so they
+   * belong to the layout's lifetime, not to the frame's. Hoisting them here is
+   * half of the zoom fix — the other half is {@link drawLabels} not re-running
+   * the fit while the camera is in motion.
+   */
+  private buildLabelGeometry(): void {
+    this.labelGeom = [];
+    this.labelPlan = null;
+    const layout = this.layout;
+    if (!layout) return;
+    for (const arc of layout.arcs) {
+      const mid = (arc.a0 + arc.a1) / 2;
+      const midRadius = (arc.r0 + arc.r1) / 2;
+      const span = arc.a1 - arc.a0;
+      this.labelGeom.push({
+        arc,
+        mid,
+        cos: Math.cos(mid),
+        sin: Math.sin(mid),
+        midRadius,
+        span,
+        tangential: span * midRadius,
+        radial: arc.r1 - arc.r0,
+      });
+    }
+  }
+
+  /** The legend row a wedge belongs to — the unit an interactive legend hides. */
+  private legendKeyFor(arc: SunburstArc): string | null {
+    const node = arc.nodeId ? this.model?.get(arc.nodeId) : undefined;
+    if (!node) return null;
+    if (this.colorMode !== 'layer') return node.kind;
+    return node.kind === DIRECTORY_KIND ? DIRECTORY_LEGEND_KEY : (node.layer ?? '');
+  }
+
+  /** Is this wedge switched off in the legend? Aggregates never are. */
+  private isHiddenArc(arc: SunburstArc): boolean {
+    if (this.hiddenColorKeys.size === 0) return false;
+    const key = this.legendKeyFor(arc);
+    return key !== null && this.hiddenColorKeys.has(key);
   }
 
   /**
@@ -528,6 +796,7 @@ export class CanvasController {
     this.resultArcs = new Set();
     this.changedArcs = new Set();
     this.impactedArcs = new Set();
+    this.impactModeArcs = new Set();
     if (!this.layout) return;
     const project = (ids: Set<string>, into: Set<string>): void => {
       for (const id of ids) {
@@ -538,6 +807,7 @@ export class CanvasController {
     project(this.resultNodes, this.resultArcs);
     project(this.changedNodes, this.changedArcs);
     project(this.impactedNodes, this.impactedArcs);
+    project(this.impactModeNodes, this.impactModeArcs);
   }
 
   /**
@@ -571,6 +841,7 @@ export class CanvasController {
     const ratio = window.devicePixelRatio || 1;
     this.canvas.width = Math.round(this.width * ratio);
     this.canvas.height = Math.round(this.height * ratio);
+    this.cameraMoved();
     this.requestDraw();
   }
 
@@ -640,6 +911,10 @@ export class CanvasController {
     if (this.transitionStart > 0) {
       progress = Math.min(1, (performance.now() - this.transitionStart) / TRANSITION_MS);
       if (progress >= 1) this.transitionStart = 0;
+      // The re-root animation scales the whole disk frame by frame, which is a
+      // camera move by any other name — the labels ride the last plan through
+      // it and are re-planned once it lands.
+      this.cameraMoved();
     }
     const eased = 1 - Math.pow(1 - progress, 3);
     const animationScale = this.transitionFrom + (1 - this.transitionFrom) * eased;
@@ -657,12 +932,26 @@ export class CanvasController {
     this.drawArcs(ctx, layout, model, k);
     this.drawCentre(ctx, layout, k);
     this.drawEdges(ctx, k);
-    this.drawLabels(ctx, layout, model, k);
+    this.drawLabels(ctx, model, k);
 
     ctx.restore();
 
+    // Two things keep the frame loop alive on their own: the ⌘P pulse, and the
+    // camera-settle window that owes the labels one more (full) pass.
+    if (this.pulseNodeId !== null || this.cameraSettling()) this.requestDraw();
+
     // The edge count is part of the summary, and it only ever changes here.
     if (this.drawnEdges.length !== this.emittedEdges) this.emitSummary();
+  }
+
+  /** Is the camera still moving (or freshly stopped)? */
+  private cameraSettling(): boolean {
+    return performance.now() - this.cameraMovedAt < LABEL_SETTLE_MS;
+  }
+
+  /** Note a camera gesture — zoom, pan, resize. Defers the label pass. */
+  private cameraMoved(): void {
+    this.cameraMovedAt = performance.now();
   }
 
   private drawArcs(
@@ -671,7 +960,11 @@ export class CanvasController {
     model: GraphModel,
     k: number
   ): void {
+    const pulseAlpha = this.pulseAlpha();
     for (const arc of layout.arcs) {
+      // A category switched off in the legend is not painted at all — it is not
+      // dimmed, it is absent (its angular space stays, so nothing else moves).
+      if (this.isHiddenArc(arc)) continue;
       const pad = Math.min(0.0022, (arc.a1 - arc.a0) * 0.14);
       const a0 = arc.a0 + pad;
       const a1 = arc.a1 - pad;
@@ -706,11 +999,76 @@ export class CanvasController {
         ctx.stroke();
       }
 
+      // The ⌘P landing pulse: a few gentle breaths of extra outline so the eye
+      // finds the wedge the palette just jumped to.
+      if (pulseAlpha > 0 && arc.nodeId !== null && arc.nodeId === this.pulseNodeId) {
+        ctx.strokeStyle = withAlpha(GLOW_RESULT, pulseAlpha);
+        ctx.lineWidth = (1.5 + 2.5 * pulseAlpha) / k;
+        ctx.stroke();
+      }
+
       if (this.changedArcs.has(arc.key)) this.strokeRim(ctx, arc, a0, a1, RIM_CHANGED, 2.8 / k);
       else if (this.impactedArcs.has(arc.key)) {
         this.strokeRim(ctx, arc, a0, a1, RIM_IMPACTED, 2 / k);
       }
+
+      this.drawChangeMarker(ctx, arc, a0, a1, alpha);
     }
+  }
+
+  /**
+   * Where the ⌘P pulse is in its cycle: 0 when nothing is pulsing.
+   *
+   * Three half-sine breaths over a second, then the pulse retires itself — a
+   * "look here" that outstays its welcome becomes chrome.
+   */
+  private pulseAlpha(): number {
+    if (this.pulseNodeId === null) return 0;
+    const elapsed = performance.now() - this.pulseStart;
+    if (elapsed < 0) return 0;
+    if (elapsed > PULSE_MS) {
+      this.pulseNodeId = null;
+      return 0;
+    }
+    const phase = (elapsed / PULSE_MS) * PULSE_CYCLES * Math.PI;
+    return Math.abs(Math.sin(phase)) * (1 - elapsed / PULSE_MS);
+  }
+
+  /**
+   * Uncommitted edits, on the OUTER rim of the file's own wedge.
+   *
+   * Two bars stacked radially — added green outside, removed red inside — each
+   * running along the arc for the share of the file's lines it accounts for.
+   * Deliberately thin and slightly translucent: this is a standing annotation
+   * on the normal view, not a mode, so it has to survive being always on.
+   */
+  private drawChangeMarker(
+    ctx: CanvasRenderingContext2D,
+    arc: SunburstArc,
+    a0: number,
+    a1: number,
+    alpha: number
+  ): void {
+    if (this.changeMarkers.size === 0 || !arc.nodeId) return;
+    const marker = this.changeMarkers.get(arc.nodeId);
+    if (!marker) return;
+    const depth = arc.r1 - arc.r0;
+    const thickness = Math.min(MARKER_MAX_THICKNESS, depth * MARKER_DEPTH_SHARE);
+    if (thickness <= 0) return;
+    const span = a1 - a0;
+
+    const bar = (share: number, color: string, outer: number): void => {
+      if (share <= 0) return;
+      const extent = Math.max(span * Math.min(1, share), span * 0.06);
+      ctx.beginPath();
+      ctx.arc(0, 0, outer - thickness / 2, a0, a0 + extent);
+      ctx.strokeStyle = withAlpha(color, 0.85 * alpha);
+      ctx.lineWidth = thickness;
+      ctx.stroke();
+    };
+
+    bar(marker.added, MARKER_ADDED, arc.r1);
+    bar(marker.removed, MARKER_REMOVED, arc.r1 - thickness);
   }
 
   /**
@@ -721,6 +1079,7 @@ export class CanvasController {
    */
   private isEmphasised(arc: SunburstArc): boolean {
     if (this.resultArcs.has(arc.key)) return true;
+    if (this.impactModeArcs.has(arc.key)) return true;
     if (this.selected !== null && arc.nodeId === this.selected) return true;
     if (this.isUnderHover(arc)) return true;
     return this.hoverConnectedArcs?.has(arc.key) ?? false;
@@ -738,9 +1097,13 @@ export class CanvasController {
     return this.hasFocus() && !this.isEmphasised(arc);
   }
 
-  /** Is anything focused right now — a card's result, or a hover? */
+  /** Is anything focused right now — a card, an impact set, or a hover? */
   private hasFocus(): boolean {
-    return this.resultArcs.size > 0 || this.hoverConnectedArcs !== null;
+    return (
+      this.resultArcs.size > 0 ||
+      this.impactModeArcs.size > 0 ||
+      this.hoverConnectedArcs !== null
+    );
   }
 
   /** Rim on the OUTER boundary: hot for changed, warm for impacted. */
@@ -827,15 +1190,40 @@ export class CanvasController {
    * when the user needs them: the dimmed ring is what they are navigating back
    * through. A dimmed label is drawn in quiet ink instead of hidden.
    */
-  private drawLabels(
-    ctx: CanvasRenderingContext2D,
-    layout: SunburstLayout,
-    model: GraphModel,
-    k: number
-  ): void {
-    for (const arc of layout.arcs) {
-      this.drawArcLabel(ctx, arc, model, k, this.isDimmed(arc));
+  private drawLabels(ctx: CanvasRenderingContext2D, model: GraphModel, k: number): void {
+    // While the camera is moving the last PLAN is replayed through arithmetic
+    // gates only. Rebuilding it costs an orientation choice and a `measureText`
+    // per candidate wedge, which at 60fps is exactly the judder the round-4
+    // review reported; the gates below are a handful of multiplications and the
+    // real pass runs the moment the gesture stops.
+    const reuse = this.cameraSettling() && this.labelPlan !== null;
+    const plan = reuse ? this.labelPlan! : this.buildLabelPlan(ctx, k);
+    if (!reuse) this.labelPlan = plan;
+
+    for (const label of plan) {
+      const arc = label.geom.arc;
+      if (this.isHiddenArc(arc)) continue;
+      if (reuse && !this.planStillFits(label, k)) continue;
+      const ink = this.isDimmed(arc) ? DIM_LABEL_COLOR : readableOn(this.fillFor(arc, model));
+      // The plan's own font is kept while the camera moves: recomputing it would
+      // miss the metrics cache on every bucket change, which is the cost this
+      // whole path exists to avoid. The size only ever varies between 8 and
+      // 12.5px, so holding it for the length of a gesture is not visible.
+      ctx.font = fontSpec(label.fontPx, k);
+      if (label.orientation === 'curved') this.paintCurvedLabel(ctx, label, k, ink);
+      else this.paintRadialLabel(ctx, label, ink);
     }
+  }
+
+  /** The full label pass: one decision per wedge, at the current scale. */
+  private buildLabelPlan(ctx: CanvasRenderingContext2D, k: number): PlannedLabel[] {
+    const plan: PlannedLabel[] = [];
+    for (const geom of this.labelGeom) {
+      if (this.isHiddenArc(geom.arc)) continue;
+      const label = this.planLabel(ctx, geom, k);
+      if (label) plan.push(label);
+    }
+    return plan;
   }
 
   /**
@@ -855,73 +1243,154 @@ export class CanvasController {
    * rule; if the chosen one does not fit, the other is tried before the wedge
    * is left bare for the hover tooltip to name.
    */
-  private drawArcLabel(
+  private planLabel(
     ctx: CanvasRenderingContext2D,
-    arc: SunburstArc,
-    model: GraphModel,
-    k: number,
-    dimmed: boolean
-  ): void {
-    const midRadius = (arc.r0 + arc.r1) / 2;
-    const span = arc.a1 - arc.a0;
-    const tangentialPx = span * midRadius * k;
-    const radialPx = (arc.r1 - arc.r0) * k;
-    const ink = dimmed ? DIM_LABEL_COLOR : readableOn(this.fillFor(arc, model));
-
-    if (tangentialPx > radialPx) {
-      if (this.drawCurvedArcLabel(ctx, arc, midRadius, span, k, ink)) return;
-      this.drawRadialLabel(ctx, arc, midRadius, span, k, ink);
-      return;
+    geom: ArcLabelGeom,
+    k: number
+  ): PlannedLabel | null {
+    if (geom.tangential > geom.radial) {
+      return this.planCurved(ctx, geom, k) ?? this.planRadial(ctx, geom, k);
     }
-    if (this.drawRadialLabel(ctx, arc, midRadius, span, k, ink)) return;
-    this.drawCurvedArcLabel(ctx, arc, midRadius, span, k, ink);
+    return this.planRadial(ctx, geom, k) ?? this.planCurved(ctx, geom, k);
   }
 
   /**
-   * Curved layout: the name follows the arc. `false` when the wedge is too
+   * Curved layout: the name follows the arc. `null` when the wedge is too
    * short or too thin for it, or when what fits is not a name any more.
    */
-  private drawCurvedArcLabel(
+  private planCurved(
     ctx: CanvasRenderingContext2D,
-    arc: SunburstArc,
-    midRadius: number,
-    span: number,
-    k: number,
-    ink: string
-  ): boolean {
-    const thicknessPx = (arc.r1 - arc.r0) * k;
-    if (span * midRadius * k < LABEL_MIN_ARC_PX || thicknessPx < LABEL_MIN_THICKNESS_PX) {
-      return false;
-    }
-    const fontPx = Math.max(9, Math.min(12.5, thicknessPx * 0.34));
-    ctx.font = `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
-    const text = fitText(ctx, arc.label, span * 0.9 * midRadius);
+    geom: ArcLabelGeom,
+    k: number
+  ): PlannedLabel | null {
+    const thicknessPx = geom.radial * k;
+    if (geom.tangential * k < LABEL_MIN_ARC_PX || thicknessPx < LABEL_MIN_THICKNESS_PX) return null;
+    const fontPx = curvedFontPx(thicknessPx);
+    const fitted = this.fitLabel(ctx, geom.arc.label, geom.tangential * 0.9 * k, fontPx, k);
     // `ex…` names nothing — let the caller try the other orientation.
-    if (!text || (text.endsWith('…') && text.length < LABEL_MIN_CHARS)) return false;
-    this.drawCurvedLabel(ctx, text, (arc.a0 + arc.a1) / 2, midRadius, ink);
-    return true;
+    if (!fitted || (fitted.text.endsWith('…') && fitted.text.length < LABEL_MIN_CHARS)) return null;
+    return { geom, text: fitted.text, orientation: 'curved', fontPx, widthPx: fitted.widthPx };
   }
 
   /**
-   * A label following its arc, one glyph at a time. Labels on the bottom half
-   * are flipped so they are never upside down.
+   * Radial layout: the name runs OUT ALONG THE RADIUS, on the wedge's angular
+   * bisector.
+   *
+   * The room is the wedge's own geometry, no approximation needed: the line
+   * length is the wedge's radial depth and the cap height is the angular chord
+   * at the centroid (`span × midRadius`). Both are known before any
+   * `measureText` — and, as of round 4, both were computed once when the layout
+   * was built rather than once per wedge per frame.
    */
-  private drawCurvedLabel(
+  private planRadial(
+    ctx: CanvasRenderingContext2D,
+    geom: ArcLabelGeom,
+    k: number
+  ): PlannedLabel | null {
+    const lengthPx = geom.radial * k;
+    const heightPx = geom.tangential * k;
+    if (lengthPx < RLABEL_MIN_LENGTH_PX || heightPx < RLABEL_MIN_HEIGHT_PX) return null;
+    const fontPx = radialFontPx(heightPx);
+    const fitted = this.fitLabel(ctx, geom.arc.label, geom.radial * 0.92 * k, fontPx, k);
+    if (!fitted || (fitted.text.endsWith('…') && fitted.text.length < RLABEL_MIN_CHARS)) return null;
+    return { geom, text: fitted.text, orientation: 'radial', fontPx, widthPx: fitted.widthPx };
+  }
+
+  /**
+   * Cheap replay gate: does last pass's decision still hold at this scale?
+   *
+   * Pure arithmetic — the wedge's two extents at the current scale against the
+   * same thresholds the full pass uses, and the plan's own measured width (the
+   * font is held for the gesture, so the width holds with it). It can only ever
+   * DROP a label, never invent one, so a gesture can thin the disk out but can
+   * never draw a name that does not fit.
+   */
+  private planStillFits(label: PlannedLabel, k: number): boolean {
+    const geom = label.geom;
+    const tangentialPx = geom.tangential * k;
+    const radialPx = geom.radial * k;
+    const needed = label.widthPx;
+    if (label.orientation === 'curved') {
+      if (tangentialPx < LABEL_MIN_ARC_PX || radialPx < LABEL_MIN_THICKNESS_PX) return false;
+      return needed <= tangentialPx * 0.9;
+    }
+    if (radialPx < RLABEL_MIN_LENGTH_PX || tangentialPx < RLABEL_MIN_HEIGHT_PX) return false;
+    return needed <= radialPx * 0.92;
+  }
+
+  /**
+   * Longest prefix of `text` that fits `maxPx`, ellipsised — or `null` when
+   * nothing legible fits (a lone `…` is noise, not information). Every
+   * measurement goes through the cache, so a re-plan at the same scale is free.
+   */
+  private fitLabel(
     ctx: CanvasRenderingContext2D,
     text: string,
-    mid: number,
-    midRadius: number,
+    maxPx: number,
+    fontPx: number,
+    k: number
+  ): { text: string; widthPx: number } | null {
+    if (maxPx <= 0) return null;
+    const full = this.measurePx(ctx, text, fontPx, k);
+    if (full <= maxPx) return { text, widthPx: full };
+    for (let cut = text.length - 1; cut > 1; cut--) {
+      const candidate = `${text.slice(0, cut)}…`;
+      const width = this.measurePx(ctx, candidate, fontPx, k);
+      if (width <= maxPx) return { text: candidate, widthPx: width };
+    }
+    return null;
+  }
+
+  /**
+   * Width of `text` at `fontPx`, in SCREEN px — memoised per (font, text).
+   *
+   * The canvas is scaled by `k`, so the context's own font is `fontPx / k` and
+   * `measureText` answers in layout units; multiplying back by `k` gives a
+   * number that depends only on the pair being cached. Font sizes are bucketed
+   * to a half-pixel by the two `*FontPx` helpers, which is what keeps the cache
+   * from being a per-zoom-level miss on every entry.
+   */
+  private measurePx(
+    ctx: CanvasRenderingContext2D,
+    text: string,
+    fontPx: number,
+    k: number
+  ): number {
+    const key = `${fontPx}|${text}`;
+    const cached = this.textWidths.get(key);
+    if (cached !== undefined) return cached;
+    ctx.font = fontSpec(fontPx, k);
+    const width = ctx.measureText(text).width * k;
+    if (this.textWidths.size < TEXT_CACHE_MAX) this.textWidths.set(key, width);
+    return width;
+  }
+
+  /**
+   * Paint a planned curved label, one glyph at a time along the arc. Labels on
+   * the bottom half are flipped so they are never upside down.
+   *
+   * Every glyph advance comes out of the metrics cache — the per-character
+   * `measureText` this used to do on every frame was the other half of the zoom
+   * cost, and a font has only so many distinct glyphs.
+   */
+  private paintCurvedLabel(
+    ctx: CanvasRenderingContext2D,
+    label: PlannedLabel,
+    k: number,
     ink: string
   ): void {
-    const flip = Math.sin(mid) > 0;
-    const total = ctx.measureText(text).width;
+    const { mid, midRadius } = label.geom;
+    const fontPx = label.fontPx;
+    const flip = label.geom.sin > 0;
+    const total = this.measurePx(ctx, label.text, fontPx, k) / k;
+    ctx.font = fontSpec(fontPx, k);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = ink;
 
     let angle = flip ? mid + total / midRadius / 2 : mid - total / midRadius / 2;
-    for (const character of text) {
-      const step = ctx.measureText(character).width / midRadius;
+    for (const character of label.text) {
+      const step = this.measurePx(ctx, character, fontPx, k) / k / midRadius;
       const at = flip ? angle - step / 2 : angle + step / 2;
       ctx.save();
       ctx.rotate(at);
@@ -934,51 +1403,28 @@ export class CanvasController {
   }
 
   /**
-   * Radial fallback: the name runs OUT ALONG THE RADIUS, on the wedge's
-   * angular bisector.
-   *
-   * The room is the wedge's own geometry, no approximation needed: the line
-   * length is the wedge's radial depth and the cap height is the angular chord
-   * at the centroid (`span × midRadius`). Both are known before any
-   * `measureText`, which is what keeps this affordable once per wedge per
-   * frame.
+   * Paint a planned radial label: out along the radius, on the wedge's angular
+   * bisector.
    *
    * On the left half of the disk (`cos(mid) < 0`) the text would come out
    * upside down, so it is rotated a further 180° and reads inward — the
    * convention every sunburst uses, and the reason the label never has to be
    * mirrored per glyph.
-   *
-   * Returns whether it drew, so {@link drawArcLabel} can fall back to the
-   * curved layout when this one has nothing legible to show.
    */
-  private drawRadialLabel(
+  private paintRadialLabel(
     ctx: CanvasRenderingContext2D,
-    arc: SunburstArc,
-    midRadius: number,
-    span: number,
-    k: number,
+    label: PlannedLabel,
     ink: string
-  ): boolean {
-    const depth = arc.r1 - arc.r0;
-    const lengthPx = depth * k;
-    const heightPx = span * midRadius * k;
-    if (lengthPx < RLABEL_MIN_LENGTH_PX || heightPx < RLABEL_MIN_HEIGHT_PX) return false;
-
-    const fontPx = Math.max(8, Math.min(RLABEL_MAX_FONT_PX, heightPx * 0.8));
-    ctx.font = `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
-    const text = fitText(ctx, arc.label, depth * 0.92);
-    if (!text || (text.endsWith('…') && text.length < RLABEL_MIN_CHARS)) return false;
-
-    const mid = (arc.a0 + arc.a1) / 2;
+  ): void {
+    const { mid, cos, sin, midRadius } = label.geom;
     ctx.save();
-    ctx.translate(Math.cos(mid) * midRadius, Math.sin(mid) * midRadius);
-    ctx.rotate(Math.cos(mid) < 0 ? mid + Math.PI : mid);
+    ctx.translate(cos * midRadius, sin * midRadius);
+    ctx.rotate(cos < 0 ? mid + Math.PI : mid);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = ink;
-    ctx.fillText(text, 0, 0);
+    ctx.fillText(label.text, 0, 0);
     ctx.restore();
-    return true;
   }
 
   private fillFor(arc: SunburstArc, model: GraphModel): string {
@@ -1120,6 +1566,19 @@ export class CanvasController {
     this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
   }
 
+  /**
+   * The arc under a layout-space point, honouring the legend's filters.
+   *
+   * A category switched off is INVISIBLE, not dimmed, so the pointer has to go
+   * straight through it — a wedge you cannot see must not swallow the click
+   * meant for the background.
+   */
+  private hitArc(layout: SunburstLayout, x: number, y: number): SunburstArc | null {
+    const arc = arcAt(layout, x, y);
+    if (!arc || this.isHiddenArc(arc)) return null;
+    return arc;
+  }
+
   private pointerPosition(event: PointerEvent | MouseEvent | WheelEvent): Point {
     const rect = this.canvas.getBoundingClientRect();
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
@@ -1136,6 +1595,7 @@ export class CanvasController {
       this.panY += dy;
       this.dragX = position.x;
       this.dragY = position.y;
+      this.cameraMoved();
       this.requestDraw();
       return;
     }
@@ -1195,7 +1655,7 @@ export class CanvasController {
       return;
     }
 
-    const arc = arcAt(layout, world.x, world.y);
+    const arc = this.hitArc(layout, world.x, world.y);
     if (!arc) {
       this.selected = null;
       this.edgesDirty = true;
@@ -1234,7 +1694,7 @@ export class CanvasController {
     if (performance.now() - this.rootChangedAt < 450) return;
     const position = this.pointerPosition(event);
     const world = this.toWorld(position.x, position.y);
-    const arc = arcAt(layout, world.x, world.y);
+    const arc = this.hitArc(layout, world.x, world.y);
     if (!arc?.nodeId) return;
     if (model.childrenOf(arc.nodeId).length === 0) return;
     this.setRoot(arc.nodeId);
@@ -1253,6 +1713,7 @@ export class CanvasController {
     const scale = this.scale();
     this.panX = position.x - before.x * scale - centre.x;
     this.panY = position.y - before.y * scale - centre.y;
+    this.cameraMoved();
     this.requestDraw();
     this.emitSummary();
   };
@@ -1280,7 +1741,9 @@ export class CanvasController {
 
     const radius = Math.hypot(world.x, world.y);
     const arcKey =
-      radius <= layout.centreRadius ? CENTRE_KEY : (arcAt(layout, world.x, world.y)?.key ?? null);
+      radius <= layout.centreRadius
+        ? CENTRE_KEY
+        : (this.hitArc(layout, world.x, world.y)?.key ?? null);
     this.setHover(arcKey, edgeKey, screenX, screenY);
   }
 
@@ -1371,6 +1834,34 @@ const CENTRE_KEY = '@centre';
 
 /** The render budget, re-exported so the chrome can show `arcs / budget`. */
 export { MAX_ARCS as ARC_BUDGET };
+
+/**
+ * Label font sizes, in SCREEN px, **bucketed to a half pixel**.
+ *
+ * The bucket is what makes the metrics cache work: a continuous zoom would
+ * otherwise produce a fresh font size — and therefore a fresh cache miss — on
+ * every single frame. Half a pixel is below the threshold anyone can see and
+ * the same wedge keeps the same entry across a whole gesture.
+ */
+function curvedFontPx(thicknessPx: number): number {
+  return bucketFont(Math.max(9, Math.min(12.5, thicknessPx * 0.34)));
+}
+
+function radialFontPx(heightPx: number): number {
+  return bucketFont(Math.max(8, Math.min(RLABEL_MAX_FONT_PX, heightPx * 0.8)));
+}
+
+function bucketFont(px: number): number {
+  return Math.round(px * 2) / 2;
+}
+
+/** The canvas is scaled by `k`, so a screen-px font is `px / k` user units. */
+function fontSpec(fontPx: number, k: number): string {
+  return `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
+}
+
+/** Entries the text-metrics cache holds before it stops growing. */
+const TEXT_CACHE_MAX = 4000;
 
 /** `#rrggbb` (or `rgba(...)`) → `rgba(...)` at the given alpha. */
 function withAlpha(color: string, alpha: number): string {

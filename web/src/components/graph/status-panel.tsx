@@ -10,6 +10,7 @@ import {
   Activity,
   ChevronDown,
   ChevronUp,
+  CircleHelp,
   Loader2,
   Play,
   Search,
@@ -33,6 +34,8 @@ export interface StatusPanelProps {
   onOpenPalette(): void;
   /** Settings — likewise, beside the collapse control. */
   onOpenSettings(): void;
+  /** Keyboard help (round 4) — the third icon in the same header. */
+  onOpenHelp(): void;
 }
 
 export function StatusPanel({
@@ -43,6 +46,7 @@ export function StatusPanel({
   onIndex,
   onOpenPalette,
   onOpenSettings,
+  onOpenHelp,
 }: StatusPanelProps) {
   const [open, setOpen] = useState(false);
   const busy = indexing || Boolean(status?.indexing);
@@ -103,6 +107,9 @@ export function StatusPanel({
           </PanelButton>
           <PanelButton onClick={onOpenSettings} label="Settings" data-testid="open-settings">
             <SettingsIcon className="h-3.5 w-3.5" />
+          </PanelButton>
+          <PanelButton onClick={onOpenHelp} label="Keyboard shortcuts" data-testid="open-help">
+            <CircleHelp className="h-3.5 w-3.5" />
           </PanelButton>
           <PanelButton
             onClick={() => setOpen((value) => !value)}

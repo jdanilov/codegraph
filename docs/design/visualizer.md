@@ -628,6 +628,111 @@ chrome; no contract item and no endpoint shape changed.
     pushed for a navigation the browser already performed. Any write still in
     flight is cancelled first.
 
+### Phase F clarifications — round 4 (additive; supersedes three round-3 items)
+
+A fourth manual review. It restores one thing round 3 removed, puts one thing
+round 3 moved back where it belongs, and adds four affordances. No contract item
+and no endpoint shape changed.
+
+- **The inter-ring gap is back — `RING_GAP = 2`, now PER BRANCH.** A wedge's
+  children start at `parent.r1 + RING_GAP`. *Supersedes round 3's "the 2-unit
+  inter-ring gap went with the bands"*: flush radii proved the per-branch model
+  but read as one solid block of colour, with no seam to tell a parent from what
+  it contains. Two units is the original value and is uniform everywhere — a
+  hairline, not the third-of-a-ring of whitespace the band model produced. Ring 1
+  still starts at the centre disk's edge. Measured on a real 14.2k-node project
+  (561 roots × both sort modes, **41,648** parent→child pairs): the gap is
+  exactly 2 for every single pair, min = max = 2.
+- **Radial depth is now LABEL-FIT, in the layout.** A directory is still exactly
+  1. A file or symbol interpolates between **4/3 and 5/3** of the ring thickness
+  by how much room its name wants — `length × LABEL_CHAR_WIDTH` layout units,
+  ramped between a 22-unit floor and a 132-unit ceiling and clamped at both ends
+  (`labelDepthFactor`). A run of siblings therefore reads as a staircase:
+  `a.js` sits at the floor (1.333), `a2.js` a hair deeper (1.350),
+  `canvas-controller.ts` near the ceiling (1.600). *Supersedes round 2's flat
+  "file 4/3, symbol 4/3"* — depth has been the label's room since round 2, so it
+  should be sized by the label, not by the kind.
+  - The layout stays a **pure deterministic function of (model, rootId,
+    options)**: `LABEL_CHAR_WIDTH` is a fixed average glyph advance, and the
+    layout never touches a canvas or `measureText`. A name that ends up a few
+    units short is truncated by the painter exactly as before.
+  - A `+N` fold arc still takes the deepest factor among the children it folded,
+    so it is never shallower than the siblings it stands in for.
+  - `MAX_RADIUS` is recomputed at the new ceiling:
+    `CENTRE_RADIUS + Σ (ringThickness(n) × 5/3) + 5 × RING_GAP` = **532**. On the
+    probe project the deepest sampled branch reached 418; every one of 47,360
+    arcs stayed inside the cap, every hit test round-tripped on its own centroid,
+    and 1,122 re-run layouts were byte-identical.
+- **The label pass is deferred while the camera moves.** Zooming used to re-run
+  the whole label layout every frame — an orientation choice plus a `measureText`
+  per candidate wedge per tick, plus one `measureText` per GLYPH for every curved
+  label — which is what made a zoom judder the moment names came into range.
+  Three changes, and the picture **at rest is unchanged**:
+  1. a **text-metrics cache** keyed by (bucketed font size, string); font sizes
+     are bucketed to a half pixel, which is what stops a continuous zoom from
+     missing the cache on every frame;
+  2. per-arc label **geometry is precomputed once per layout** (mid angle, its
+     sine/cosine, label radius, tangential and radial extents in layout units) —
+     these are properties of the wedge, not of the frame;
+  3. while the camera is in motion the painter **replays the last plan** through
+     arithmetic gates only — the same thresholds against the wedge's extents at
+     the current scale, plus the plan's already-measured width — and the full
+     pass runs once the camera has been still for **100ms**. The plan's font is
+     held for the length of the gesture (it only ever varies between 8 and
+     12.5px, so this is not visible, and it keeps every metric a cache hit). The
+     replay can only ever DROP a label, never invent one.
+  The re-root animation counts as camera motion for this purpose, so a drill-in
+  is planned once and re-planned when it lands.
+- **Changed files wear their diff on the rim.** A file wedge with uncommitted
+  edits gets up to two thin bars on the OUTER band of its own radial extent,
+  **stacked radially — green (added) outermost, red (removed) directly inside
+  it** — each running along the arc for the share of the file's own line count it
+  accounts for (clamped to the full span). Stacked rather than side by side
+  angularly because the angle already means "how much code is here", and
+  re-using it would make a small heavily-edited file read as a big one. Data is
+  `GET /api/changes` (`hunks` counted per file, `changedFiles[].nodeId` for the
+  wedge); it is now fetched for **every** view, not just the Changes card, and
+  refreshed on `dataVersion`. Always on, deliberately subtle.
+- **⌘P pulses what it landed on.** After the palette reveals a node the wedge
+  breathes three times over ~1s (opacity + stroke width, decaying), starting when
+  the re-root transition ENDS. A re-root can move the whole picture; "which of
+  these 300 arcs did I just ask for" should not be answered by reading.
+- **The legend is a filter.** Clicking a kind/layer swatch makes that category
+  **invisible** — not painted, no label, no tooltip, and the pointer goes
+  straight through it — while the **layout is untouched**, so the wedges keep
+  their angular space and nothing else moves. A filter that re-flows the picture
+  is a filter you cannot use to compare two states. Switched-off rows render
+  muted and struck through. State is **session-only** (shell state, not the
+  hash): hiding a kind is how you are reading the disk this minute, not the view
+  you would send someone — the same reasoning that keeps the sort mode in
+  settings.
+- **Per-node IMPACT mode.** An `impact` toggle in the node panel's title bar
+  lights the selected node plus its **transitive dependents** and dims everything
+  else with the same treatment a question card uses (dimmed wedges keep dimmed
+  labels). The closure is computed **client-side**: the model already holds every
+  non-`contains` edge indexed by node, so the walk is local — seeded with the
+  node and everything it contains (a file's dependents are its symbols'
+  dependents), then following edges BACKWARDS (an edge's source depends on its
+  target), capped at 4,000 nodes. `/api/changes`'s `impactedNodeIds` is a
+  different question (depth-2, seeded from a whole changeset) and is left alone.
+  Toggling off, or selecting another node, clears it.
+- **The disk is drivable from the keyboard.** `←`/`→` walk the SIBLINGS in
+  display order (wrapping — a ring is a circle), `↑` selects the containing
+  wedge, `↓` the first wedge inside, and `Enter` re-roots onto the selection.
+  With nothing selected any arrow lands on the first wedge of ring 1. Arrow keys
+  stand down whenever a dialog is up or a field has focus. A **(?) icon button**
+  in the CODEGRAPH header opens a compact shortcut overlay (⌘P, arrows, Enter,
+  Esc, Back/Forward); Escape's priority is now **⌘P palette → help → settings →
+  feedback export → selection**. No transitions, like every other surface here.
+- **EDGES belong to the LEGEND.** The side-by-side incoming|outgoing treatment is
+  one compact row in the legend panel on the LEFT — `EDGES ● incoming ●
+  outgoing`, colours from `EDGE_DIRECTION_LEGEND`. The node panel's own lists are
+  **stacked again**, outgoing then incoming, one after the other. *Supersedes
+  round 3's "the node panel's EDGES are side by side"*: halving their width
+  halved the room a qualified name (`analytics.send`) has to be readable in,
+  which is the whole reason those names are qualified. An empty half is left out
+  entirely rather than printed as a `· 0` heading over nothing.
+
 Standing views (always-present cards, client-side): **Project** (whole graph)
 and **Changes** (`/api/changes`, refreshed on `dataVersion` change).
 
@@ -666,7 +771,13 @@ paths, line spans, user note) to paste into an agent prompt. Client-side only.
    wedge and its own children) with angle-first hit testing, label orientation
    picked by the wedge's longer extent, search + settings as icon buttons in the
    CODEGRAPH header, side-by-side node-panel edges, and browser Back/Forward as
-   selection history.
+   selection history. **Round 4** (fourth manual review): the inter-ring gap
+   restored per branch, label-fit radial depth computed in the layout, a
+   deferred label pass while the camera moves, change markers on the rim of
+   edited files, a ⌘P landing pulse, an interactive (invisible-category) legend,
+   per-node impact mode, keyboard navigation with a shortcut overlay, and the
+   EDGES treatment moved to the legend with the node panel's lists stacked
+   again.
 
 ## House rules for every phase
 

@@ -31,6 +31,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { CommandPalette } from '@/components/command-palette';
+import { HelpOverlay } from '@/components/help-overlay';
 import { SettingsDialog } from '@/components/settings-dialog';
 import {
   CardsPanel,
@@ -43,7 +44,11 @@ import { GraphCanvas } from '@/components/graph/graph-canvas';
 import { LegendPanel } from '@/components/graph/legend-panel';
 import { NodePanel } from '@/components/graph/node-panel';
 import { StatusPanel } from '@/components/graph/status-panel';
-import type { CanvasController, ViewSummary } from '@/graph/canvas-controller';
+import type {
+  CanvasController,
+  ChangeMarker,
+  ViewSummary,
+} from '@/graph/canvas-controller';
 import { DIRECTORY_KIND, ROOT_ID, type GraphModel, type ModelNode } from '@/graph/model';
 import { useNodeDetail } from '@/graph/use-node-detail';
 import type { ColorMode } from '@/graph/palette';
@@ -68,6 +73,7 @@ export default function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
 
   const [cards, setCards] = useState<Card[]>([]);
   const [activeId, setActiveId] = useState<string>(PROJECT_VIEW_ID);
@@ -93,6 +99,15 @@ export default function App() {
   /** Colour keys currently on the disk — the LEGEND's only input. */
   const [colorKeys, setColorKeys] = useState<string[]>([]);
   const colorKeysRef = useRef('');
+  /**
+   * Legend categories switched off (round 4). Deliberately SESSION state, not
+   * URL state: hiding a kind is how you are reading the disk this minute, not
+   * the view you would send someone — the same reasoning that keeps the sort
+   * mode in settings rather than the hash.
+   */
+  const [hiddenColorKeys, setHiddenColorKeys] = useState<string[]>([]);
+  /** The node IMPACT mode is showing dependents of, if any. */
+  const [impactNodeId, setImpactNodeId] = useState<string | null>(null);
 
   const detailState = useNodeDetail(selectedNode);
 
@@ -142,7 +157,7 @@ export default function App() {
     }
   }, []);
 
-  /** Changes are re-read whenever the index moves while the view is on show. */
+  /** Changes are re-read whenever the index moves — see the effect below. */
   const loadChanges = useCallback(async () => {
     try {
       const payload = await fetchChanges();
@@ -155,13 +170,33 @@ export default function App() {
     }
   }, []);
 
+  /** The markers themselves: file node id → share of its lines added/removed. */
   useEffect(() => {
-    if (activeId !== CHANGES_VIEW_ID) return;
-    void loadChanges().then((payload) => {
-      if (payload) applyChanges(payload);
-    });
-    // `dataVersion` is the contract's "something changed" signal.
-  }, [activeId, status?.dataVersion, loadChanges]);
+    controllerRef.current?.setChangeMarkers(changeMarkers(changes, model));
+  }, [changes, model]);
+
+  useEffect(() => {
+    controllerRef.current?.setHiddenColorKeys(hiddenColorKeys);
+  }, [hiddenColorKeys]);
+
+  /**
+   * IMPACT mode. The closure is computed **client-side**: the model already
+   * holds every non-`contains` edge indexed by node (`edgesOf`), so walking
+   * incoming edges outward is a local graph walk — no request, no latency, and
+   * no second source of truth to disagree with the disk. (`/api/changes` runs
+   * the server's own `getImpactRadius`, but that is depth-2 and seeded from a
+   * whole changeset; this question is "everything that transitively depends on
+   * THIS", which is a different walk.)
+   */
+  useEffect(() => {
+    const controller = controllerRef.current;
+    if (!controller) return;
+    if (!impactNodeId || !model) {
+      controller.setImpact(null);
+      return;
+    }
+    controller.setImpact(impactClosure(model, impactNodeId));
+  }, [impactNodeId, model]);
 
   // --------------------------------------------------------------- cards ---
 
@@ -227,6 +262,20 @@ export default function App() {
     },
     [model, applyChanges, applyResult, loadChanges]
   );
+
+  /**
+   * Changes are read for EVERY view now, not just the Changes card (round 4):
+   * the disk carries a permanent added/removed marker on each changed file, so
+   * the payload is part of the normal picture rather than a mode. It is one git
+   * call against the working tree, refreshed on the contract's `dataVersion`
+   * signal, and it only ever touches files that actually changed.
+   */
+  useEffect(() => {
+    if (!status?.indexed) return;
+    void loadChanges().then((payload) => {
+      if (payload && activeRef.current === CHANGES_VIEW_ID) applyChanges(payload);
+    });
+  }, [status?.indexed, status?.dataVersion, loadChanges, applyChanges]);
 
   /**
    * Ask a question. The deterministic explore is what lands the card — the
@@ -472,35 +521,82 @@ export default function App() {
         setPaletteOpen(true);
         return;
       }
-      if (event.key !== 'Escape') return;
-      if (paletteOpen) {
-        event.preventDefault();
-        setPaletteOpen(false);
+
+      if (event.key === 'Escape') {
+        if (paletteOpen) {
+          event.preventDefault();
+          setPaletteOpen(false);
+          return;
+        }
+        if (helpOpen) {
+          event.preventDefault();
+          setHelpOpen(false);
+          return;
+        }
+        if (settingsOpen) {
+          event.preventDefault();
+          setSettingsOpen(false);
+          void refreshSettings();
+          return;
+        }
+        if (feedbackOpen) {
+          event.preventDefault();
+          setFeedbackOpen(false);
+          return;
+        }
+        if (selectedNode) {
+          event.preventDefault();
+          clearSelection();
+        }
         return;
       }
-      if (settingsOpen) {
+
+      // Arrow navigation belongs to the DISK, so it stands down whenever
+      // something else owns the keyboard: a dialog, or a field being typed in.
+      if (paletteOpen || settingsOpen || feedbackOpen || helpOpen) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (isTypingTarget(event.target)) return;
+
+      const move = ARROW_MOVES[event.key];
+      if (move) {
         event.preventDefault();
-        setSettingsOpen(false);
-        void refreshSettings();
+        controllerRef.current?.moveSelection(move);
         return;
       }
-      if (feedbackOpen) {
+      if (event.key === 'Enter') {
         event.preventDefault();
-        setFeedbackOpen(false);
-        return;
-      }
-      if (selectedNode) {
-        event.preventDefault();
-        clearSelection();
+        controllerRef.current?.enterSelected();
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [paletteOpen, settingsOpen, feedbackOpen, selectedNode, clearSelection, refreshSettings]);
+  }, [
+    paletteOpen,
+    settingsOpen,
+    feedbackOpen,
+    helpOpen,
+    selectedNode,
+    clearSelection,
+    refreshSettings,
+  ]);
+
+  /** A different node is a different question — impact mode never carries over. */
+  useEffect(() => {
+    setImpactNodeId(null);
+  }, [selectedNode?.id]);
 
   /** Select a node and bring it on screen — used by the palette and the panel. */
   const navigate = useCallback((id: string) => {
     controllerRef.current?.reveal(id);
+  }, []);
+
+  /**
+   * The ⌘P landing. Same reveal, plus a short PULSE on the wedge it lands on:
+   * a re-root can move the whole picture, and "which of these 300 arcs did I
+   * just ask for" is a question the user should not have to answer by reading.
+   */
+  const navigateFromSearch = useCallback((id: string) => {
+    controllerRef.current?.reveal(id, true);
   }, []);
 
   // ------------------------------------------------------------ feedback ---
@@ -552,6 +648,7 @@ export default function App() {
             onIndex={() => void runIndex()}
             onOpenPalette={() => setPaletteOpen(true)}
             onOpenSettings={() => setSettingsOpen(true)}
+            onOpenHelp={() => setHelpOpen(true)}
           />
 
           <CardsPanel
@@ -578,6 +675,12 @@ export default function App() {
             onModeChange={setColorMode}
             layers={model?.layers ?? []}
             present={colorKeys}
+            hidden={hiddenColorKeys}
+            onToggleKey={(key) =>
+              setHiddenColorKeys((keys) =>
+                keys.includes(key) ? keys.filter((entry) => entry !== key) : [...keys, key]
+              )
+            }
             onFit={() => controllerRef.current?.fitView()}
             collapsed={legendPanelCollapsed}
             onToggleCollapsed={() => setLegendPanelCollapsed((value) => !value)}
@@ -597,6 +700,10 @@ export default function App() {
             error={detailState.error}
             root={status?.root ?? null}
             onNavigate={navigate}
+            impact={impactNodeId === selectedNode.id}
+            onToggleImpact={() =>
+              setImpactNodeId((current) => (current === selectedNode.id ? null : selectedNode.id))
+            }
             collapsed={nodePanelCollapsed}
             onToggleCollapsed={() => setNodePanelCollapsed((value) => !value)}
             // The node panel yields the lower half to the code — unless there
@@ -621,7 +728,12 @@ export default function App() {
         </div>
       ) : null}
 
-      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} onPick={navigate} />
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        onPick={navigateFromSearch}
+      />
+      <HelpOverlay open={helpOpen} onClose={() => setHelpOpen(false)} />
       <SettingsDialog
         open={settingsOpen}
         onSortModeChange={setSortMode}
@@ -667,6 +779,93 @@ function sameHashState(a: HashState, b: HashState): boolean {
     a.edgeKinds.length === b.edgeKinds.length &&
     a.edgeKinds.every((kind, index) => kind === b.edgeKinds[index])
   );
+}
+
+/** Arrow key → the move it makes on the disk. */
+const ARROW_MOVES: Record<string, 'prev' | 'next' | 'up' | 'down'> = {
+  ArrowLeft: 'prev',
+  ArrowRight: 'next',
+  ArrowUp: 'up',
+  ArrowDown: 'down',
+};
+
+/** Is the keyboard currently owned by a field the user is typing into? */
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
+/** Nodes walked before an impact closure gives up and reports what it has. */
+const IMPACT_CAP = 4000;
+
+/**
+ * The selected node and everything that TRANSITIVELY depends on it.
+ *
+ * Dependents are found by walking edges BACKWARDS — an edge's source depends on
+ * its target — from the node and (for a file or a class) everything it
+ * contains, because "what breaks if I change this file" means the callers of
+ * the symbols in it. `contains` is not in the edge set at all, so the walk can
+ * only ever follow real relations. Capped, like every other traversal here: an
+ * unbounded closure on a project root would light the entire disk, which is the
+ * same as lighting none of it.
+ */
+function impactClosure(model: GraphModel, id: string): string[] {
+  const seen = new Set<string>([id]);
+  for (const descendant of model.descendants(id)) {
+    if (seen.size >= IMPACT_CAP) break;
+    seen.add(descendant);
+  }
+  const stack = [...seen];
+  while (stack.length > 0 && seen.size < IMPACT_CAP) {
+    const current = stack.pop()!;
+    for (const edge of model.edgesOf(current)) {
+      if (edge.target !== current || edge.source === current) continue;
+      if (seen.has(edge.source)) continue;
+      seen.add(edge.source);
+      stack.push(edge.source);
+    }
+  }
+  return [...seen];
+}
+
+/**
+ * Change markers: for every changed file the index still knows, the share of
+ * its own lines that were added and removed (each clamped to 1, since a file
+ * can gain more lines than it currently has).
+ */
+function changeMarkers(
+  changes: ChangesPayload | null,
+  model: GraphModel | null
+): Array<[string, ChangeMarker]> {
+  if (!changes || !model) return [];
+  const counts = new Map<string, { added: number; removed: number }>();
+  for (const hunk of changes.hunks) {
+    let entry = counts.get(hunk.file);
+    if (!entry) {
+      entry = { added: 0, removed: 0 };
+      counts.set(hunk.file, entry);
+    }
+    for (const line of hunk.lines) {
+      if (line.type === 'add') entry.added++;
+      else if (line.type === 'del') entry.removed++;
+    }
+  }
+
+  const markers: Array<[string, ChangeMarker]> = [];
+  for (const file of changes.changedFiles) {
+    if (!file.nodeId) continue;
+    const node = model.get(file.nodeId);
+    const count = counts.get(file.path);
+    if (!node || !count) continue;
+    const loc = Math.max(1, node.weight);
+    markers.push([
+      file.nodeId,
+      { added: Math.min(1, count.added / loc), removed: Math.min(1, count.removed / loc) },
+    ]);
+  }
+  return markers;
 }
 
 /** A node as the feedback export cites it (`path:start-end`). */

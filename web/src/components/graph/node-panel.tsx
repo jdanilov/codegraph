@@ -33,6 +33,7 @@ import {
   ChevronRight,
   Loader2,
   SquareArrowOutUpRight,
+  Waypoints,
 } from 'lucide-react';
 
 import { PanelButton, SidePanel } from './side-panel';
@@ -57,6 +58,10 @@ export interface NodePanelProps {
   root: string | null;
   /** Select the node and bring it into view on the canvas. */
   onNavigate(id: string): void;
+  /** Is IMPACT mode on for this node? */
+  impact: boolean;
+  /** Toggle impact mode — the shell owns the closure and the dimming. */
+  onToggleImpact(): void;
   collapsed: boolean;
   onToggleCollapsed(): void;
   /** Height policy from the shell — it knows whether the code panel is up. */
@@ -71,6 +76,8 @@ export function NodePanel({
   error,
   root,
   onNavigate,
+  impact,
+  onToggleImpact,
   collapsed,
   onToggleCollapsed,
   className,
@@ -109,9 +116,21 @@ export function NodePanel({
       }
       meta={node.kind.replace(/_/g, ' ')}
       actions={
-        isDirectory ? null : (
-          <EditorJump root={root} file={node.file} line={node.startLine || 1} />
-        )
+        <>
+          {/* IMPACT (round 4): this node plus everything that transitively
+              depends on it, lit; the rest of the disk dimmed. */}
+          <PanelButton
+            onClick={onToggleImpact}
+            active={impact}
+            label={impact ? 'Clear impact' : 'Show what depends on this (impact)'}
+            data-testid="impact-toggle"
+          >
+            <Waypoints className="h-3.5 w-3.5" />
+          </PanelButton>
+          {isDirectory ? null : (
+            <EditorJump root={root} file={node.file} line={node.startLine || 1} />
+          )}
+        </>
       }
     >
       <dl className="flex flex-col gap-1">
@@ -223,15 +242,15 @@ const INCOMING_KIND_LABELS: Record<string, string> = {
 };
 
 /**
- * EDGES — the two directions **side by side**, under one heading (round 3).
+ * EDGES — the two directions **stacked, one after the other** (round 4).
  *
- * They used to stack: `outgoing · N` and every kind group under it, then
- * `incoming · M` and every kind group under THAT, which pushed the incoming
- * half off the bottom of a panel that already shares its column with the code.
- * Two columns halve the height and put the question the panel exists to answer
- * — what reaches this, what does it reach — in one screen. Everything inside a
- * column is unchanged: grouped by kind, qualified names, and `extended by` for
- * an incoming `extends`.
+ * Round 3 put them in two columns; that treatment belongs to the LEGEND on the
+ * left, which says what the two edge colours mean in one row. Here the two
+ * lists are the panel's content, and halving their width halved the room a
+ * qualified name (`analytics.send`) has to be readable in — which is the whole
+ * reason the names are qualified. Outgoing first (what this reaches), then
+ * incoming (what reaches it). Everything inside a group is unchanged: grouped
+ * by kind, qualified names, and `extended by` for an incoming `extends`.
  */
 function EdgesSection({
   incoming,
@@ -248,26 +267,24 @@ function EdgesSection({
 }) {
   if (incoming.length === 0 && outgoing.length === 0) return null;
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex flex-col gap-1.5">
       <div className="text-[10px] uppercase tracking-[0.18em] text-muted">edges</div>
-      <div className="grid grid-cols-2 items-start gap-x-2">
-        <RelationColumn
-          title="incoming"
-          arrow="←"
-          relations={incoming}
-          model={model}
-          contextFile={contextFile}
-          onNavigate={onNavigate}
-        />
-        <RelationColumn
-          title="outgoing"
-          arrow="→"
-          relations={outgoing}
-          model={model}
-          contextFile={contextFile}
-          onNavigate={onNavigate}
-        />
-      </div>
+      <RelationColumn
+        title="outgoing"
+        arrow="→"
+        relations={outgoing}
+        model={model}
+        contextFile={contextFile}
+        onNavigate={onNavigate}
+      />
+      <RelationColumn
+        title="incoming"
+        arrow="←"
+        relations={incoming}
+        model={model}
+        contextFile={contextFile}
+        onNavigate={onNavigate}
+      />
     </div>
   );
 }
@@ -289,6 +306,9 @@ function RelationColumn({
 }) {
   const incoming = title === 'incoming';
   const groups = useMemo(() => groupByKind(relations), [relations]);
+  // Stacked (round 4): an empty half is left out entirely rather than printed
+  // as a `· 0` heading over nothing.
+  if (relations.length === 0) return null;
   return (
     <div className="flex min-w-0 flex-col gap-1" data-testid={`edges-${title}`}>
       <div className="text-[10px] text-muted/80">

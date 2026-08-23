@@ -10,8 +10,13 @@
  * The panel carries the two colour vocabularies:
  *
  *  - **arcs** — the active colour mode's swatches, listing only what is
- *    actually mounted, so it shrinks as you drill in;
- *  - **edges** — direction: incoming green, outgoing amber.
+ *    actually mounted, so it shrinks as you drill in. A swatch is also a
+ *    FILTER (round 4): clicking one makes that category invisible on the disk
+ *    — not dimmed, absent — while the layout stays exactly as it was, so
+ *    nothing moves under the cursor. A switched-off row is drawn muted.
+ *  - **edges** — direction, as one compact row: `EDGES ● incoming ● outgoing`.
+ *    This is where the side-by-side treatment belongs; the node panel's own
+ *    incoming/outgoing lists are stacked, one after the other (round 4).
  *
  * Every value is imported from `@/graph/palette`, never re-typed here: the
  * canvas paints from the same tables, so the legend cannot drift from the disk.
@@ -41,6 +46,10 @@ export interface LegendPanelProps {
   layers: string[];
   /** Kinds (or layers) present in the mounted slice. */
   present: string[];
+  /** Categories currently switched OFF — invisible on the disk. */
+  hidden: string[];
+  /** Toggle one category's visibility. */
+  onToggleKey(key: string): void;
   /** Reset zoom and centre the disk. */
   onFit(): void;
   collapsed: boolean;
@@ -52,10 +61,13 @@ export function LegendPanel({
   onModeChange,
   layers,
   present,
+  hidden,
+  onToggleKey,
   onFit,
   collapsed,
   onToggleCollapsed,
 }: LegendPanelProps) {
+  const off = new Set(hidden);
   const entries = legendEntries(mode, new Set(present), layers);
   const canSwitch = layers.length > 0;
 
@@ -110,38 +122,53 @@ export function LegendPanel({
 
       {collapsed ? null : (
         <>
-          <ul className="mt-2.5 flex max-h-48 flex-col gap-1 overflow-auto">
-            {entries.map((entry) => (
-              <li key={entry.key} className="flex items-center gap-2 text-[11px] text-muted">
-                <span
-                  className="h-2.5 w-2.5 shrink-0 rounded-full"
-                  style={{ backgroundColor: entry.color }}
-                />
-                <span className="truncate">{entry.label}</span>
-              </li>
-            ))}
+          <ul className="mt-2.5 flex max-h-48 flex-col gap-0.5 overflow-auto">
+            {entries.map((entry) => {
+              const isOff = off.has(entry.key);
+              return (
+                <li key={entry.key}>
+                  <button
+                    type="button"
+                    onClick={() => onToggleKey(entry.key)}
+                    data-testid="legend-swatch"
+                    data-off={isOff}
+                    title={isOff ? `Show ${entry.label}` : `Hide ${entry.label}`}
+                    className={cn(
+                      'flex w-full items-center gap-2 rounded px-1 py-[2px] text-left text-[11px]',
+                      isOff ? 'text-muted/40' : 'text-muted hover:bg-accent/10 hover:text-foreground'
+                    )}
+                  >
+                    <span
+                      className={cn('h-2.5 w-2.5 shrink-0 rounded-full', isOff && 'opacity-25')}
+                      style={{ backgroundColor: entry.color }}
+                    />
+                    <span className={cn('truncate', isOff && 'line-through')}>{entry.label}</span>
+                  </button>
+                </li>
+              );
+            })}
             {entries.length === 0 ? (
               <li className="text-[11px] text-muted">nothing mounted</li>
             ) : null}
           </ul>
 
-          <div className="mt-2.5 border-t border-border/60 pt-2">
+          {/* EDGES — one compact row, which is where the side-by-side
+              incoming|outgoing treatment lives (round 4). */}
+          <div className="mt-2.5 flex items-center gap-3 border-t border-border/60 pt-2">
             <span className="text-[9px] uppercase tracking-[0.18em] text-muted">edges</span>
-            <ul className="mt-1 flex flex-col gap-1">
-              {EDGE_DIRECTION_LEGEND.map((entry) => (
-                <li
-                  key={entry.key}
-                  className="flex items-center gap-2 text-[11px] text-muted"
-                  title={entry.meaning}
-                >
-                  <span
-                    className="h-0.5 w-3.5 shrink-0 rounded-full"
-                    style={{ backgroundColor: entry.color }}
-                  />
-                  <span className="truncate">{entry.label}</span>
-                </li>
-              ))}
-            </ul>
+            {EDGE_DIRECTION_LEGEND.map((entry) => (
+              <span
+                key={entry.key}
+                className="flex items-center gap-1.5 text-[11px] text-muted"
+                title={entry.meaning}
+              >
+                <span
+                  className="h-2 w-2 shrink-0 rounded-full"
+                  style={{ backgroundColor: entry.color }}
+                />
+                {entry.label}
+              </span>
+            ))}
           </div>
         </>
       )}
