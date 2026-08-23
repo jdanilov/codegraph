@@ -71,8 +71,47 @@ export const MAX_ARCS = 2000;
  */
 export const MAX_SLOTS_PER_PARENT = 96;
 
-/** Radius of the centre disk (the current root). */
+/** Base radius of the centre disk — the ×1 of {@link centreRadiusFor}. */
 export const CENTRE_RADIUS = 62;
+
+/** The PROJECT root's centre circle, as a multiple of {@link CENTRE_RADIUS}. */
+export const CENTRE_SCALE_MAX = 1.6;
+/** The smallest possible root's centre circle, same multiple. */
+export const CENTRE_SCALE_MIN = 0.8;
+
+/**
+ * How big THIS disk's centre circle is, from what it holds.
+ *
+ * The centre circle used to be one fixed size on every disk, which made a disk
+ * rooted at a 12-line helper and a disk rooted at the whole project look
+ * equally important — in a multi-disk workspace that is the one thing the
+ * centre should say. It is now proportional to the root's LoC on a **log**
+ * scale, because LoC across a project spans four or five orders of magnitude
+ * and a linear scale would collapse every disk but the project root onto the
+ * floor.
+ *
+ * The scale is pinned at both ends and interpolated between them:
+ *
+ *   - a root weighing the WHOLE project → exactly {@link CENTRE_SCALE_MAX};
+ *   - a root of one line (the smallest a root can be) → exactly
+ *     {@link CENTRE_SCALE_MIN};
+ *   - anything between → `log(rootLoc) / log(projectTotalLoc)` of the way.
+ *
+ * Pure and deterministic: it depends only on the two numbers, and
+ * `projectTotalLoc` is constant across every disk of a workspace, so two disks
+ * rooted at equally-sized subtrees get equally-sized centres wherever they sit.
+ *
+ * Every ring radius derives from the result (rings start at the centre's edge),
+ * so a bigger centre pushes the whole disk outward — which is the point.
+ */
+export function centreRadiusFor(rootLoc: number, projectTotalLoc: number): number {
+  const root = Math.max(1, rootLoc);
+  const total = Math.max(1, projectTotalLoc);
+  // A one-line project (or a root at/over the total) is the whole project.
+  const denominator = Math.log(total);
+  const t = denominator <= 0 ? 1 : Math.min(1, Math.log(root) / denominator);
+  return CENTRE_RADIUS * (CENTRE_SCALE_MIN + (CENTRE_SCALE_MAX - CENTRE_SCALE_MIN) * t);
+}
 
 /**
  * Base radial thickness of ring *n* — rings get slightly thinner outward, so
@@ -171,14 +210,29 @@ const MAX_DEPTH_FACTOR = MAX_LABEL_DEPTH_FACTOR;
  * Otherwise only a FALLBACK for a controller with no layout yet — a real layout
  * reports its own `maxRadius`, which is what the camera fits to.
  */
-export const MAX_RADIUS = (() => {
-  let radius = CENTRE_RADIUS;
+const RINGS_MAX_DEPTH = (() => {
+  let depth = 0;
   for (let ring = 1; ring <= MAX_RINGS; ring++) {
-    if (ring > 1) radius += RING_GAP;
-    radius += ringThickness(ring) * MAX_DEPTH_FACTOR;
+    if (ring > 1) depth += RING_GAP;
+    depth += ringThickness(ring) * MAX_DEPTH_FACTOR;
   }
-  return radius;
+  return depth;
 })();
+
+/**
+ * The radial ceiling for a disk whose centre circle is `centreRadius`.
+ *
+ * The ring stack is the same depth on every disk, so the ceiling simply RIDES
+ * the centre: a disk with a bigger centre gets the same six rings pushed
+ * outward, rather than the same outer radius with its rings squeezed. Without
+ * this the deepest branch of a project-root disk would be cut ~37 units short
+ * purely because its centre grew.
+ */
+export function maxRadiusFor(centreRadius: number): number {
+  return centreRadius + RINGS_MAX_DEPTH;
+}
+
+export const MAX_RADIUS = maxRadiusFor(CENTRE_RADIUS);
 
 /** Sibling ORDER. The angle is always the LoC share — only order changes. */
 export type SortMode = 'structural' | 'size';
@@ -582,6 +636,14 @@ export function computeSunburst(
   const root = model.get(requestedRootId) ?? model.get(ROOT_ID)!;
   const rootId = root.id;
 
+  // This disk's own centre size, from what it holds against what the PROJECT
+  // holds — the second number is the project root's LoC, so it is the same for
+  // every disk of a workspace and two equally-weighted roots always agree.
+  const rootLoc = sizes.get(rootId) ?? root.weight;
+  const projectTotalLoc = sizes.get(ROOT_ID) ?? rootLoc;
+  const centreRadius = centreRadiusFor(rootLoc, projectTotalLoc);
+  const radiusCeiling = maxRadiusFor(centreRadius);
+
   const arcs: SunburstArc[] = [];
   const byKey = new Map<string, SunburstArc>();
   const byNode = new Map<string, SunburstArc>();
@@ -602,10 +664,10 @@ export function computeSunburst(
   }
 
   let frontier: Frontier[] = [
-    { arc: null, nodeId: rootId, a0: START_ANGLE, a1: START_ANGLE + TAU, r0: CENTRE_RADIUS },
+    { arc: null, nodeId: rootId, a0: START_ANGLE, a1: START_ANGLE + TAU, r0: centreRadius },
   ];
   let rings = 0;
-  let maxRadius = CENTRE_RADIUS;
+  let maxRadius = centreRadius;
 
   for (let ring = 1; ring <= maxRings && frontier.length > 0; ring++) {
     const thickness = ringThickness(ring);
@@ -627,7 +689,7 @@ export function computeSunburst(
       // The radius budget is the other half of the depth cap: a branch that
       // has run out of disk folds here exactly as a too-deep one does.
       const r0 = item.r0;
-      if (r0 >= MAX_RADIUS) {
+      if (r0 >= radiusCeiling) {
         if (item.arc) item.arc.hiddenChildren = childIds.length;
         truncated = true;
         continue;
@@ -725,7 +787,7 @@ export function computeSunburst(
           a0,
           a1,
           r0,
-          r1: Math.min(MAX_RADIUS, r0 + depth),
+          r1: Math.min(radiusCeiling, r0 + depth),
           parentKey: item.arc?.key ?? null,
           parentNodeId: item.nodeId,
           weight: slot.size,
@@ -821,9 +883,9 @@ export function computeSunburst(
     byRing,
     rings,
     truncated,
-    rootLoc: sizes.get(rootId) ?? root.weight,
+    rootLoc,
     sort,
-    centreRadius: CENTRE_RADIUS,
+    centreRadius,
     maxRadius,
   };
 }

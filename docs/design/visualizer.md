@@ -1073,6 +1073,30 @@ way an agent does.
   endpoints, so a returned `nodeIds`/`flow` can only name nodes inside the
   scope.
 
+### Disk identity — centre size and border (additive; no contract item changed)
+
+In a multi-disk workspace the centre circle is what a disk IS, so it now says
+so twice over:
+
+- **Centre size is the root's LoC on a log scale.** `centreRadiusFor(rootLoc,
+  projectTotalLoc)` pins both ends — a root holding the whole project gets
+  exactly ×1.6 of the base `CENTRE_RADIUS`, a one-line root exactly ×0.8 — and
+  interpolates `log(rootLoc)/log(projectTotalLoc)` between them. Log, because
+  LoC spans four or five orders of magnitude and a linear scale would collapse
+  every disk but the project root onto the floor. Pure and deterministic:
+  `projectTotalLoc` is constant across a workspace, so two equally-weighted
+  roots get equal centres wherever they sit. The ring stack RIDES the centre
+  (`maxRadiusFor(centreRadius)`): a bigger centre pushes the same six rings
+  outward rather than squeezing them, and the parent→child `RING_GAP` invariant
+  is unchanged.
+- **Centre border is the root's colour.** A 2.5-unit border ring carries the
+  disk root's own colour under the ACTIVE colour mode, through the same
+  `colorForNode` + palette the wedges use — grey for a directory, the kind's
+  (or layer's) colour otherwise — and re-colours when the mode switches,
+  because it is derived, not stored. Hover and keyboard-focus rings are drawn
+  just OUTSIDE the identity border instead of replacing it: losing a disk's
+  colour the moment you point at it is the wrong trade.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all

@@ -249,6 +249,16 @@ const GLOW_RESULT = '#67e8f9';
 const CENTRE_FILL = 'rgba(24, 33, 52, 0.92)';
 const CENTRE_STROKE = 'rgba(140, 165, 205, 0.45)';
 
+/**
+ * Width of the centre circle's identity border, in LAYOUT units.
+ *
+ * The border carries the disk root's own colour under the active colour mode
+ * (see {@link CanvasController.drawCentre}). 2.5 reads clearly at every zoom
+ * without becoming a second ring competing with the wedges — the same range the
+ * change markers and the focus ring already live in.
+ */
+const CENTRE_BORDER = 2.5;
+
 /** Phase G chrome: the drag ghost, the close `×`, the expansion tether. */
 const GHOST_RADIUS_PX = 44;
 const GHOST_STROKE = 'rgba(140, 200, 255, 0.75)';
@@ -1557,15 +1567,33 @@ export class CanvasController {
     ctx.arc(0, 0, layout.centreRadius - 3, 0, Math.PI * 2);
     ctx.fillStyle = CENTRE_FILL;
     ctx.fill();
-    // The focus ring only appears once there is more than one disk: with one
-    // disk "which disk has the keyboard" is not a question anyone is asking.
-    ctx.strokeStyle = hoveredHere
-      ? 'rgba(255,255,255,0.7)'
-      : this.disks.length > 1 && disk.id === this.focusedDiskId
-        ? FOCUS_RING
-        : CENTRE_STROKE;
-    ctx.lineWidth = (this.disks.length > 1 && disk.id === this.focusedDiskId ? 2 : 1.4) / k;
+
+    // The border says WHAT THIS DISK IS ROOTED AT: the root's own colour under
+    // the ACTIVE colour mode, through the same `colorForNode` + palette the
+    // wedges use — grey for a directory, its kind's (or layer's) colour for a
+    // file/class/function. Together with the size (which says how much it
+    // holds) it gives every disk in a workspace an identity you can read
+    // without following a tether. It re-colours when the mode switches,
+    // because it is derived, not stored.
+    ctx.strokeStyle = this.model
+      ? colorForNode(layout.root, this.colorMode, this.model.layers)
+      : CENTRE_STROKE;
+    ctx.lineWidth = CENTRE_BORDER / k;
     ctx.stroke();
+
+    // Hover and keyboard focus are TRANSIENT states, so they are drawn just
+    // outside the identity border rather than replacing it — losing a disk's
+    // colour the moment you point at it is exactly the wrong trade. The focus
+    // ring only appears once there is more than one disk: with one disk "which
+    // disk has the keyboard" is not a question anyone is asking.
+    const focusedHere = this.disks.length > 1 && disk.id === this.focusedDiskId;
+    if (hoveredHere || focusedHere) {
+      ctx.beginPath();
+      ctx.arc(0, 0, layout.centreRadius - 0.6, 0, Math.PI * 2);
+      ctx.strokeStyle = hoveredHere ? 'rgba(255,255,255,0.7)' : FOCUS_RING;
+      ctx.lineWidth = (focusedHere && !hoveredHere ? 2 : 1.4) / k;
+      ctx.stroke();
+    }
 
     // The centre names WHERE YOU ARE (round 2): the current root, prominent,
     // with the LoC the disk in front of you weighs under it. It is still a
