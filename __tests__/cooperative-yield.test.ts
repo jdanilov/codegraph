@@ -12,7 +12,7 @@
  * reintroduce the wedge, and the AsyncFunction assertions fail loudly if so.
  */
 import { describe, it, expect } from 'vitest';
-import { createYielder, DEFAULT_YIELD_BUDGET_MS } from '../src/resolution/cooperative-yield';
+import { createYielder, DEFAULT_YIELD_BUDGET_MS, MaybeYield } from '../src/resolution/cooperative-yield';
 import { synthesizeCallbackEdges } from '../src/resolution/callback-synthesizer';
 import { ReferenceResolver } from '../src/resolution/index';
 
@@ -24,7 +24,7 @@ import { ReferenceResolver } from '../src/resolution/index';
  * `setImmediate`), the earlier `setImmediate` — queued first, FIFO — has fired.
  * This makes "did it yield?" a deterministic, non-timing assertion.
  */
-async function yieldedDuring(maybeYield: () => Promise<void>): Promise<boolean> {
+async function yieldedDuring(maybeYield: MaybeYield): Promise<boolean> {
   let macrotaskRan = false;
   setImmediate(() => { macrotaskRan = true; });
   await maybeYield();

@@ -16,12 +16,12 @@ export function scoreSearchNodes(
   let firstRank = 0;
 
   for (let i = 0; i < expectedLower.length; i++) {
-    const idx = resultNames.indexOf(expectedLower[i]);
+    const idx = resultNames.indexOf(expectedLower[i]!);
     if (idx !== -1) {
-      found.push(expectedSymbols[i]);
+      found.push(expectedSymbols[i]!);
       if (firstRank === 0) firstRank = idx + 1;
     } else {
-      missed.push(expectedSymbols[i]);
+      missed.push(expectedSymbols[i]!);
     }
   }
 
@@ -45,7 +45,6 @@ export function scoreFindRelevantContext(
   subgraph: { nodes: Map<string, { name: string }>; edges: unknown[]; roots: string[] },
   latencyMs: number
 ): EvalResult {
-  const expectedLower = new Set(expectedSymbols.map((s) => s.toLowerCase()));
   const nodeNames = new Set<string>();
   for (const node of subgraph.nodes.values()) {
     nodeNames.add(node.name.toLowerCase());

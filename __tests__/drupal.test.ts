@@ -259,7 +259,7 @@ mod.api:
   });
 
   it('returns empty result for non-routing-yml files', () => {
-    const { nodes, references } = drupalResolver.extract!(
+    const { nodes } = drupalResolver.extract!(
       'mymodule.module',
       '<?php\n',
     );

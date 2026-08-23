@@ -29,7 +29,7 @@ function sourcedFiles(text: string): string[] {
   const out: string[] = [];
   for (const line of text.split('\n')) {
     const m = line.match(/^\*\*`(.+?)`\*\* —/);
-    if (m) out.push(m[1].trim());
+    if (m) out.push(m[1]!.trim());
   }
   return out;
 }
@@ -82,7 +82,7 @@ describe('codegraph_explore — NL-stopword collision guard', () => {
       `  return latest;\n` +
       `}\n`);
 
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });

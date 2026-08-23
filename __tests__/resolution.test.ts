@@ -10,12 +10,11 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
-import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
+import { ReferenceResolver, ResolutionContext } from '../src/resolution';
 import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile, matchMethodCall } from '../src/resolution/name-matcher';
 import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
-import { QueryBuilder } from '../src/db/queries';
 import { DatabaseConnection } from '../src/db';
 
 describe('Resolution Module', () => {
@@ -64,6 +63,8 @@ describe('Resolution Module', () => {
         readFile: () => null,
         getProjectRoot: () => '/test',
         getAllFiles: () => ['test.ts'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const ref = {
@@ -341,6 +342,8 @@ describe('Resolution Module', () => {
         readFile: () => null,
         getProjectRoot: () => '/test',
         getAllFiles: () => ['user.ts'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const ref = {
@@ -533,6 +536,8 @@ describe('Resolution Module', () => {
         readFile: () => null,
         getProjectRoot: () => '',
         getAllFiles: () => ['src/components/utils.ts', 'src/components/utils/index.ts'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const result = resolveImportPath(
@@ -555,6 +560,8 @@ describe('Resolution Module', () => {
         readFile: () => null,
         getProjectRoot: () => '',
         getAllFiles: () => ['src/helpers.ts', 'src/helpers/index.ts'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const result = resolveImportPath(
@@ -618,6 +625,8 @@ from ..services import auth_service
       readFile: () => null,
       getProjectRoot: () => '',
       getAllFiles: () => [],
+      getNodesByLowerName: () => [],
+      getImportMappings: () => [],
     });
     const node = (id: string, name: string, qualifiedName: string, kind: Node['kind'] = 'class', language: Node['language'] = 'kotlin'): Node => ({
       id, kind, name, qualifiedName,
@@ -734,6 +743,8 @@ from ..services import auth_service
         },
         getProjectRoot: () => '/test',
         getAllFiles: () => ['package.json', 'src/App.tsx'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const frameworks = detectFrameworks(context);
@@ -757,6 +768,8 @@ from ..services import auth_service
         },
         getProjectRoot: () => '/test',
         getAllFiles: () => ['package.json', 'src/app.js'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const frameworks = detectFrameworks(context);
@@ -773,6 +786,8 @@ from ..services import auth_service
         readFile: () => null,
         getProjectRoot: () => '/test',
         getAllFiles: () => ['artisan', 'app/Http/Kernel.php'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const frameworks = detectFrameworks(context);
@@ -820,6 +835,8 @@ from ..services import auth_service
         },
         getProjectRoot: () => '/test',
         getAllFiles: () => ['package.json', 'src/Button.tsx', 'src/App.tsx'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const frameworks = detectFrameworks(context);
@@ -829,7 +846,7 @@ from ..services import auth_service
       const ref = {
         fromNodeId: 'component:src/App.tsx:App:1',
         referenceName: 'Button',
-        referenceKind: 'renders' as const,
+        referenceKind: 'references' as const,
         line: 10,
         column: 5,
         filePath: 'src/App.tsx',
@@ -883,6 +900,8 @@ from ..services import auth_service
         },
         getProjectRoot: () => '/test',
         getAllFiles: () => ['package.json', 'src/hooks/useAuth.ts'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const frameworks = detectFrameworks(context);
@@ -1662,6 +1681,8 @@ func main() {
       readFile: () => null,
       getProjectRoot: () => '',
       getAllFiles: () => [],
+      getNodesByLowerName: () => [],
+      getImportMappings: () => [],
     });
 
     it('prefers the definition in the call site\'s own file (#1079)', () => {
@@ -1761,6 +1782,8 @@ func main() {
         readFile: () => null,
         getProjectRoot: () => '',
         getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
       const ref: UnresolvedRef = {
         fromNodeId: 'caller', referenceName: 'Logger::log', referenceKind: 'calls',
@@ -1876,6 +1899,8 @@ func main() {
         readFile: () => null,
         getProjectRoot: () => '',
         getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
       const refFrom = (filePath: string): UnresolvedRef => ({
         fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
@@ -1971,6 +1996,8 @@ func main() {
         getFileLines: () => lines,
         getProjectRoot: () => '',
         getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
       const ref: UnresolvedRef = {
         fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
@@ -1997,6 +2024,8 @@ func main() {
         getFileLines: () => lines,
         getProjectRoot: () => '',
         getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       });
       const ref: UnresolvedRef = {
         fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
@@ -2991,6 +3020,8 @@ int run() {
         readFile: () => null,
         getProjectRoot: () => '',
         getAllFiles: () => ['utils.h', 'main.c'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const result = resolveImportPath(
@@ -3014,6 +3045,8 @@ int run() {
         getProjectRoot: () => '',
         getAllFiles: () => ['include/myclass.hpp', 'src/main.cpp'],
         getCppIncludeDirs: () => ['include'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const result = resolveImportPath(
@@ -3036,6 +3069,8 @@ int run() {
         readFile: () => null,
         getProjectRoot: () => '',
         getAllFiles: () => ['utils/helpers.h', 'main.c'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const result = resolveImportPath(
@@ -3059,6 +3094,8 @@ int run() {
         getProjectRoot: () => '',
         getAllFiles: () => ['include/myheader.h', 'src/main.cpp'],
         getCppIncludeDirs: () => ['include'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const result = resolveImportPath(
@@ -3083,6 +3120,8 @@ int run() {
         getProjectRoot: () => '',
         getAllFiles: () => ['include/myclass.hpp', 'src/main.cpp'],
         getCppIncludeDirs: () => ['include'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       const result = resolveImportPath(
@@ -3105,6 +3144,8 @@ int run() {
         readFile: () => null,
         getProjectRoot: () => '',
         getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       // C standard library header
@@ -3126,6 +3167,8 @@ int run() {
         getProjectRoot: () => '',
         getAllFiles: () => [],
         getCppIncludeDirs: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       // Third-party bare header without path — not resolvable, returns null
@@ -3149,6 +3192,8 @@ int run() {
         readFile: () => null,
         getProjectRoot: () => '',
         getAllFiles: () => ['mylib/utils.h'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
       };
 
       // Path with separator should NOT be filtered as external

@@ -70,7 +70,7 @@ describe('Installer Config Writer', () => {
 
       // Should have warned
       expect(warnSpy).toHaveBeenCalled();
-      const warnMsg = warnSpy.mock.calls[0][0];
+      const warnMsg = warnSpy.mock.calls[0]![0];
       expect(warnMsg).toContain('Warning');
 
       // Backup should exist

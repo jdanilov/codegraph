@@ -32,9 +32,7 @@ describe('codegraph_files path normalization', () => {
       `export const Button = () => 1;\n`
     );
     fs.writeFileSync(path.join(tempDir, 'tests', 'a.test.ts'), `export const t = 1;\n`);
-    cg = await CodeGraph.init(tempDir, {
-      config: { include: ['**/*.ts'], exclude: [] },
-    });
+    cg = await CodeGraph.init(tempDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });

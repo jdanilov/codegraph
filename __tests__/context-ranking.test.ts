@@ -137,9 +137,7 @@ export function downloadDataset(name: string): string { return name; }
 `
     );
 
-    cg = CodeGraph.initSync(testDir, {
-      config: { include: ['**/*.ts', '**/*.tsx'], exclude: [] },
-    });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
   });
 

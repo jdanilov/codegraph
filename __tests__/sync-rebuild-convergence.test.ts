@@ -133,7 +133,7 @@ describe('Incremental sync converges to a full rebuild (CG-33)', () => {
   it('rebinds references in UNCHANGED files when a sync adds a competing definition', async () => {
     write('src/caller.ts', `export function run(): number {\n  return pct(1);\n}\n`);
     write('src/zeta.ts', `export function pct(n: number): number {\n  return n;\n}\n`);
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
 
     write('src/alpha.ts', `export function pct(n: number): number {\n  return n * 2;\n}\n`);
@@ -161,7 +161,7 @@ describe('Incremental sync converges to a full rebuild (CG-33)', () => {
     write('src/caller.ts', `export function run(): number {\n  return pct(1);\n}\n`);
     write('src/alpha.ts', `export function pct(n: number): number {\n  return n;\n}\n`);
     write('src/zeta.ts', `export function pct(n: number): number {\n  return n * 2;\n}\n`);
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
 
     fs.rmSync(path.join(testDir, 'src', 'alpha.ts'));
@@ -183,7 +183,7 @@ describe('Incremental sync converges to a full rebuild (CG-33)', () => {
   it('flags a name added in one changed file even when another changed file already defines it', async () => {
     write('src/caller.ts', `export function run(): number {\n  return pct(1);\n}\n`);
     write('src/zeta.ts', `export function pct(n: number): number {\n  return n;\n}\nexport function keep(): number {\n  return 0;\n}\n`);
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
 
     // One commit: a NEW file gains `pct`, and the file that already had `pct`
@@ -207,7 +207,7 @@ describe('Incremental sync converges to a full rebuild (CG-33)', () => {
     write('src/caller.ts', `export function run(): number {\n  return pct(1) + fmt(2) + collect(3);\n}\n`);
     write('src/util/zeta.ts', `export function pct(n: number): number {\n  return n;\n}\n`);
     write('src/util/omega.ts', `export function fmt(n: number): number {\n  return n;\n}\n`);
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
 
     // 1. add a competing `pct` that sorts before the existing one
@@ -267,7 +267,7 @@ describe('Incremental sync converges to a full rebuild (CG-33)', () => {
     write('src/caller.ts', `export function run(): number {\n  return pct(1);\n}\n`);
     write('src/other.ts', `export function other(): number {\n  return 0;\n}\n`);
     write('src/zeta.ts', `export function pct(n: number): number {\n  return n;\n}\n`);
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
 
     const planted = withDb((db) => {
@@ -333,7 +333,7 @@ describe('Incremental sync converges to a full rebuild (CG-33)', () => {
       'src/zzz_defs.ts',
       `export function push(n: number): number {\n  return n;\n}\nexport function tug(n: number): number {\n  return n;\n}\n`
     );
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
 
     const targetsOf = (name: string): string[] =>
@@ -384,7 +384,7 @@ describe('Incremental sync converges to a full rebuild (CG-33)', () => {
   it('CODEGRAPH_NO_REBIND=1 disables the pass without corrupting the index', async () => {
     write('src/caller.ts', `export function run(): number {\n  return pct(1);\n}\n`);
     write('src/zeta.ts', `export function pct(n: number): number {\n  return n;\n}\n`);
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     const before = edgeSet();
 
@@ -423,7 +423,7 @@ describe('Same-name candidate order is content-derived, not insertion-derived (C
     fs.mkdirSync(path.join(testDir, 'src'), { recursive: true });
     fs.writeFileSync(path.join(testDir, 'src', 'mid.ts'), `export function pad(): void {}\nexport function dup(): number {\n  return 2;\n}\n`);
     fs.writeFileSync(path.join(testDir, 'src', 'zeta.ts'), `export function dup(): number {\n  return 1;\n}\n`);
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
 
     // A sync APPENDS this file's nodes, so `alpha.ts` gets the highest rowids

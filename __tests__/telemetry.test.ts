@@ -16,7 +16,7 @@ import { Telemetry, getTelemetry, TELEMETRY_ENDPOINT } from '../src/telemetry';
 type FetchCall = { url: string; body: Record<string, unknown> };
 
 function mockFetch(calls: FetchCall[], opts: { fail?: boolean } = {}) {
-  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+  return vi.fn(async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
     if (opts.fail) throw new Error('network down');
     calls.push({ url: String(input), body: JSON.parse(String(init?.body)) as Record<string, unknown> });
     return new Response(null, { status: 204 });
@@ -223,7 +223,7 @@ describe('Telemetry', () => {
     });
 
     it('a hung endpoint is bounded by the flush timeout', async () => {
-      const hangingFetch = ((_url: RequestInfo | URL, init?: RequestInit) =>
+      const hangingFetch = ((_url: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) =>
         new Promise((_resolve, reject) => {
           init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
         })) as unknown as typeof globalThis.fetch;

@@ -42,7 +42,7 @@ describe('codegraph_node file-view (Read replacement)', () => {
         Array.from({ length: 2000 }, (_, i) => `  const v${i} = ${i};`).join('\n') +
         '\n  return 0;\n}\n',
     );
-    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts', '**/*.properties'], exclude: [] } });
+    cg = CodeGraph.initSync(dir);
     await cg.indexAll();
     h = new ToolHandler(cg);
   });

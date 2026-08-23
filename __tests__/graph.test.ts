@@ -115,12 +115,7 @@ export { main };
     );
 
     // Initialize and index
-    cg = CodeGraph.initSync(testDir, {
-      config: {
-        include: ['src/**/*.ts'],
-        exclude: [],
-      },
-    });
+    cg = CodeGraph.initSync(testDir);
 
     await cg.indexAll();
     cg.resolveReferences();
@@ -458,7 +453,6 @@ export { main };
       expect(Array.isArray(deadCode)).toBe(true);
 
       // unusedHelper should be detected
-      const hasUnused = deadCode.some((n) => n.name === 'unusedHelper');
       // Note: This depends on extraction properly detecting function scope
       expect(deadCode.length).toBeGreaterThanOrEqual(0);
     });

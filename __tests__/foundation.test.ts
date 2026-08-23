@@ -9,10 +9,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { Node, Edge } from '../src/types';
-import { isInitialized, getCodeGraphDir, validateDirectory, codeGraphDirName, isCodeGraphDataDir } from '../src/directory';
+import { getCodeGraphDir, validateDirectory, codeGraphDirName, isCodeGraphDataDir } from '../src/directory';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from '../src/db';
 import { CURRENT_SCHEMA_VERSION } from '../src/db/migrations';
+import { getLogger, setLogger, defaultLogger, silentLogger } from '../src/errors';
 
 // Create a temporary directory for each test
 function createTempDir(): string {
@@ -92,6 +92,33 @@ describe('CodeGraph Foundation', () => {
 
     it('should throw if not initialized', () => {
       expect(() => CodeGraph.openSync(tempDir)).toThrow(/not initialized/i);
+    });
+  });
+
+  describe('silent option', () => {
+    // The logger is a process-wide singleton, so restore the default after
+    // each case or every later test in this file would run silenced.
+    afterEach(() => setLogger(defaultLogger));
+
+    it('init({ silent: true }) installs the silent logger', async () => {
+      expect(getLogger()).toBe(defaultLogger);
+      const cg = await CodeGraph.init(tempDir, { silent: true });
+      expect(getLogger()).toBe(silentLogger);
+      cg.close();
+    });
+
+    it('open({ silent: true }) installs the silent logger', async () => {
+      CodeGraph.initSync(tempDir).close();
+      expect(getLogger()).toBe(defaultLogger);
+      const cg = await CodeGraph.open(tempDir, { silent: true });
+      expect(getLogger()).toBe(silentLogger);
+      cg.close();
+    });
+
+    it('leaves the logger alone when silent is omitted', async () => {
+      const cg = await CodeGraph.init(tempDir);
+      expect(getLogger()).toBe(defaultLogger);
+      cg.close();
     });
   });
 

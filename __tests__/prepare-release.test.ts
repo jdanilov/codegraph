@@ -6,7 +6,7 @@
  * those files. Real script, real fs — keeps the test honest about what
  * the workflow will actually do.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -53,7 +53,7 @@ describe('prepare-release.mjs', () => {
       // [1.2.3] gets a date.
       expect(result).toMatch(/## \[1\.2\.3\] - \d{4}-\d{2}-\d{2}/);
       // Promoted content lives under [1.2.3].
-      const v123Section = result.split('## [1.2.3]')[1].split('## [1.2.2]')[0];
+      const v123Section = result.split('## [1.2.3]')[1]!.split('## [1.2.2]')[0];
       expect(v123Section).toContain('### Added');
       expect(v123Section).toContain('- New feature foo');
       expect(v123Section).toContain('- New feature bar');
@@ -78,12 +78,12 @@ describe('prepare-release.mjs', () => {
       const result = fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8');
 
       // [Unreleased] is emptied.
-      const unrelSection = result.split('## [Unreleased]')[1].split('## [1.2.3]')[0];
+      const unrelSection = result.split('## [Unreleased]')[1]!.split('## [1.2.3]')[0]!;
       expect(unrelSection.trim()).toBe('');
 
       // [1.2.3] now has BOTH the original Fixed entries AND the
       // Unreleased Fixed entries, plus the new Added sub-section.
-      const v123Section = result.split('## [1.2.3]')[1].split('## [1.2.2]')[0];
+      const v123Section = result.split('## [1.2.3]')[1]!.split('## [1.2.2]')[0];
       expect(v123Section).toContain('### Added');
       expect(v123Section).toContain('- Big feature 1');
       expect(v123Section).toContain('- Big feature 2');

@@ -329,6 +329,7 @@ class App {
       getProjectRoot: () => '',
       getAllFiles: () => [],
       getImportMappings: () => [],
+      getNodesByLowerName: () => [],
     };
     const ref: UnresolvedRef = {
       fromNodeId: 'caller', referenceName: 'this->greeter.greet', referenceKind: 'calls',

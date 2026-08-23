@@ -170,9 +170,7 @@ describe('codegraph_explore output respects the adaptive budget', () => {
       );
     }
 
-    cg = CodeGraph.initSync(testDir, {
-      config: { include: ['**/*.ts'], exclude: [] },
-    });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });

@@ -175,7 +175,7 @@ describe('daemon observability for watchdog kills (#1431)', () => {
     try {
       const { progressPaths } = watchdogProgressPaths(dir);
       expect(progressPaths).toHaveLength(2);
-      expect(progressPaths![0].endsWith(path.join('.codegraph', 'codegraph.db'))).toBe(true);
+      expect(progressPaths![0]!.endsWith(path.join('.codegraph', 'codegraph.db'))).toBe(true);
       expect(progressPaths![1]).toBe(`${progressPaths![0]}-wal`);
       expect(watchdogProgressPaths(null)).toEqual({});
     } finally {

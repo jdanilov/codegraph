@@ -3816,7 +3816,7 @@ class APXCharacter {  // the one real definition
       );
       // Exactly one class node, and it's the definition (carries the member).
       expect(classes).toHaveLength(1);
-      expect(classes[0].startLine).toBe(6);
+      expect(classes[0]!.startLine).toBe(6);
       expect(
         result.nodes.some((n) => n.kind === 'method' && n.name === 'takeDamage')
       ).toBe(true);
@@ -8827,7 +8827,7 @@ export const registry = [widget];
         path.join(dir, 'src', 'bar.ts'),
         `import { widget } from './foo';\nexport { helper } from './foo';\nexport const registry = [widget];\n`
       );
-      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.ts'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('src/foo.ts')).toContain('src/bar.ts');
@@ -8846,7 +8846,7 @@ export const registry = [widget];
       // (no call, no type) — `foo.helper()` would link on its own, but a bare
       // `foo.SOME_CONST` would not, so the module-import backstop must link it.
       fs.writeFileSync(path.join(dir, 'src', 'bar.ts'), `import * as foo from './foo';\nexport const x = foo.SOME_CONST;\n`);
-      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.ts'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('src/foo.ts')).toContain('src/bar.ts');
@@ -8887,7 +8887,7 @@ describe('Python import dependency linking (blast-radius recall)', () => {
       // bar imports widget+helper but only stores widget in a list — nothing is
       // called, so before import-linking bar had no edge to foo.
       fs.writeFileSync(path.join(dir, 'pkg', 'bar.py'), `from foo import widget, helper\nregistry = [widget]\n`);
-      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('pkg/foo.py')).toContain('pkg/bar.py');
@@ -8907,7 +8907,7 @@ describe('Python import dependency linking (blast-radius recall)', () => {
       // call through it — the receiver isn't a symbol, so plain name-matching
       // can't link it. Also exercises the Python relative-dot path fix (`.certs`).
       fs.writeFileSync(path.join(dir, 'pkg', 'utils.py'), `from . import certs\ndef go():\n    return certs.where()\n`);
-      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('pkg/certs.py')).toContain('pkg/utils.py');
@@ -8927,7 +8927,7 @@ describe('Python import dependency linking (blast-radius recall)', () => {
       // record utils -> certs. (Mirrors requests' real `certs.where`.)
       fs.writeFileSync(path.join(dir, 'pkg', 'certs.py'), `from external_ca import where\n`);
       fs.writeFileSync(path.join(dir, 'pkg', 'utils.py'), `from . import certs\nCA = certs.where()\n`);
-      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('pkg/certs.py')).toContain('pkg/utils.py');
@@ -8950,7 +8950,7 @@ describe('Go cross-package composite literals (blast-radius recall)', () => {
       fs.mkdirSync(path.join(dir, 'render'), { recursive: true });
       fs.writeFileSync(path.join(dir, 'render', 'xml.go'), `package render\n\ntype XML struct { Data any }\n`);
       fs.writeFileSync(path.join(dir, 'app.go'), `package main\n\nimport "example.com/proj/render"\n\nfunc handle() any { return render.XML{} }\n`);
-      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('render/xml.go')).toContain('app.go');
@@ -8970,7 +8970,7 @@ describe('Go cross-package composite literals (blast-radius recall)', () => {
       // map literal — the body walker doesn't cover top-level declarations, so this
       // exercises the var-initializer walking added for Go.
       fs.writeFileSync(path.join(dir, 'reg.go'), `package main\n\nimport "example.com/proj/render"\n\ntype R interface { Render() }\n\nvar registry = map[string]R{ "xml": render.XML{} }\n`);
-      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('render/xml.go')).toContain('reg.go');
@@ -8993,7 +8993,7 @@ describe('Go cross-package composite literals (blast-radius recall)', () => {
         path.join(dir, 'root.go'),
         `package main\n\ntype Cmd struct{ RunE func() error }\n\nvar rootCmd = &Cmd{\n\tRunE: func() error { return Wire() },\n}\n`
       );
-      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
 
@@ -9016,7 +9016,7 @@ describe('Go cross-package composite literals (blast-radius recall)', () => {
       // `(*Wrapped)(x)` parses as a call whose callee is the parenthesized type
       // `(*Wrapped)` — without normalization it dropped on the floor.
       fs.writeFileSync(path.join(dir, 'use.go'), `package main\n\nfunc run(x *int) { _ = (*Wrapped)(x) }\n`);
-      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('types.go')).toContain('use.go');
@@ -9036,7 +9036,7 @@ describe('Go cross-package composite literals (blast-radius recall)', () => {
       // reached ONLY through the interface (API.Marshal). Without implicit
       // interface satisfaction + dispatch, json.go shows 0 dependents.
       fs.writeFileSync(path.join(dir, 'codec', 'json.go'), `package codec\n\ntype jsonApi struct{}\n\nfunc (j jsonApi) Marshal(v any) ([]byte, error) { return nil, nil }\n\nfunc init() { API = jsonApi{} }\n`);
-      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('codec/json.go')).toContain('codec/api.go');
@@ -9068,7 +9068,7 @@ describe('C# records (blast-radius recall)', () => {
         path.join(dir, 'use.cs'),
         `using System.Collections.Generic;\nnamespace P;\npublic class User {\n    public IEnumerable<Box> Boxes { get; }\n    public Box Make() => new Box(1);\n}\n`
       );
-      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.cs'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('types.cs')).toContain('use.cs');
@@ -9099,7 +9099,7 @@ describe('Rust cross-module recall', () => {
       'consumer.rs': 'use crate::types::Widget;\npub fn build() -> Widget { Widget { n: 1 } }\n',
     });
     try {
-      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('src/types.rs')).toContain('src/consumer.rs');
@@ -9115,7 +9115,7 @@ describe('Rust cross-module recall', () => {
       'consumer.rs': 'use crate::types::Render;\npub struct Mine { pub x: i32 }\nimpl Render for Mine { fn render(&self) -> i32 { self.x } }\n',
     });
     try {
-      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       // implements edge (Mine -> Render) makes types.rs a dependent of consumer.rs's struct.
@@ -9131,7 +9131,7 @@ describe('Rust cross-module recall', () => {
       'api/widget.rs': 'pub struct Widget { pub n: i32 }\n',
     });
     try {
-      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       // The re-export hub depends on the module it re-exports from.
@@ -9150,7 +9150,7 @@ describe('Rust cross-module recall', () => {
       'hub.rs': 'pub use crate::fast::read;\n',
     });
     try {
-      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('src/fast.rs')).toContain('src/hub.rs');
@@ -9172,7 +9172,7 @@ describe('Java annotations (blast-radius recall)', () => {
         path.join(dir, 'p', 'User.java'),
         `package p;\n@MyAnno("c")\npublic class User {\n  @MyAnno("f") int field;\n  @MyAnno("m") void go() {}\n}\n`
       );
-      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.java'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('p/MyAnno.java')).toContain('p/User.java');
@@ -9191,7 +9191,7 @@ describe('Swift property wrappers / attributes (blast-radius recall)', () => {
       // property's `modifiers` and Swift doesn't extract instance properties as
       // their own nodes, so without the fix the wrapper type has no users.
       fs.writeFileSync(path.join(dir, 'Sources', 'M', 'Cmd.swift'), `public struct MyCommand {\n  @Argument var name: String\n  @Argument var count: Int\n}\n`);
-      const cg = CodeGraph.initSync(dir, { config: { include: ['Sources/**/*.swift'], exclude: [] } });
+      const cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       cg.resolveReferences();
       expect(cg.getFileDependents('Sources/M/Wrap.swift')).toContain('Sources/M/Cmd.swift');
@@ -9514,10 +9514,10 @@ import foo.cfm;
       const result = extractFromSource('TagStyle.cfc', code);
       const fileNodes = result.nodes.filter((n) => n.kind === 'file');
       expect(fileNodes).toHaveLength(1);
-      expect(fileNodes[0].startLine).toBe(1);
+      expect(fileNodes[0]!.startLine).toBe(1);
       const cls = result.nodes.find((n) => n.kind === 'class');
       const containsClass = result.edges.find(
-        (e) => e.source === fileNodes[0].id && e.target === cls?.id && e.kind === 'contains'
+        (e) => e.source === fileNodes[0]!.id && e.target === cls?.id && e.kind === 'contains'
       );
       expect(containsClass).toBeDefined();
     });

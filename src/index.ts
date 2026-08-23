@@ -49,6 +49,7 @@ import {
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
+import { setLogger, silentLogger } from './errors';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
@@ -102,6 +103,15 @@ export interface InitOptions {
 
   /** Progress callback for indexing */
   onProgress?: (progress: IndexProgress) => void;
+
+  /**
+   * Suppress CodeGraph's own console output (warnings/errors/debug) by
+   * installing {@link silentLogger} as the process-wide logger. Sugar for
+   * `setLogger(silentLogger)` — the logger is global, so this affects every
+   * CodeGraph instance in the process until `setLogger` is called again.
+   * Useful for tests and for embedding CodeGraph in a CLI that owns its output.
+   */
+  silent?: boolean;
 }
 
 /**
@@ -113,6 +123,11 @@ export interface OpenOptions {
 
   /** Whether to run in read-only mode */
   readOnly?: boolean;
+
+  /**
+   * Suppress CodeGraph's own console output — see {@link InitOptions.silent}.
+   */
+  silent?: boolean;
 }
 
 /**
@@ -233,6 +248,17 @@ export class CodeGraph {
   // ===========================================================================
 
   /**
+   * Honour `{ silent: true }` on init/open by installing the silent logger.
+   * The logger is a process-wide singleton (`src/errors.ts`), so this is a
+   * one-way switch by design: `silent: false`/omitted deliberately does NOT
+   * restore the default logger, because a second instance must not un-silence
+   * a caller that asked for quiet. Call `setLogger(defaultLogger)` to undo.
+   */
+  private static applySilent(silent: boolean | undefined): void {
+    if (silent) setLogger(silentLogger);
+  }
+
+  /**
    * Initialize a new CodeGraph project
    *
    * Creates the .CodeGraph directory, database, and configuration.
@@ -242,6 +268,7 @@ export class CodeGraph {
    * @returns A new CodeGraph instance
    */
   static async init(projectRoot: string, options: InitOptions = {}): Promise<CodeGraph> {
+    CodeGraph.applySilent(options.silent);
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
 
@@ -298,6 +325,7 @@ export class CodeGraph {
    * @returns A CodeGraph instance
    */
   static async open(projectRoot: string, options: OpenOptions = {}): Promise<CodeGraph> {
+    CodeGraph.applySilent(options.silent);
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
 

@@ -93,9 +93,9 @@ describe('MCP stale-slice guard (#1474)', () => {
       'export function unrelated() { return 0; }\n',
     );
 
-    cgFixture = CodeGraph.initSync(fixtureDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cgFixture = CodeGraph.initSync(fixtureDir);
     await cgFixture.indexAll();
-    cgOther = CodeGraph.initSync(otherDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cgOther = CodeGraph.initSync(otherDir);
     await cgOther.indexAll();
     // The issue's exact topology: the server's default project is a DIFFERENT
     // project; the stale one is reached via `projectPath` and therefore has no

@@ -132,14 +132,14 @@ describe('codegraph_explore — dynamic boundaries', () => {
   let cg: CodeGraph;
   let handler: ToolHandler;
 
-  const setup = async (files: Record<string, string>, include: string[]) => {
+  const setup = async (files: Record<string, string>) => {
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-boundary-'));
     const src = path.join(testDir, 'src');
     fs.mkdirSync(src, { recursive: true });
     for (const [name, content] of Object.entries(files)) {
       fs.writeFileSync(path.join(src, name), content);
     }
-    cg = CodeGraph.initSync(testDir, { config: { include, exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   };
@@ -166,10 +166,10 @@ describe('codegraph_explore — dynamic boundaries', () => {
         'export function onSave(payload: unknown) { return payload; }',
         'export function wire(r: Router) { r.add("save", onSave); }',
       ].join('\n'),
-    }, ['**/*.ts']);
+    });
 
     const res = await handler.execute('codegraph_explore', { query: 'routeSave onSave' });
-    const text = res.content[0].text as string;
+    const text = res.content[0]!.text as string;
 
     expect(text).toContain('**Dynamic boundaries');
     expect(text).toContain('computed member call');
@@ -194,10 +194,10 @@ describe('codegraph_explore — dynamic boundaries', () => {
         '}',
       ].join('\n'),
       'handlers.ts': 'export function onSave(payload: unknown) { return payload; }',
-    }, ['**/*.ts']);
+    });
 
     const res = await handler.execute('codegraph_explore', { query: 'route onSave' });
-    const text = res.content[0].text as string;
+    const text = res.content[0]!.text as string;
 
     expect(text).toContain('**Dynamic boundaries');
     expect(text).toContain('computed member call');
@@ -216,11 +216,11 @@ describe('codegraph_explore — dynamic boundaries', () => {
         '  }',
         '}',
       ].join('\n'),
-    }, ['**/*.ts']);
+    });
 
     // `processPayment` does not exist anywhere — only `route` resolves.
     const res = await handler.execute('codegraph_explore', { query: 'route processPayment' });
-    const text = res.content[0].text as string;
+    const text = res.content[0]!.text as string;
     expect(text).toContain('**Dynamic boundaries');
   });
 
@@ -249,10 +249,10 @@ describe('codegraph_explore — dynamic boundaries', () => {
         "  bus.emit('invoice.settled', order);",
         '}',
       ].join('\n'),
-    }, ['**/*.ts']);
+    });
 
     const res = await handler.execute('codegraph_explore', { query: 'completeCheckout settleInvoice' });
-    const text = res.content[0].text as string;
+    const text = res.content[0]!.text as string;
 
     expect(text).toContain('**Dynamic-dispatch links among your symbols');
     expect(text).toMatch(/completeCheckout → settleInvoice/);
@@ -268,10 +268,10 @@ describe('codegraph_explore — dynamic boundaries', () => {
         'export function stepTwo() { return stepThree(); }',
         'export function stepThree() { return 3; }',
       ].join('\n'),
-    }, ['**/*.ts']);
+    });
 
     const res = await handler.execute('codegraph_explore', { query: 'stepOne stepThree' });
-    const text = res.content[0].text as string;
+    const text = res.content[0]!.text as string;
     expect(text).toContain('**Flow');
     expect(text).not.toContain('**Dynamic boundaries');
   });
@@ -287,10 +287,10 @@ describe('codegraph_explore — dynamic boundaries', () => {
         "        handler = getattr(self, 'handle_' + kind)",
         '        return handler(payload)',
       ].join('\n'),
-    }, ['**/*.py']);
+    });
 
     const res = await handler.execute('codegraph_explore', { query: 'process handle_save' });
-    const text = res.content[0].text as string;
+    const text = res.content[0]!.text as string;
 
     expect(text).toContain('**Dynamic boundaries');
     expect(text).toContain('getattr');
@@ -307,14 +307,14 @@ describe('codegraph_explore — interface dispatch', () => {
   let cg: CodeGraph;
   let handler: ToolHandler;
 
-  const setup = async (files: Record<string, string>, include: string[]) => {
+  const setup = async (files: Record<string, string>) => {
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-iface-'));
     const src = path.join(testDir, 'src');
     fs.mkdirSync(src, { recursive: true });
     for (const [name, content] of Object.entries(files)) {
       fs.writeFileSync(path.join(src, name), content);
     }
-    cg = CodeGraph.initSync(testDir, { config: { include, exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   };
@@ -355,10 +355,10 @@ describe('codegraph_explore — interface dispatch', () => {
   ].join('\n');
 
   it('announces the interface, the TRUE implementer count, and sample targets', async () => {
-    await setup({ 'nodes.ts': nodeFamily(9), 'registry.ts': registry, 'engine.ts': engine }, ['**/*.ts']);
+    await setup({ 'nodes.ts': nodeFamily(9), 'registry.ts': registry, 'engine.ts': engine });
 
     const res = await handler.execute('codegraph_explore', { query: 'processRunExecutionData executeNode execute' });
-    const text = res.content[0].text as string;
+    const text = res.content[0]!.text as string;
 
     expect(text).toContain('**Interface dispatch (a named method has many implementations)');
     expect(text).toMatch(/`execute` → runtime dispatch to \*\*9\*\* types implementing `INodeType`/);
@@ -375,19 +375,19 @@ describe('codegraph_explore — interface dispatch', () => {
         'export function stepTwo() { return stepThree(); }',
         'export function stepThree() { return 3; }',
       ].join('\n'),
-    }, ['**/*.ts']);
+    });
 
     const res = await handler.execute('codegraph_explore', { query: 'stepOne stepThree' });
-    const text = res.content[0].text as string;
+    const text = res.content[0]!.text as string;
     expect(text).toContain('**Flow');
     expect(text).not.toContain('**Interface dispatch');
   });
 
   it('stays SILENT when the interface family is below the polymorphism threshold (3 impls)', async () => {
-    await setup({ 'nodes.ts': nodeFamily(3), 'registry.ts': registry, 'engine.ts': engine }, ['**/*.ts']);
+    await setup({ 'nodes.ts': nodeFamily(3), 'registry.ts': registry, 'engine.ts': engine });
 
     const res = await handler.execute('codegraph_explore', { query: 'processRunExecutionData executeNode execute' });
-    const text = res.content[0].text as string;
+    const text = res.content[0]!.text as string;
     expect(text).not.toContain('**Interface dispatch');
   });
 });

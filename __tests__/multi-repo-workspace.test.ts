@@ -219,7 +219,7 @@ describe('multi-repo workspaces (#514) + .gitignore-respect default (#970, #976)
       writeConfig({ includeIgnored: ['packages/'] });
       makeRepo(ws);
 
-      const cg = CodeGraph.initSync(ws, { config: { include: ['**/*.ts'], exclude: [] } });
+      const cg = CodeGraph.initSync(ws);
       try {
         await cg.indexAll();
         expect(cg.searchNodes('login', { limit: 5 }).length).toBeGreaterThan(0);

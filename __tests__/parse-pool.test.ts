@@ -41,7 +41,7 @@ class FakeWorker implements ParsePoolWorker {
     if (this.alive) this.msgCb?.({ type: 'parse-result', id, result });
   }
   postMessage(msg: unknown): void {
-    const m = msg as { type: string } & Partial<ParseMsg>;
+    const m = msg as { type: string } & Partial<Omit<ParseMsg, 'type'>>;
     if (m.type === 'load-grammars') {
       setTimeout(() => { if (this.alive) this.msgCb?.({ type: 'grammars-loaded' }); }, 0);
       return;
@@ -226,7 +226,7 @@ describe('ParseWorkerPool', () => {
     });
     await pool.requestParse(task('a.ts'));
     expect(loadMsgs).toHaveLength(1);
-    expect(loadMsgs[0].grammarBuffers).toBe(grammarBuffers);
+    expect(loadMsgs[0]!.grammarBuffers).toBe(grammarBuffers);
     await pool.destroy();
   });
 

@@ -50,7 +50,7 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
     process.env[ENV] = 'node';
     const res = await new ToolHandler(null).execute('codegraph_explore', {});
     expect(res.isError).toBe(true);
-    expect(res.content[0].text).toMatch(/disabled via CODEGRAPH_MCP_TOOLS/);
+    expect(res.content[0]!.text).toMatch(/disabled via CODEGRAPH_MCP_TOOLS/);
   });
 
   it('lets an allowlisted tool past the guard', async () => {
@@ -58,6 +58,6 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
     // No CodeGraph attached, so it fails *after* the allowlist guard — the
     // "disabled" message must NOT appear, proving the guard passed it through.
     const res = await new ToolHandler(null).execute('codegraph_search', { query: 'x' });
-    expect(res.content[0].text).not.toMatch(/disabled via CODEGRAPH_MCP_TOOLS/);
+    expect(res.content[0]!.text).not.toMatch(/disabled via CODEGRAPH_MCP_TOOLS/);
   });
 });

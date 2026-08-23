@@ -34,7 +34,7 @@ function sourcedFiles(text: string): string[] {
   const out: string[] = [];
   for (const line of text.split('\n')) {
     const m = line.match(/^\*\*`(.+?)`\*\* —/);
-    if (m) out.push(m[1].trim());
+    if (m) out.push(m[1]!.trim());
   }
   return out;
 }
@@ -89,7 +89,7 @@ describe('codegraph_explore — multi-term corroboration tier', () => {
       `  load(): string[] { return []; }\n` +
       `}\n`);
 
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });
@@ -101,7 +101,7 @@ describe('codegraph_explore — multi-term corroboration tier', () => {
 
   it('sources the corroborated backend file alongside a denser frontend cluster in a multi-layer repo', async () => {
     const res = await handler.execute('codegraph_explore', { query: 'item service' });
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
     const sourced = sourcedFiles(text);
 
     // The backend service — matched by item+service and a search root — must
@@ -113,7 +113,7 @@ describe('codegraph_explore — multi-term corroboration tier', () => {
     // A query naming the backend symbol directly: the answer is the DataService
     // file; the frontend mesh stays subordinate (it matches only "item").
     const res = await handler.execute('codegraph_explore', { query: 'DataService read load' });
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
     const sourced = sourcedFiles(text);
     expect(sourced).toContain('api/item/service.ts');
     // The named backend file leads — it is not displaced by the frontend layer.

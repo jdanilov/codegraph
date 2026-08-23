@@ -65,7 +65,7 @@ describe('MCP staleness banner', () => {
       'export function charlieOnly() { return 3; }\n',
     );
 
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });
@@ -111,7 +111,7 @@ describe('MCP staleness banner', () => {
 
     const res = await handler.execute('codegraph_search', { query: 'alphaOnly' });
     expect(res.isError).toBeFalsy();
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
 
     // Banner shape: warning glyph + filename + actionable instruction.
     expect(text.startsWith('⚠️')).toBe(true);
@@ -137,7 +137,7 @@ describe('MCP staleness banner', () => {
     await waitFor(() => cg.getPendingFiles().some((p) => p.path === 'src/bravo-only.ts'));
 
     const res = await handler.execute('codegraph_search', { query: 'alphaOnly' });
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
 
     expect(text.startsWith('⚠️')).toBe(false);
     expect(text).toMatch(/elsewhere in this project are pending index sync/);
@@ -157,7 +157,7 @@ describe('MCP staleness banner', () => {
     await waitFor(() => cg.getPendingFiles().length === 0, 3000);
 
     const res = await handler.execute('codegraph_search', { query: 'alphaOnly' });
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
     expect(text.startsWith('⚠️')).toBe(false);
     expect(text).not.toMatch(/elsewhere in this project are pending index sync/);
   });
@@ -174,7 +174,7 @@ describe('MCP staleness banner', () => {
     await waitFor(() => cg.getPendingFiles().some((p) => p.path === 'src/charlie-only.ts'));
 
     const res = await handler.execute('codegraph_status', {});
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
     expect(text).toContain('**Pending sync:');
     expect(text).toContain('src/charlie-only.ts');
     // Status embeds the info first-class, so the auto-banner is suppressed.
@@ -190,7 +190,7 @@ describe('MCP staleness banner', () => {
 
     const res = await handler.execute('codegraph_search', { query: 'alphaOnly' });
     expect(res.isError).toBeFalsy();
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
 
     expect(text.startsWith('⚠️')).toBe(true);
     expect(text).toMatch(/auto-sync is DISABLED/i);
@@ -203,7 +203,7 @@ describe('MCP staleness banner', () => {
     degradeWatcher();
 
     const res = await handler.execute('codegraph_status', {});
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
     expect(text).toContain('**Auto-sync disabled:');
     expect(text).toContain('OS watch/file limit exhausted');
     // status renders the notice inline, so the auto-banner is not also prepended.

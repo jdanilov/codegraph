@@ -15,9 +15,9 @@ describe('readGrammarWasmBytes', () => {
   it('reads bytes for a tree-sitter-wasms grammar and a vendored grammar', async () => {
     const bytes = await readGrammarWasmBytes(['typescript', 'lua']);
     expect(bytes.typescript).toBeInstanceOf(Uint8Array); // from tree-sitter-wasms
-    expect(bytes.typescript.byteLength).toBeGreaterThan(10_000);
+    expect(bytes.typescript!.byteLength).toBeGreaterThan(10_000);
     expect(bytes.lua).toBeInstanceOf(Uint8Array); // vendored under src/extraction/wasm/
-    expect(bytes.lua.byteLength).toBeGreaterThan(10_000);
+    expect(bytes.lua!.byteLength).toBeGreaterThan(10_000);
   });
 
   it('expands delegating languages to the grammars they need (svelte → ts/js)', async () => {
@@ -33,7 +33,7 @@ describe('readGrammarWasmBytes', () => {
   it('produces bytes web-tree-sitter can load into a working parser', async () => {
     await Parser.init();
     const bytes = await readGrammarWasmBytes(['javascript']);
-    const language = await WasmLanguage.load(bytes.javascript);
+    const language = await WasmLanguage.load(bytes.javascript!);
     const parser = new Parser();
     parser.setLanguage(language);
     const tree = parser.parse('function hello() { return 1; }');

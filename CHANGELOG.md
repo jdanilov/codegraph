@@ -43,6 +43,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Hovering in `codegraph ui` now answers about one thing. Hover or select a slice and you see exactly its own connections — a class with one call out and three in shows four lines, not the hundreds its methods have between them — and everything not on the other end of one of those fades. Each symbol inside answers for itself when you hover it. While a question card is open, hovering stays inside that card's answer: you see the connections of the thing under your pointer that are part of the answer, and nothing else. Switching views no longer moves the picture, either: activating a question card, the Changes view or Project only changes what is lit and what is dimmed — it never re-centres, re-zooms or jumps you somewhere else, so you can flip between a question and the project while looking at the same thing. Clicking a symbol listed in a card still takes you to it.
 
+- Library and SDK users can now pass `silent: true` to `CodeGraph.init()` and `CodeGraph.open()` to suppress CodeGraph's own console warnings and errors, so embedding it in your own CLI or test suite no longer mixes its output into yours.
+
 ### Fixes
 
 - Object-literal members declared through a project's `object-literal-members` plugin are now attached to the object that declares them. A component or module defined as an object of methods produced the members as free-standing symbols with nothing joining them to their owner, so "what does this contain" came back empty and anything reading the containment structure — including the graph view — showed the file flat instead of nested. Existing projects pick this up on the next index.

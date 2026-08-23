@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "rootDir": ".",
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src/**/*", "__tests__/**/*"],
+  "//": "__tests__/fixtures/** holds sample projects that are PARSER INPUT, not code we compile — they contain deliberately odd/broken constructs and must stay out of the program.",
+  "exclude": ["node_modules", "dist", "__tests__/fixtures"]
+}

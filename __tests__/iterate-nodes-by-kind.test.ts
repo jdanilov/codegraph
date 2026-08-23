@@ -26,7 +26,7 @@ describe('iterateNodesByKind (#610 streaming)', () => {
       'export function bar() { return 2; }\n' +
       'export class C { m() { return 3; } n() { return 4; } }\n'
     );
-    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(dir);
     await cg.indexAll();
   });
 

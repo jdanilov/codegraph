@@ -28,14 +28,14 @@ function renderedSourceFiles(text: string): string[] {
   const out: string[] = [];
   for (const line of text.split('\n')) {
     const m = line.match(/^\*\*`(.+?)`\*\*/);
-    if (m) out.push(m[1].trim());
+    if (m) out.push(m[1]!.trim());
   }
   return out;
 }
 
 function headerFileCount(text: string): number | null {
   const m = text.match(/Found \d+ symbols? across (\d+) files?\./);
-  return m ? parseInt(m[1], 10) : null;
+  return m ? parseInt(m[1]!, 10) : null;
 }
 
 describe('codegraph_explore — curated result count (#1046)', () => {
@@ -63,7 +63,7 @@ describe('codegraph_explore — curated result count (#1046)', () => {
         `export function status_widget_${i}() { return ${i}; }\n`);
     }
 
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });
@@ -75,7 +75,7 @@ describe('codegraph_explore — curated result count (#1046)', () => {
 
   it('header file count equals the number of rendered source sections', async () => {
     const res = await handler.execute('codegraph_explore', { query: 'publish status' });
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
 
     const headerFiles = headerFileCount(text);
     const rendered = renderedSourceFiles(text);

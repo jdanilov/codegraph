@@ -80,7 +80,7 @@ function tagStreams(child: ChildProcessWithoutNullStreams) {
   return events;
 }
 
-function waitFor<T>(
+function waitFor(
   events: ReadonlyArray<{ seq: number; stream: string; text: string }>,
   predicate: (e: { seq: number; stream: string; text: string }) => boolean,
   timeoutMs: number,

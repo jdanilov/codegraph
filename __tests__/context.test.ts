@@ -142,12 +142,7 @@ export function validateEmail(email: string): boolean {
     );
 
     // Initialize CodeGraph
-    cg = CodeGraph.initSync(testDir, {
-      config: {
-        include: ['**/*.ts', '**/*.c'],
-        exclude: [],
-      },
-    });
+    cg = CodeGraph.initSync(testDir);
 
     // Index the codebase
     await cg.indexAll();

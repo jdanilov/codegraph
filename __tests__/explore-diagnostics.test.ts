@@ -115,7 +115,7 @@ describe('codegraph_explore allocation diagnostic', () => {
     }
 
     clearDebugEnv();
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });

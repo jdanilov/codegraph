@@ -328,7 +328,7 @@ describe('framework registry — plugin wiring', () => {
         {
           fromNodeId: 'n1',
           referenceName: 'anything',
-          referenceKind: 'call',
+          referenceKind: 'calls',
           line: 1,
           column: 0,
           filePath: 'src/a.ts',

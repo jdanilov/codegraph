@@ -69,8 +69,8 @@ describe('daemon-registry', () => {
     registerDaemon(rec('/proj/a', process.pid));
     const live = listDaemons();
     expect(live).toHaveLength(1);
-    expect(live[0].root).toBe('/proj/a');
-    expect(live[0].pid).toBe(process.pid);
+    expect(live[0]!.root).toBe('/proj/a');
+    expect(live[0]!.pid).toBe(process.pid);
 
     deregisterDaemon('/proj/a');
     expect(listDaemons()).toEqual([]);
@@ -83,7 +83,7 @@ describe('daemon-registry', () => {
 
     const live = listDaemons();
     expect(live).toHaveLength(1);
-    expect(live[0].root).toBe('/proj/live');
+    expect(live[0]!.root).toBe('/proj/live');
 
     // The dead record's file was deleted as a side effect.
     const remaining = fs.readdirSync(getRegistryDir()).filter((f) => f.endsWith('.json'));

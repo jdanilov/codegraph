@@ -248,7 +248,7 @@ describe('Shared MCP daemon (issue #411)', () => {
 
     // All three get a valid initialize response...
     for (let i = 0; i < procs.length; i++) {
-      const resp = await waitFor(() => findResponse(procs[i].stdout, i + 1), 12000);
+      const resp = await waitFor(() => findResponse(procs[i]!.stdout, i + 1), 12000);
       expect(resp.result.serverInfo.name).toBe('codegraph');
     }
     // ...and all three attached as proxies (none fell back / wedged).

@@ -27,9 +27,7 @@ describe('MCP input size limits', () => {
       path.join(tempDir, 'src', 'a.ts'),
       `export function alpha(): number { return 1; }\n`
     );
-    cg = await CodeGraph.init(tempDir, {
-      config: { include: ['**/*.ts'], exclude: [] },
-    });
+    cg = await CodeGraph.init(tempDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });

@@ -132,7 +132,7 @@ describe.skipIf(process.platform === 'win32')('MCP PPID watchdog (#277)', () => 
         const m = buf.match(/\{"pid":(\d+),"stdinHolderPid":(\d+)\}/);
         if (m) {
           clearTimeout(timer);
-          resolve({ pid: parseInt(m[1], 10), stdinHolderPid: parseInt(m[2], 10) });
+          resolve({ pid: parseInt(m[1]!, 10), stdinHolderPid: parseInt(m[2]!, 10) });
         }
       });
       wrapper!.on('exit', () => {

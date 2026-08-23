@@ -11,10 +11,12 @@ import { logAttachedDaemon } from '../src/mcp/proxy';
 const hello = { pid: 4242, codegraph: '9.9.9' } as any;
 
 describe('daemon attach log gating (#618)', () => {
-  let spy: ReturnType<typeof vi.spyOn>;
+  const spyStderrWrite = () =>
+    vi.spyOn(process.stderr, 'write').mockImplementation((() => true) as never);
+  let spy: ReturnType<typeof spyStderrWrite>;
 
   beforeEach(() => {
-    spy = vi.spyOn(process.stderr, 'write').mockImplementation((() => true) as any);
+    spy = spyStderrWrite();
   });
 
   afterEach(() => {

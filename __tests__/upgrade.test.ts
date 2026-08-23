@@ -295,11 +295,11 @@ describe('runUpgrade', () => {
     const code = await runUpgrade({}, deps);
     expect(code).toBe(0);
     expect(calls.runs).toHaveLength(1);
-    expect(calls.runs[0].cmd).toBe('sh');
-    expect(calls.runs[0].args[0]).toBe('-c');
-    expect(calls.runs[0].args[1]).toContain('curl -fsSL');
-    expect(calls.runs[0].args[1]).toContain('| sh');
-    expect(calls.runs[0].env?.CODEGRAPH_INSTALL_DIR).toBe('/h/.codegraph');
+    expect(calls.runs[0]!.cmd).toBe('sh');
+    expect(calls.runs[0]!.args[0]).toBe('-c');
+    expect(calls.runs[0]!.args[1]).toContain('curl -fsSL');
+    expect(calls.runs[0]!.args[1]).toContain('| sh');
+    expect(calls.runs[0]!.env?.CODEGRAPH_INSTALL_DIR).toBe('/h/.codegraph');
     expect(calls.logs.join('\n')).toMatch(/codegraph sync/); // re-index advisory printed
   });
 
@@ -324,8 +324,8 @@ describe('runUpgrade', () => {
     const code = await runUpgrade({}, deps);
     expect(code).toBe(0);
     expect(calls.runs).toHaveLength(1);
-    expect(calls.runs[0].cmd).toBe('powershell.exe');
-    const decoded = decodeEncodedCommand(calls.runs[0].args);
+    expect(calls.runs[0]!.cmd).toBe('powershell.exe');
+    const decoded = decodeEncodedCommand(calls.runs[0]!.args);
     // Downloads the right asset, renames the locked exe aside, copies over current\.
     expect(decoded).toContain('releases/download/v0.9.9/codegraph-win32-');
     expect(decoded).toContain('Rename-Item');
@@ -354,8 +354,8 @@ describe('runUpgrade', () => {
     });
     const code = await runUpgrade({}, deps);
     expect(code).toBe(0);
-    expect(calls.runs[0].cmd).toBe('npm');
-    expect(calls.runs[0].args).toEqual(['install', '-g', `${NPM_PACKAGE}@latest`]);
+    expect(calls.runs[0]!.cmd).toBe('npm');
+    expect(calls.runs[0]!.args).toEqual(['install', '-g', `${NPM_PACKAGE}@latest`]);
   });
 
   it('npm on win32 routes through cmd.exe (a direct npm.cmd spawn EINVALs on modern Node)', async () => {
@@ -365,9 +365,9 @@ describe('runUpgrade', () => {
       platform: 'win32',
     });
     await runUpgrade({}, deps);
-    expect(calls.runs[0].cmd).toBe('cmd.exe');
-    expect(calls.runs[0].args.slice(0, 3)).toEqual(['/d', '/s', '/c']);
-    expect(calls.runs[0].args[3]).toBe(`npm install -g ${NPM_PACKAGE}@latest`);
+    expect(calls.runs[0]!.cmd).toBe('cmd.exe');
+    expect(calls.runs[0]!.args.slice(0, 3)).toEqual(['/d', '/s', '/c']);
+    expect(calls.runs[0]!.args[3]).toBe(`npm install -g ${NPM_PACKAGE}@latest`);
   });
 
   it('npm: a pinned version is passed through as @<version>', async () => {
@@ -377,7 +377,7 @@ describe('runUpgrade', () => {
     });
     await runUpgrade({ version: '0.9.8' }, deps);
     // npm spec carries no leading "v".
-    expect(calls.runs[0].args).toEqual(['install', '-g', `${NPM_PACKAGE}@0.9.8`]);
+    expect(calls.runs[0]!.args).toEqual(['install', '-g', `${NPM_PACKAGE}@0.9.8`]);
   });
 
   it('npm: surfaces a non-zero exit as failure', async () => {

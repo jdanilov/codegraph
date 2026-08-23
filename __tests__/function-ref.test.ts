@@ -891,8 +891,8 @@ describe('Function-as-value capture (#756)', () => {
       // Re-index: identical node/edge counts (idempotent, no accumulation).
       await cg.indexAll();
       const stats2 = cg.getStats();
-      expect(stats2.totalNodes).toBe(stats1.totalNodes);
-      expect(stats2.totalEdges).toBe(stats1.totalEdges);
+      expect(stats2.nodeCount).toBe(stats1.nodeCount);
+      expect(stats2.edgeCount).toBe(stats1.edgeCount);
 
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'cb_a'))).toEqual(['wire']);
     } finally {

@@ -20,7 +20,6 @@ describe('FrameworkResolver.extract interface', () => {
 });
 
 import { getApplicableFrameworks } from '../src/resolution/frameworks';
-import type { FrameworkResolver } from '../src/resolution/types';
 
 describe('getApplicableFrameworks', () => {
   const pyFw: FrameworkResolver = { name: 'py', languages: ['python'], detect: () => true, resolve: () => null };
@@ -52,34 +51,34 @@ urlpatterns = [
 `;
     const { nodes, references } = djangoResolver.extract!('users/urls.py', src);
     expect(nodes).toHaveLength(1);
-    expect(nodes[0].kind).toBe('route');
-    expect(nodes[0].name).toBe('users/');
+    expect(nodes[0]!.kind).toBe('route');
+    expect(nodes[0]!.name).toBe('users/');
     expect(references).toHaveLength(1);
-    expect(references[0].referenceName).toBe('UserListView');
-    expect(references[0].referenceKind).toBe('references');
-    expect(references[0].fromNodeId).toBe(nodes[0].id);
+    expect(references[0]!.referenceName).toBe('UserListView');
+    expect(references[0]!.referenceKind).toBe('references');
+    expect(references[0]!.fromNodeId).toBe(nodes[0]!.id);
   });
 
   it('extracts route for path() with dotted module.Class.as_view()', () => {
     const src = `from django.urls import path\nfrom api.v1 import views as api_v1_views\nurlpatterns = [path('api/', api_v1_views.UserListView.as_view())]\n`;
     const { nodes, references } = djangoResolver.extract!('api/urls.py', src);
     expect(nodes).toHaveLength(1);
-    expect(references[0].referenceName).toBe('UserListView');
+    expect(references[0]!.referenceName).toBe('UserListView');
   });
 
   it('extracts route for path() with bare function view', () => {
     const src = `from django.urls import path\nurlpatterns = [path('home/', home_view, name='home')]\n`;
-    const { nodes, references } = djangoResolver.extract!('home/urls.py', src);
-    expect(references[0].referenceName).toBe('home_view');
+    const { references } = djangoResolver.extract!('home/urls.py', src);
+    expect(references[0]!.referenceName).toBe('home_view');
   });
 
   it('extracts route for path() with include()', () => {
     const src = `from django.urls import path, include\nurlpatterns = [path('api/', include('api.urls'))]\n`;
     const { nodes, references } = djangoResolver.extract!('root/urls.py', src);
     expect(nodes).toHaveLength(1);
-    expect(nodes[0].kind).toBe('route');
-    expect(references[0].referenceName).toBe('api.urls');
-    expect(references[0].referenceKind).toBe('imports');
+    expect(nodes[0]!.kind).toBe('route');
+    expect(references[0]!.referenceName).toBe('api.urls');
+    expect(references[0]!.referenceKind).toBe('imports');
   });
 
   it('extracts routes for re_path and url', () => {
@@ -108,9 +107,9 @@ def list_users():
 `;
     const { nodes, references } = flaskResolver.extract!('app.py', src);
     expect(nodes).toHaveLength(1);
-    expect(nodes[0].kind).toBe('route');
-    expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('list_users');
+    expect(nodes[0]!.kind).toBe('route');
+    expect(nodes[0]!.name).toBe('GET /users');
+    expect(references[0]!.referenceName).toBe('list_users');
   });
 
   it('extracts blueprint routes', () => {
@@ -120,8 +119,8 @@ def create_user(id):
     pass
 `;
     const { nodes, references } = flaskResolver.extract!('routes.py', src);
-    expect(nodes[0].name).toBe('POST /<id>');
-    expect(references[0].referenceName).toBe('create_user');
+    expect(nodes[0]!.name).toBe('POST /<id>');
+    expect(references[0]!.referenceName).toBe('create_user');
   });
 
   it('resolves the handler across an intervening decorator (@login_required)', () => {
@@ -132,8 +131,8 @@ def profile():
     return render_template('profile.html')
 `;
     const { nodes, references } = flaskResolver.extract!('routes.py', src);
-    expect(nodes[0].name).toBe('GET /profile');
-    expect(references[0].referenceName).toBe('profile');
+    expect(nodes[0]!.name).toBe('GET /profile');
+    expect(references[0]!.referenceName).toBe('profile');
   });
 
   it('extracts stacked @x.route decorators bound to one view', () => {
@@ -156,8 +155,8 @@ def make_article():
     pass
 `;
     const { nodes, references } = flaskResolver.extract!('views.py', src);
-    expect(nodes[0].name).toBe('POST /api/articles');
-    expect(references[0].referenceName).toBe('make_article');
+    expect(nodes[0]!.name).toBe('POST /api/articles');
+    expect(references[0]!.referenceName).toBe('make_article');
   });
 
   it('extracts Flask-RESTful api.add_resource(Resource, paths) → the Resource class', () => {
@@ -179,8 +178,8 @@ async def list_users():
     return []
 `;
     const { nodes, references } = fastapiResolver.extract!('main.py', src);
-    expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('list_users');
+    expect(nodes[0]!.name).toBe('GET /users');
+    expect(references[0]!.referenceName).toBe('list_users');
   });
 
   it('extracts route from router.post', () => {
@@ -190,8 +189,8 @@ def create_item(item: Item):
     pass
 `;
     const { nodes, references } = fastapiResolver.extract!('items.py', src);
-    expect(nodes[0].name).toBe('POST /items');
-    expect(references[0].referenceName).toBe('create_item');
+    expect(nodes[0]!.name).toBe('POST /items');
+    expect(references[0]!.referenceName).toBe('create_item');
   });
 
   it('extracts a route mounted at the router/prefix root (empty path)', () => {
@@ -201,8 +200,8 @@ async def list_articles():
     return []
 `;
     const { nodes, references } = fastapiResolver.extract!('articles.py', src);
-    expect(nodes[0].name).toBe('GET /');
-    expect(references[0].referenceName).toBe('list_articles');
+    expect(nodes[0]!.name).toBe('GET /');
+    expect(references[0]!.referenceName).toBe('list_articles');
   });
 
   it('extracts a multi-line decorator with an empty path', () => {
@@ -216,8 +215,8 @@ async def create_article():
     pass
 `;
     const { nodes, references } = fastapiResolver.extract!('articles.py', src);
-    expect(nodes[0].name).toBe('POST /');
-    expect(references[0].referenceName).toBe('create_article');
+    expect(nodes[0]!.name).toBe('POST /');
+    expect(references[0]!.referenceName).toBe('create_article');
   });
 });
 
@@ -228,22 +227,22 @@ describe('expressResolver.extract', () => {
     const src = `app.get('/users', listUsers);\n`;
     const { nodes, references } = expressResolver.extract!('routes.ts', src);
     expect(nodes).toHaveLength(1);
-    expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('listUsers');
+    expect(nodes[0]!.name).toBe('GET /users');
+    expect(references[0]!.referenceName).toBe('listUsers');
   });
 
   it('extracts route with router.post and middleware chain', () => {
     const src = `router.post('/items', auth, createItem);\n`;
     const { nodes, references } = expressResolver.extract!('items.ts', src);
-    expect(nodes[0].name).toBe('POST /items');
+    expect(nodes[0]!.name).toBe('POST /items');
     // Multiple handlers: prefer the LAST one (convention: middleware first, handler last)
-    expect(references[0].referenceName).toBe('createItem');
+    expect(references[0]!.referenceName).toBe('createItem');
   });
 
   it('extracts route with controller method reference', () => {
     const src = `app.get('/x', userController.list);\n`;
-    const { nodes, references } = expressResolver.extract!('routes.ts', src);
-    expect(references[0].referenceName).toBe('list');
+    const { references } = expressResolver.extract!('routes.ts', src);
+    expect(references[0]!.referenceName).toBe('list');
   });
 });
 
@@ -260,11 +259,11 @@ export class UsersController {
 `;
     const { nodes, references } = nestjsResolver.extract!('users.controller.ts', src);
     expect(nodes).toHaveLength(1);
-    expect(nodes[0].kind).toBe('route');
-    expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('findAll');
-    expect(references[0].referenceKind).toBe('references');
-    expect(references[0].fromNodeId).toBe(nodes[0].id);
+    expect(nodes[0]!.kind).toBe('route');
+    expect(nodes[0]!.name).toBe('GET /users');
+    expect(references[0]!.referenceName).toBe('findAll');
+    expect(references[0]!.referenceKind).toBe('references');
+    expect(references[0]!.fromNodeId).toBe(nodes[0]!.id);
   });
 
   it('joins controller prefix with a method-level path param', () => {
@@ -276,8 +275,8 @@ export class CatsController {
 }
 `;
     const { nodes, references } = nestjsResolver.extract!('cats.controller.ts', src);
-    expect(nodes[0].name).toBe('GET /cats/:id');
-    expect(references[0].referenceName).toBe('findOne');
+    expect(nodes[0]!.name).toBe('GET /cats/:id');
+    expect(references[0]!.referenceName).toBe('findOne');
   });
 
   it('handles an empty @Controller() and empty @Post()', () => {
@@ -289,8 +288,8 @@ export class AppController {
 }
 `;
     const { nodes, references } = nestjsResolver.extract!('app.controller.ts', src);
-    expect(nodes[0].name).toBe('POST /');
-    expect(references[0].referenceName).toBe('create');
+    expect(nodes[0]!.name).toBe('POST /');
+    expect(references[0]!.referenceName).toBe('create');
   });
 
   it('covers HTTP verbs and skips intervening method decorators', () => {
@@ -355,7 +354,7 @@ export class CatsResolver {
 }
 `;
     const { nodes } = nestjsResolver.extract!('cats.resolver.ts', src);
-    expect(nodes[0].name).toBe('QUERY cat');
+    expect(nodes[0]!.name).toBe('QUERY cat');
   });
 
   it('does NOT treat the REST @Query() parameter decorator as a GraphQL op', () => {
@@ -398,8 +397,8 @@ export class ChatGateway {
 }
 `;
     const { nodes, references } = nestjsResolver.extract!('chat.gateway.ts', src);
-    expect(nodes[0].name).toBe('WS chat:message');
-    expect(references[0].referenceName).toBe('handleMessage');
+    expect(nodes[0]!.name).toBe('WS chat:message');
+    expect(references[0]!.referenceName).toBe('handleMessage');
   });
 
   it('extracts @SubscribeMessage without a namespace', () => {
@@ -411,7 +410,7 @@ export class EventsGateway {
 }
 `;
     const { nodes } = nestjsResolver.extract!('events.gateway.ts', src);
-    expect(nodes[0].name).toBe('WS events');
+    expect(nodes[0]!.name).toBe('WS events');
   });
 
   it('returns empty for a non-JS/TS file', () => {
@@ -799,21 +798,21 @@ describe('laravelResolver.extract', () => {
   it('extracts route with controller tuple syntax', () => {
     const src = `Route::get('/users', [UserController::class, 'index']);\n`;
     const { nodes, references } = laravelResolver.extract!('routes/web.php', src);
-    expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('UserController@index');
+    expect(nodes[0]!.name).toBe('GET /users');
+    expect(references[0]!.referenceName).toBe('UserController@index');
   });
 
   it('extracts route with Controller@action syntax', () => {
     const src = `Route::post('/users', 'UserController@store');\n`;
-    const { nodes, references } = laravelResolver.extract!('routes/web.php', src);
-    expect(references[0].referenceName).toBe('UserController@store');
+    const { references } = laravelResolver.extract!('routes/web.php', src);
+    expect(references[0]!.referenceName).toBe('UserController@store');
   });
 
   it('extracts resource route', () => {
     const src = `Route::resource('users', UserController::class);\n`;
     const { nodes, references } = laravelResolver.extract!('routes/web.php', src);
-    expect(nodes[0].kind).toBe('route');
-    expect(references[0].referenceName).toBe('UserController');
+    expect(nodes[0]!.kind).toBe('route');
+    expect(references[0]!.referenceName).toBe('UserController');
   });
 });
 
@@ -823,14 +822,14 @@ describe('railsResolver.extract', () => {
   it('extracts route with controller#action syntax', () => {
     const src = `get '/users', to: 'users#index'\n`;
     const { nodes, references } = railsResolver.extract!('config/routes.rb', src);
-    expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('users#index');
+    expect(nodes[0]!.name).toBe('GET /users');
+    expect(references[0]!.referenceName).toBe('users#index');
   });
 
   it('extracts route without to: keyword', () => {
     const src = `post '/items' => 'items#create'\n`;
-    const { nodes, references } = railsResolver.extract!('config/routes.rb', src);
-    expect(references[0].referenceName).toBe('items#create');
+    const { references } = railsResolver.extract!('config/routes.rb', src);
+    expect(references[0]!.referenceName).toBe('items#create');
   });
 });
 
@@ -845,8 +844,8 @@ public List<User> listUsers() {
 }
 `;
     const { nodes, references } = springResolver.extract!('UserController.java', src);
-    expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('listUsers');
+    expect(nodes[0]!.name).toBe('GET /users');
+    expect(references[0]!.referenceName).toBe('listUsers');
   });
 
   it('extracts a Kotlin @GetMapping with a fun handler', () => {
@@ -857,9 +856,9 @@ fun showVetList(model: MutableMap<String, Any>): String {
 }
 `;
     const { nodes, references } = springResolver.extract!('VetController.kt', src);
-    expect(nodes[0].name).toBe('GET /vets');
-    expect(references[0].referenceName).toBe('showVetList');
-    expect(nodes[0].language).toBe('kotlin');
+    expect(nodes[0]!.name).toBe('GET /vets');
+    expect(references[0]!.referenceName).toBe('showVetList');
+    expect(nodes[0]!.language).toBe('kotlin');
   });
 
   it('joins a Kotlin class @RequestMapping prefix and skips a stacked annotation', () => {
@@ -875,8 +874,8 @@ class OwnerController {
 }
 `;
     const { nodes, references } = springResolver.extract!('OwnerController.kt', src);
-    expect(nodes[0].name).toBe('GET /owners/{ownerId}');
-    expect(references[0].referenceName).toBe('showOwner');
+    expect(nodes[0]!.name).toBe('GET /owners/{ownerId}');
+    expect(references[0]!.referenceName).toBe('showOwner');
   });
 });
 
@@ -925,14 +924,14 @@ describe('goResolver.extract', () => {
   it('extracts route from r.GET', () => {
     const src = `r.GET("/users", listUsers)\n`;
     const { nodes, references } = goResolver.extract!('main.go', src);
-    expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('listUsers');
+    expect(nodes[0]!.name).toBe('GET /users');
+    expect(references[0]!.referenceName).toBe('listUsers');
   });
 
   it('extracts route from router.HandleFunc', () => {
     const src = `router.HandleFunc("/items", createItem)\n`;
-    const { nodes, references } = goResolver.extract!('main.go', src);
-    expect(references[0].referenceName).toBe('createItem');
+    const { references } = goResolver.extract!('main.go', src);
+    expect(references[0]!.referenceName).toBe('createItem');
   });
 
   it('extracts gorilla/mux HandleFunc on a subrouter var, ignoring chained .Methods()', () => {
@@ -940,7 +939,7 @@ describe('goResolver.extract', () => {
     // trailing .Methods("GET") doesn't break the handler capture.
     const src = `s.HandleFunc("/users/{id}", listUsers).Methods("GET")\n`;
     const { references } = goResolver.extract!('routes.go', src);
-    expect(references[0].referenceName).toBe('listUsers');
+    expect(references[0]!.referenceName).toBe('listUsers');
   });
 
   it('does NOT treat verb-named method calls with non-path args as routes (#1259)', () => {
@@ -970,8 +969,8 @@ describe('goResolver.extract', () => {
   it('recognizes Go 1.22 "METHOD /path" patterns on HandleFunc and extracts the method', () => {
     const src = `mux.HandleFunc("GET /api/users/{id}", getUser)\n`;
     const { nodes, references } = goResolver.extract!('main.go', src);
-    expect(nodes[0].name).toBe('GET /api/users/{id}');
-    expect(references[0].referenceName).toBe('getUser');
+    expect(nodes[0]!.name).toBe('GET /api/users/{id}');
+    expect(references[0]!.referenceName).toBe('getUser');
   });
 });
 
@@ -999,10 +998,10 @@ type SignInRes struct{}
 `;
     const { nodes } = goframeResolver.extract!('api/user/v1/user_sign_in.go', src);
     expect(nodes).toHaveLength(1);
-    expect(nodes[0].kind).toBe('route');
-    expect(nodes[0].name).toBe('POST /user/sign-in');
+    expect(nodes[0]!.kind).toBe('route');
+    expect(nodes[0]!.name).toBe('POST /user/sign-in');
     // The package-qualified request type is encoded for the synthesizer join.
-    expect(nodes[0].qualifiedName).toContain('::goframe-route:v1.SignInReq');
+    expect(nodes[0]!.qualifiedName).toContain('::goframe-route:v1.SignInReq');
   });
 
   it('is independent of g.Meta tag attribute order', () => {
@@ -1010,8 +1009,8 @@ type SignInRes struct{}
 	g.Meta \`path:"/dept/list" tags:"Dept" method:"get" summary:"列表"\`
 }`;
     const { nodes } = goframeResolver.extract!('api/system/dept.go', src);
-    expect(nodes[0].name).toBe('GET /dept/list');
-    expect(nodes[0].qualifiedName).toContain('::goframe-route:DeptSearchReq');
+    expect(nodes[0]!.name).toBe('GET /dept/list');
+    expect(nodes[0]!.qualifiedName).toContain('::goframe-route:DeptSearchReq');
   });
 
   it('skips a response g.Meta that has no path (mime-only) and other non-route metadata', () => {
@@ -1028,7 +1027,7 @@ type SignInRes struct{}
 	g.Meta \`path:"/ping"\`
 }`;
     const { nodes } = goframeResolver.extract!('api/ping.go', src);
-    expect(nodes[0].name).toBe('ANY /ping');
+    expect(nodes[0]!.name).toBe('ANY /ping');
   });
 
   it('extracts every request struct in a multi-route api file', () => {
@@ -1053,8 +1052,8 @@ describe('rustResolver.extract', () => {
   it('extracts route from axum .route with get()', () => {
     const src = `let app = Router::new().route("/users", get(list_users));\n`;
     const { nodes, references } = rustResolver.extract!('main.rs', src);
-    expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('list_users');
+    expect(nodes[0]!.name).toBe('GET /users');
+    expect(references[0]!.referenceName).toBe('list_users');
   });
 
   it('extracts every method from a chained axum .route (get().put())', () => {
@@ -1076,29 +1075,29 @@ let app = Router::new()
     );
 `;
     const { nodes, references } = rustResolver.extract!('main.rs', src);
-    expect(nodes[0].name).toBe('GET /articles/feed');
-    expect(references[0].referenceName).toBe('feed_articles');
+    expect(nodes[0]!.name).toBe('GET /articles/feed');
+    expect(references[0]!.referenceName).toBe('feed_articles');
   });
 
   it('extracts actix web::resource().route(web::METHOD().to(handler))', () => {
     const src = `App::new().service(web::resource("/user/{id}").route(web::get().to(get_user)))\n`;
     const { nodes, references } = rustResolver.extract!('main.rs', src);
-    expect(nodes[0].name).toBe('GET /user/{id}');
-    expect(references[0].referenceName).toBe('get_user');
+    expect(nodes[0]!.name).toBe('GET /user/{id}');
+    expect(references[0]!.referenceName).toBe('get_user');
   });
 
   it('extracts actix web::resource("/").to(handler) (all methods)', () => {
     const src = `App::new().service(web::resource("/").to(index))\n`;
     const { nodes, references } = rustResolver.extract!('main.rs', src);
-    expect(nodes[0].name).toBe('ANY /');
-    expect(references[0].referenceName).toBe('index');
+    expect(nodes[0]!.name).toBe('ANY /');
+    expect(references[0]!.referenceName).toBe('index');
   });
 
   it('extracts actix App-level .route("/path", web::METHOD().to(handler))', () => {
     const src = `App::new().route("/health", web::get().to(health_check))\n`;
     const { nodes, references } = rustResolver.extract!('main.rs', src);
-    expect(nodes[0].name).toBe('GET /health');
-    expect(references[0].referenceName).toBe('health_check');
+    expect(nodes[0]!.name).toBe('GET /health');
+    expect(references[0]!.referenceName).toBe('health_check');
   });
 });
 
@@ -1421,8 +1420,8 @@ public IActionResult ListUsers()
 }
 `;
     const { nodes, references } = aspnetResolver.extract!('UserController.cs', src);
-    expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('ListUsers');
+    expect(nodes[0]!.name).toBe('GET /users');
+    expect(references[0]!.referenceName).toBe('ListUsers');
   });
 });
 
@@ -1432,8 +1431,8 @@ describe('vaporResolver.extract', () => {
   it('extracts route from app.get with use:', () => {
     const src = `app.get("users", use: listUsers)\n`;
     const { nodes, references } = vaporResolver.extract!('routes.swift', src);
-    expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('listUsers');
+    expect(nodes[0]!.name).toBe('GET /users');
+    expect(references[0]!.referenceName).toBe('listUsers');
   });
 
   it('extracts grouped RouteCollection routes with the group prefix and no path arg', () => {
@@ -1463,8 +1462,8 @@ func boot(routes: RoutesBuilder) throws {
   it('handles use: self.handler and non-string path segments', () => {
     const src = `router.get("users", User.parameter, "edit", use: self.editUserHandler)\n`;
     const { nodes, references } = vaporResolver.extract!('UserController.swift', src);
-    expect(nodes[0].name).toBe('GET /users/edit');
-    expect(references[0].referenceName).toBe('editUserHandler');
+    expect(nodes[0]!.name).toBe('GET /users/edit');
+    expect(references[0]!.referenceName).toBe('editUserHandler');
   });
 
   it('ignores non-route .get calls that lack use: (e.g. Environment.get)', () => {

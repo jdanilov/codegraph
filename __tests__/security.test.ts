@@ -14,9 +14,9 @@ import * as path from 'path';
 import * as os from 'os';
 import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
-import { ToolHandler, tools } from '../src/mcp/tools';
+import { ToolHandler } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
-import { DatabaseConnection, getDatabasePath } from '../src/db';
+import { DatabaseConnection } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
 
 function createTempDir(): string {
@@ -150,9 +150,7 @@ describe('Path Traversal Prevention', () => {
       `export function hello(): string { return "hi"; }\n`
     );
 
-    cg = CodeGraph.initSync(testDir, {
-      config: { include: ['**/*.ts'], exclude: [] },
-    });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
   });
 
@@ -257,7 +255,7 @@ describe('Symlink escape prevention (#527)', () => {
       'export function leaked() { return "LEAKED-ZZZ-9"; }\n');
     if (!link(path.join(root, 'vendored'), path.join(outside, 'pkg'))) return;
 
-    const cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
+    const cg = CodeGraph.initSync(root);
     try {
       await cg.indexAll();
       // Whether or not extraction followed the dir symlink, NO node may ever
@@ -281,7 +279,7 @@ describe('Symlink escape prevention (#527)', () => {
       'export function vendoredHelper() { return "LEAKED-ZZZ-9"; }\n');
     if (!link(path.join(root, 'game'), path.join(outside, 'pkg'))) return;
 
-    const cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
+    const cg = CodeGraph.initSync(root);
     try {
       await cg.indexAll();
       // The symlinked-in file is now part of the graph...
@@ -344,9 +342,7 @@ describe('MCP Input Validation', () => {
       `export function exampleFunc(): void {}\nexport class ExampleClass {}\n`
     );
 
-    cg = CodeGraph.initSync(testDir, {
-      config: { include: ['**/*.ts'], exclude: [] },
-    });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });
@@ -359,13 +355,13 @@ describe('MCP Input Validation', () => {
   it('should reject non-string query in codegraph_search', async () => {
     const result = await handler.execute('codegraph_search', { query: null });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('non-empty string');
+    expect(result.content[0]!.text).toContain('non-empty string');
   });
 
   it('should reject empty string query in codegraph_search', async () => {
     const result = await handler.execute('codegraph_search', { query: '' });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('non-empty string');
+    expect(result.content[0]!.text).toContain('non-empty string');
   });
 
   it('should accept valid query in codegraph_search', async () => {
@@ -382,13 +378,13 @@ describe('MCP Input Validation', () => {
   it('should reject non-string symbol in codegraph_callers', async () => {
     const result = await handler.execute('codegraph_callers', { symbol: 123 });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('non-empty string');
+    expect(result.content[0]!.text).toContain('non-empty string');
   });
 
   it('should reject non-string query in codegraph_explore', async () => {
     const result = await handler.execute('codegraph_explore', { query: undefined });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('non-empty string');
+    expect(result.content[0]!.text).toContain('non-empty string');
   });
 
   it('should truncate oversized tool output', async () => {
@@ -418,7 +414,7 @@ describe('MCP Input Validation', () => {
     const result = await fakeHandler.execute('codegraph_search', { query: 'x' });
 
     expect(result.isError).toBeFalsy();
-    expect(result.content[0].text).toContain('... (output truncated)');
+    expect(result.content[0]!.text).toContain('... (output truncated)');
   });
 
   it('should reject non-string symbol in codegraph_impact', async () => {
@@ -458,7 +454,7 @@ describe('MCP Input Validation', () => {
         projectPath: '/etc',
       });
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toMatch(/sensitive system directory/i);
+      expect(result.content[0]!.text).toMatch(/sensitive system directory/i);
     }
   );
 
@@ -470,7 +466,7 @@ describe('MCP Input Validation', () => {
         projectPath: 'C:\\Windows',
       });
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toMatch(/sensitive system directory/i);
+      expect(result.content[0]!.text).toMatch(/sensitive system directory/i);
     }
   );
 });
@@ -585,9 +581,9 @@ describe('JSON.parse Error Boundaries in DB', () => {
     // Should not throw - should return edge with undefined metadata
     const edges = queries.getOutgoingEdges('node-a');
     expect(edges.length).toBe(1);
-    expect(edges[0].source).toBe('node-a');
-    expect(edges[0].target).toBe('node-b');
-    expect(edges[0].metadata).toBeUndefined();
+    expect(edges[0]!.source).toBe('node-a');
+    expect(edges[0]!.target).toBe('node-b');
+    expect(edges[0]!.metadata).toBeUndefined();
 
     db.close();
   });

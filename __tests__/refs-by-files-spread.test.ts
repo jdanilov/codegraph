@@ -53,7 +53,7 @@ describe('unresolved-ref loads with dense result sets (#1558)', () => {
       batch.push({
         fromNodeId: anchorId,
         referenceName: `ref_${i}`,
-        referenceKind: 'call',
+        referenceKind: 'calls',
         line: (i % 1000) + 1,
         column: 0,
         filePath: paths[i % FILES]!,

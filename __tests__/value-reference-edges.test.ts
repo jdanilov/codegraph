@@ -42,7 +42,7 @@ describe('value-reference edges', () => {
   });
 
   function index(): CodeGraph {
-    const g = CodeGraph.initSync(dir, { config: { include: ['**/*.ts', '**/*.tsx'], exclude: [] } });
+    const g = CodeGraph.initSync(dir);
     return g;
   }
 

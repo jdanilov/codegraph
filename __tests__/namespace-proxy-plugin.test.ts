@@ -751,6 +751,7 @@ describe('precision safeguards', () => {
       endLine: 5,
       startColumn: 0,
       endColumn: 0,
+      updatedAt: Date.now(),
     };
     const context = fakeContext({
       getAllFiles: () => ['src/services/mailer.ts'],
@@ -791,6 +792,7 @@ describe('confidence and attribution', () => {
     endLine: 5,
     startColumn: 0,
     endColumn: 0,
+    updatedAt: Date.now(),
   };
 
   it('scores registry-backed resolutions higher than assignment-scanned ones', () => {

@@ -61,7 +61,7 @@ export const outerThunk = createAsyncThunk('app/outer', async (n: number, { disp
 `
     );
 
-    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(dir);
     await cg.indexAll();
 
     // Precondition: the endpoints really are `constant` nodes — the exact kind the old
@@ -73,7 +73,7 @@ export const outerThunk = createAsyncThunk('app/outer', async (n: number, { disp
 
     handler = new ToolHandler(cg);
     const res = await handler.execute('codegraph_explore', { query: 'outerThunk innerThunk' });
-    const text = res.content[0].text as string;
+    const text = res.content[0]!.text as string;
 
     // The synthesized hop now surfaces (was invisible: both endpoints `constant` AND the
     // small-repo Relationships section is off).

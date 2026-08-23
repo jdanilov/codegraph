@@ -9,15 +9,12 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
-import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 
 import CodeGraph from '../src/index';
 import { startUiServer, type UiServer } from '../src/ui-server';
-import { layerOf } from '../src/ui-server/graph-payload';
-import { tokenizeCommand, buildEditorArgv } from '../src/ui-server/editor';
 import { mergeSettings, settingsView } from '../src/ui-server/settings';
 import { normalizeSymbolBag } from '../src/ui-server/ask';
 

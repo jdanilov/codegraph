@@ -63,6 +63,7 @@ function classNode(name: string, filePath: string, kind: NodeKind = 'class'): No
     endLine: 3,
     startColumn: 0,
     endColumn: 1,
+    updatedAt: Date.now(),
   };
 }
 

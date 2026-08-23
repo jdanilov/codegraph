@@ -30,12 +30,7 @@ describe('Sync Module', () => {
       );
 
       // Initialize and index
-      cg = CodeGraph.initSync(testDir, {
-        config: {
-          include: ['**/*.ts'],
-          exclude: [],
-        },
-      });
+      cg = CodeGraph.initSync(testDir);
       await cg.indexAll();
     });
 
@@ -201,12 +196,7 @@ describe('Sync Module', () => {
       git('commit', '-m', 'initial');
 
       // Initialize CodeGraph and index
-      cg = CodeGraph.initSync(testDir, {
-        config: {
-          include: ['**/*.ts'],
-          exclude: [],
-        },
-      });
+      cg = CodeGraph.initSync(testDir);
       await cg.indexAll();
     });
 
@@ -374,9 +364,7 @@ describe('Sync Module', () => {
       git('add', '-f', 'generated/out.ts'); // force the ignored-but-tracked file in
       git('commit', '-m', 'initial');
 
-      cg = CodeGraph.initSync(testDir, {
-        config: { include: ['**/*.ts'], exclude: [] },
-      });
+      cg = CodeGraph.initSync(testDir);
       await cg.indexAll();
     });
 
@@ -481,9 +469,7 @@ describe('Sync Module', () => {
       write('a.ts', `import { greet } from './b';\n\nexport function run(): number {\n  return greet();\n}\n`);
       write('b.ts', `export function other(): number {\n  return 1;\n}\n`);
 
-      cg = CodeGraph.initSync(testDir, {
-        config: { include: ['**/*.ts'], exclude: [] },
-      });
+      cg = CodeGraph.initSync(testDir);
       await cg.indexAll();
     });
 
@@ -586,9 +572,7 @@ describe('Sync Module', () => {
       write('a.ts', `export function run(): number {\n  return greet();\n}\n`);
       write('b.ts', `export function greet(): number {\n  return 42;\n}\n`);
 
-      cg = CodeGraph.initSync(testDir, {
-        config: { include: ['**/*.ts'], exclude: [] },
-      });
+      cg = CodeGraph.initSync(testDir);
       await cg.indexAll();
       // Baseline: the call resolved into b.ts.
       expect(greetCallers()).toContain('run');
@@ -691,9 +675,7 @@ describe('Sync Module', () => {
         ].join('\n')
       );
 
-      cg = CodeGraph.initSync(testDir, {
-        config: { include: ['**/*.py'], exclude: [] },
-      });
+      cg = CodeGraph.initSync(testDir);
       await cg.indexAll();
     });
 

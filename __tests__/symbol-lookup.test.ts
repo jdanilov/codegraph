@@ -83,9 +83,7 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — module-qualified lookups (#173)'
     projectRoot = await buildRustWorkspace();
     const CodeGraph = (await import('../src/index')).default;
     const { ToolHandler } = await import('../src/mcp/tools');
-    cg = CodeGraph.initSync(projectRoot, {
-      config: { include: ['**/*.rs'], exclude: [] },
-    });
+    cg = CodeGraph.initSync(projectRoot);
     await cg.indexAll();
     handler = new ToolHandler(cg);
     findSymbolMatches = (handler as any).findSymbolMatches.bind(handler);
@@ -186,9 +184,7 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
 
     const CodeGraph = (await import('../src/index')).default;
     const { ToolHandler } = await import('../src/mcp/tools');
-    cg = CodeGraph.initSync(projectRoot, {
-      config: { include: ['src/**/*.ts'], exclude: [] },
-    });
+    cg = CodeGraph.initSync(projectRoot);
     await cg.indexAll();
     handler = new ToolHandler(cg);
     findSymbolMatches = (handler as any).findSymbolMatches.bind(handler);

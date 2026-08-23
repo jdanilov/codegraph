@@ -706,9 +706,7 @@ describe('FileWatcher', () => {
     });
 
     it('should watch and unwatch via CodeGraph API', async () => {
-      cg = CodeGraph.initSync(testDir, {
-        config: { include: ['**/*.ts'], exclude: [] },
-      });
+      cg = CodeGraph.initSync(testDir);
       await cg.indexAll();
 
       expect(cg.isWatching()).toBe(false);
@@ -722,9 +720,7 @@ describe('FileWatcher', () => {
     });
 
     it('should stop watching on close', async () => {
-      cg = CodeGraph.initSync(testDir, {
-        config: { include: ['**/*.ts'], exclude: [] },
-      });
+      cg = CodeGraph.initSync(testDir);
       await cg.indexAll();
 
       cg.watch({ debounceMs: 200, inertForTests: true });
@@ -739,9 +735,7 @@ describe('FileWatcher', () => {
     it('should auto-sync when files change while watching (real fs.watch end-to-end)', async () => {
       // The one test that exercises the genuine native watcher: a real file
       // write must propagate through fs.watch → debounce → sync into the graph.
-      cg = CodeGraph.initSync(testDir, {
-        config: { include: ['**/*.ts'], exclude: [] },
-      });
+      cg = CodeGraph.initSync(testDir);
       await cg.indexAll();
 
       const initialStats = cg.getStats();

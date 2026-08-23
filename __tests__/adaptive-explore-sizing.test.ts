@@ -44,7 +44,7 @@ function sectionFor(text: string, basename: string): string {
   if (start < 0) return '';
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i++) {
-    if (lines[i].startsWith('**')) {
+    if (lines[i]!.startsWith('**')) {
       end = i;
       break;
     }
@@ -244,7 +244,7 @@ export class YamlCodec extends Codec {
 `
     );
 
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });

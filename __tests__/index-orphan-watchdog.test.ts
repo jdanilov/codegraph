@@ -89,7 +89,7 @@ describe.skipIf(process.platform === 'win32')('index/init orphan supervision (#9
     `;
     wrapper = spawn(process.execPath, ['-e', wrapperSrc], {
       stdio: ['pipe', 'pipe', 'inherit'],
-    }) as ChildProcessWithoutNullStreams;
+    }) as unknown as ChildProcessWithoutNullStreams;
 
     const { pid } = await new Promise<{ pid: number }>((resolve, reject) => {
       let buf = '';
@@ -97,7 +97,7 @@ describe.skipIf(process.platform === 'win32')('index/init orphan supervision (#9
       wrapper!.stdout.on('data', (chunk: Buffer) => {
         buf += chunk.toString('utf8');
         const m = buf.match(/\{"pid":(\d+)\}/);
-        if (m) { clearTimeout(timer); resolve({ pid: parseInt(m[1], 10) }); }
+        if (m) { clearTimeout(timer); resolve({ pid: parseInt(m[1]!, 10) }); }
       });
       wrapper!.on('exit', () => { clearTimeout(timer); reject(new Error('wrapper exited before reporting pid')); });
     });

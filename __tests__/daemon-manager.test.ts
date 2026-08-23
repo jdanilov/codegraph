@@ -29,8 +29,8 @@ describe('buildPickItems', () => {
   it('orders newest-first and appends Stop all + Cancel', () => {
     const items = buildPickItems([old, fresh], null, 3000);
     expect(items.map((i) => i.value)).toEqual(['/p/new', '/p/old', STOP_ALL, CANCEL]);
-    expect(items[0].hint).toContain('pid 2');
-    expect(items[0].hint).toContain('Running');
+    expect(items[0]!.hint).toContain('pid 2');
+    expect(items[0]!.hint).toContain('Running');
   });
 
   it('omits Stop all for a single daemon (but keeps Cancel)', () => {
@@ -39,8 +39,8 @@ describe('buildPickItems', () => {
 
   it('floats the current project to the top, auto-selected and labelled', () => {
     const items = buildPickItems([old, fresh, cwd], '/p/cwd', 3000);
-    expect(items[0].value).toBe('/p/cwd');
-    expect(items[0].label).toContain('(current project)');
+    expect(items[0]!.value).toBe('/p/cwd');
+    expect(items[0]!.label).toContain('(current project)');
     expect(items.slice(1, 3).map((i) => i.value)).toEqual(['/p/new', '/p/old']); // rest newest-first
   });
 });

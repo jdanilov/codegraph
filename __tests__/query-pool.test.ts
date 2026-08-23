@@ -79,7 +79,7 @@ describe('QueryPool', () => {
   it('dispatches a call and returns the worker result', async () => {
     const pool = new QueryPool({ root: '/x', size: 1, createWorker: () => new FakeWorker((m) => ({ result: ok(`r:${m.toolName}`) })) });
     const res = await pool.run('codegraph_explore', { query: 'q' });
-    expect(res.content[0].text).toBe('r:codegraph_explore');
+    expect(res.content[0]!.text).toBe('r:codegraph_explore');
     await pool.destroy();
   });
 
@@ -103,7 +103,7 @@ describe('QueryPool', () => {
     expect(maxActive).toBe(5);
     release();
     const results = await calls;
-    expect(results.every((r) => /^r\d+$/.test(r.content[0].text))).toBe(true);
+    expect(results.every((r) => /^r\d+$/.test(r.content[0]!.text))).toBe(true);
     await pool.destroy();
   });
 
@@ -125,7 +125,7 @@ describe('QueryPool', () => {
     });
     const res = await pool.run('codegraph_explore', { query: 'q' });
     expect(res.isError).toBeFalsy();
-    expect(res.content[0].text).toBe('recovered:1');
+    expect(res.content[0]!.text).toBe('recovered:1');
     await sleep(10);
     // The pool grows lazily, so one call keeps one worker — but the crash must
     // have been replaced (not dropped to zero) and the pool stays healthy and
@@ -148,7 +148,7 @@ describe('QueryPool', () => {
     expect(bad.isError).toBe(true); // graceful, after retries
     const good = await pool.run('codegraph_search', { query: 'fine' });
     expect(good.isError).toBeFalsy();
-    expect(good.content[0].text).toMatch(/^ok:/);
+    expect(good.content[0]!.text).toMatch(/^ok:/);
     await pool.destroy();
   });
 
@@ -158,7 +158,7 @@ describe('QueryPool', () => {
     const pool = new QueryPool({ root: '/x', size: 1, softTimeoutMs: 60, createWorker: () => new FakeWorker(() => ({ hang: true })) });
     const res = await pool.run('codegraph_explore', { query: 'q' });
     expect(res.isError).toBeFalsy();            // NOT an error (abandonment rule)
-    expect(res.content[0].text).toMatch(/busy|retry/i);
+    expect(res.content[0]!.text).toMatch(/busy|retry/i);
     await pool.destroy();
   });
 
@@ -184,7 +184,7 @@ describe('QueryPool', () => {
     await sleep(5);                 // let the ready handshake land
     expect(pool.ready).toBe(true);
     const res = await pool.run('codegraph_status', {});
-    expect(res.content[0].text).toBe('r:codegraph_status');
+    expect(res.content[0]!.text).toBe('r:codegraph_status');
     await pool.destroy();
     expect(pool.ready).toBe(false); // destroyed pool must not be selected
   });

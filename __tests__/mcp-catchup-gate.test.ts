@@ -39,7 +39,7 @@ describe('MCP catch-up gate', () => {
       'export function deletedLater() { return 2; }\n',
     );
 
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(testDir);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });
@@ -60,7 +60,7 @@ describe('MCP catch-up gate', () => {
     const res = await handler.execute('codegraph_search', { query: 'survivor' });
     expect(gateResolved).toBe(true);
     expect(res.isError).toBeFalsy();
-    expect(res.content[0].text).toMatch(/survivor/);
+    expect(res.content[0]!.text).toMatch(/survivor/);
   });
 
   it('drops the gate after first await — second call does not re-wait', async () => {
@@ -92,7 +92,7 @@ describe('MCP catch-up gate', () => {
 
     const res = await handler.execute('codegraph_search', { query: 'deletedLater' });
     expect(res.isError).toBeFalsy();
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
     expect(text).not.toMatch(/src\/deleted-later\.ts/);
   });
 
@@ -130,7 +130,7 @@ describe('MCP catch-up gate', () => {
       const elapsed = Date.now() - started;
 
       expect(res.isError).toBeFalsy();
-      expect(res.content[0].text).toMatch(/survivor/);
+      expect(res.content[0]!.text).toMatch(/survivor/);
       // Served on the timeout (~50ms), NOT after the 5s reconcile.
       expect(gateResolved).toBe(false);
       expect(elapsed).toBeLessThan(2000);
@@ -168,6 +168,6 @@ describe('MCP catch-up gate', () => {
 
     const res = await handler.execute('codegraph_search', { query: 'survivor' });
     expect(res.isError).toBeFalsy();
-    expect(res.content[0].text).toMatch(/survivor/);
+    expect(res.content[0]!.text).toMatch(/survivor/);
   });
 });

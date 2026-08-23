@@ -149,7 +149,7 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
   it('prefixes a compact notice on codegraph_search run from a nested worktree', async () => {
     handler.setDefaultProjectHint(worktree);
     const res = await handler.execute('codegraph_search', { query: 'mainOnly' });
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
     expect(res.isError).toBeFalsy();
     expect(text).toContain('different git worktree');
     expect(text).toContain(real(worktree));
@@ -159,13 +159,13 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
   it('does NOT prefix when the default project is the main checkout itself', async () => {
     handler.setDefaultProjectHint(mainRepo);
     const res = await handler.execute('codegraph_search', { query: 'mainOnly' });
-    expect(res.content[0].text).not.toContain('different git worktree');
+    expect(res.content[0]!.text).not.toContain('different git worktree');
   });
 
   it('still shows the verbose warning on codegraph_status', async () => {
     handler.setDefaultProjectHint(worktree);
     const res = await handler.execute('codegraph_status', {});
-    const text = res.content[0].text;
+    const text = res.content[0]!.text;
     expect(text).toContain('different git working tree');
     expect(text).toContain(real(worktree));
   });
@@ -174,7 +174,7 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
     handler.setDefaultProjectHint(worktree);
     // First call computes + caches the mismatch (this is the only git spawn).
     const first = await handler.execute('codegraph_search', { query: 'mainOnly' });
-    expect(first.content[0].text).toContain('different git worktree');
+    expect(first.content[0]!.text).toContain('different git worktree');
 
     // Make git unreachable. A fresh detection would now return null (no notice);
     // the notice still appearing on a *different* tool proves it came from cache.
@@ -182,7 +182,7 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
     process.env.PATH = '';
     try {
       const second = await handler.execute('codegraph_explore', { query: 'mainOnly' });
-      expect(second.content[0].text).toContain('different git worktree');
+      expect(second.content[0]!.text).toContain('different git worktree');
     } finally {
       process.env.PATH = savedPath;
     }
@@ -250,8 +250,8 @@ describe('worktree mismatch verdict re-resolves when the index root changes (iss
     // Phase 1: the index genuinely belongs to a different working tree (the main
     // checkout) → warn, and cache that verdict.
     const before = await handler.execute('codegraph_status', {});
-    expect(before.content[0].text).toContain('different git working tree');
-    expect(before.content[0].text).toContain(real(mainRepo));
+    expect(before.content[0]!.text).toContain('different git working tree');
+    expect(before.content[0]!.text).toContain(real(mainRepo));
 
     // Phase 2: the worktree's own index is now the server's default project
     // (engine re-open → setDefaultCodeGraph). The resolved index root for the
@@ -260,7 +260,7 @@ describe('worktree mismatch verdict re-resolves when the index root changes (iss
     handler.setDefaultCodeGraph(worktreeCg);
 
     const after = await handler.execute('codegraph_status', {});
-    expect(after.content[0].text).not.toContain('different git working tree');
+    expect(after.content[0]!.text).not.toContain('different git working tree');
   });
 });
 
