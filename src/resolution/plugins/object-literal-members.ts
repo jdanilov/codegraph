@@ -31,7 +31,16 @@
  * runs, and `getParser` hands them back synchronously), finds
  * `<configured object>.<member…> = { … }` assignments, and emits one node per
  * function-valued property of the assigned object literal — plus, optionally, a
- * node for the assigned object itself.
+ * node for the assigned object itself, and a `contains` edge from that container
+ * to each member it mints.
+ *
+ * The containment edges matter as much as the nodes. Core emits `contains` from
+ * the node stack its tree-sitter walk maintains, which a resolver running after
+ * the walk cannot join (the same constraint `reattributeFileScopeRefs` exists
+ * for) — so before those edges were emitted here, a container and its members
+ * were minted as siblings with nothing joining them: a component's own methods
+ * were structurally invisible to `getContainedNodes`, to containment-shaped MCP
+ * answers, and to every consumer that reads the backbone.
  *
  * It is an AST walk, deliberately: a regex over raw text would mint NODES, and a
  * wrong node is worse than a wrong edge — every edge later resolved onto it
@@ -172,7 +181,7 @@
  */
 import * as path from 'node:path';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import type { Language, Node, NodeKind } from '../../types';
+import type { Edge, Language, Node, NodeKind } from '../../types';
 import { logDebug, logWarn } from '../../errors';
 import { getProjectConfigGeneration } from '../../project-config';
 import { generateNodeId, getChildByField, getNodeText, getPrecedingDocstring } from '../../extraction/tree-sitter-helpers';
@@ -266,6 +275,7 @@ const CONTAINER_KIND: NodeKind = 'variable';
 const EMPTY_RESULT: FrameworkExtractionResult = Object.freeze({
   nodes: Object.freeze([]) as unknown as Node[],
   references: Object.freeze([]) as unknown as UnresolvedRef[],
+  edges: Object.freeze([]) as unknown as Edge[],
 });
 
 // ---------------------------------------------------------------------------
@@ -610,10 +620,20 @@ interface EmitContext {
   source: string;
   config: NormalizedConfig;
   nodes: Node[];
+  edges: Edge[];
   ids: Set<string>;
   now: number;
 }
 
+/**
+ * Push a node and return its id, or `null` when nothing was minted (the
+ * per-file cap, an empty name, or an id this file already emitted).
+ *
+ * The id is the return value precisely so the caller can hang a `contains` edge
+ * off it — and `null` on a dedupe hit is deliberate: an edge is only ever drawn
+ * to a node THIS call created, so a container never claims to contain a node it
+ * did not mint.
+ */
 function pushNode(
   ctx: EmitContext,
   kind: NodeKind,
@@ -621,12 +641,12 @@ function pushNode(
   qualifiedName: string,
   span: SyntaxNode,
   extra?: Partial<Node>
-): boolean {
-  if (!name) return false;
-  if (ctx.nodes.length >= ctx.config.maxNodesPerFile) return false;
+): string | null {
+  if (!name) return null;
+  if (ctx.nodes.length >= ctx.config.maxNodesPerFile) return null;
   const startLine = span.startPosition.row + 1;
   const id = generateNodeId(ctx.filePath, kind, name, startLine);
-  if (ctx.ids.has(id)) return false;
+  if (ctx.ids.has(id)) return null;
   ctx.ids.add(id);
   ctx.nodes.push({
     id,
@@ -642,13 +662,36 @@ function pushNode(
     updatedAt: ctx.now,
     ...extra,
   });
-  return true;
+  return id;
 }
 
 /**
- * Emit the container node plus one node per function-valued member of `obj`.
- * Returns the nodes emitted for this subtree (as a count), and emits NOTHING —
- * container included — when the object carries no function members at all.
+ * `container contains member`, exactly as core's tree-sitter walk spells it:
+ * no line/col (containment is a structural fact, not a call site) and no
+ * `provenance` override, because this IS an AST fact — the member is lexically
+ * inside the object literal the container node spans.
+ *
+ * Coordinate-less edges de-duplicate in the database (the identity index folds
+ * NULL line/col), so re-emitting one across a sync is a no-op.
+ */
+function pushContains(ctx: EmitContext, containerId: string | null, memberId: string | null): void {
+  if (!containerId || !memberId || containerId === memberId) return;
+  ctx.edges.push({ source: containerId, target: memberId, kind: 'contains' });
+}
+
+/**
+ * Emit the container node plus one node per function-valued member of `obj`,
+ * joined by `contains` edges. Returns the container's id (`null` when there is
+ * no container node — `emitContainer: false`, a duplicate id, or the per-file
+ * cap), and emits NOTHING — container included — when the object carries no
+ * function members at all.
+ *
+ * The `contains` edges are the point: without them the members are structurally
+ * orphaned, which is what made a component's own methods invisible to every
+ * consumer that reads the containment backbone. With `emitContainer: false`
+ * there is nothing to contain them, so no edge is emitted and the members hang
+ * off the file exactly as they did before — that is the honest answer for a
+ * configuration that asked for no container.
  */
 function emitObject(
   ctx: EmitContext,
@@ -658,15 +701,14 @@ function emitObject(
   qualifiedName: string,
   depth: number,
   containerKind: NodeKind = CONTAINER_KIND
-): number {
-  if (!hasInlineFunctions(obj, depth, ctx.config.maxDepth)) return 0;
+): string | null {
+  if (!hasInlineFunctions(obj, depth, ctx.config.maxDepth)) return null;
 
-  const before = ctx.nodes.length;
-  if (ctx.config.emitContainer) {
-    pushNode(ctx, containerKind, name, qualifiedName, span, {
-      docstring: getPrecedingDocstring(span, ctx.source),
-    });
-  }
+  const containerId = ctx.config.emitContainer
+    ? pushNode(ctx, containerKind, name, qualifiedName, span, {
+        docstring: getPrecedingDocstring(span, ctx.source),
+      })
+    : null;
 
   for (let i = 0; i < obj.namedChildCount; i++) {
     const member = obj.namedChild(i);
@@ -677,11 +719,12 @@ function emitObject(
       if (!key) continue;
       const memberName = keyName(key, ctx.source);
       if (!memberName) continue;
-      pushNode(ctx, MEMBER_KIND, memberName, `${qualifiedName}::${memberName}`, member, {
+      const memberId = pushNode(ctx, MEMBER_KIND, memberName, `${qualifiedName}::${memberName}`, member, {
         signature: buildSignature(memberName, member, ctx.source),
         isAsync: isAsyncFunction(member) || undefined,
         docstring: getPrecedingDocstring(member, ctx.source),
       });
+      pushContains(ctx, containerId, memberId);
       continue;
     }
 
@@ -693,20 +736,24 @@ function emitObject(
     if (!memberName) continue;
 
     if (FUNCTION_VALUE_TYPES.has(value.type)) {
-      pushNode(ctx, MEMBER_KIND, memberName, `${qualifiedName}::${memberName}`, member, {
+      const memberId = pushNode(ctx, MEMBER_KIND, memberName, `${qualifiedName}::${memberName}`, member, {
         signature: buildSignature(memberName, value, ctx.source),
         isAsync: isAsyncFunction(value) || undefined,
         docstring: getPrecedingDocstring(member, ctx.source),
       });
+      pushContains(ctx, containerId, memberId);
       continue;
     }
 
     if (depth < ctx.config.maxDepth && OBJECT_TYPES.has(value.type)) {
-      emitObject(ctx, value, member, memberName, `${qualifiedName}::${memberName}`, depth + 1);
+      // A nested member table is itself a member of the object above it, so the
+      // backbone runs container → nested container → its own members.
+      const nestedId = emitObject(ctx, value, member, memberName, `${qualifiedName}::${memberName}`, depth + 1);
+      pushContains(ctx, containerId, nestedId);
     }
   }
 
-  return ctx.nodes.length - before;
+  return containerId;
 }
 
 /**
@@ -872,6 +919,7 @@ export const objectLiteralMembersPlugin: FrameworkResolver = {
         source: content,
         config,
         nodes: [],
+        edges: [],
         ids: new Set(),
         now: Date.now(),
       };
@@ -885,6 +933,9 @@ export const objectLiteralMembersPlugin: FrameworkResolver = {
       return {
         nodes: ctx.nodes,
         references: [],
+        // `contains`, container → member: the backbone core's own walk emits
+        // from its node stack, which this plugin runs too late to join.
+        edges: ctx.edges,
         // The calls inside these members were attributed to the FILE node
         // during core's walk (the object literal opened no scope frame). Ask
         // for them to be moved onto the member that actually makes them —

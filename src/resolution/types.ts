@@ -4,7 +4,7 @@
  * Types for the reference resolution system.
  */
 
-import { Language, Node, ReferenceKind } from '../types';
+import { Edge, Language, Node, ReferenceKind } from '../types';
 
 /**
  * An unresolved reference from extraction
@@ -207,6 +207,24 @@ export interface FrameworkExtractionResult {
   nodes: Node[];
   /** Framework-specific unresolved references (e.g. route -> handler) */
   references: UnresolvedRef[];
+  /**
+   * Framework-specific edges between the nodes above — in practice the
+   * `contains` backbone a resolver that mints a CONTAINER and its MEMBERS owes
+   * the graph.
+   *
+   * Core's tree-sitter walk emits `contains` from its own node stack, which a
+   * resolver running after the walk cannot join (same reason
+   * `reattributeFileScopeRefs` exists). Without a channel for them, members
+   * minted by a plugin are structurally orphaned: nothing joins `Widget` to its
+   * `render`, so callers/contained-by, the containment-shaped MCP answers and
+   * any consumer that reads the backbone all see a flat file.
+   *
+   * Edges are appended verbatim to the file's extraction result, so they are
+   * subject to the same identity de-duplication as every other edge
+   * (`source, target, kind, line, col` is UNIQUE) and must reference node ids
+   * the same extraction produced.
+   */
+  edges?: Edge[];
   /**
    * Re-attribute this file's FILE-SCOPE references to the nodes returned above,
    * by line span. Off by default — today's behavior exactly.

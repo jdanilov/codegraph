@@ -746,3 +746,135 @@ $ns.UpsellSnack = $ui.component('UpsellSnack', {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Containment: the `contains` backbone between a container and its members
+// ---------------------------------------------------------------------------
+
+/** `container.name -> member.name` for every `contains` edge in a result. */
+const containsPairs = (rel: string, source: string): string[] => {
+  const result = extract(rel, source);
+  const byId = new Map(result.nodes.map((node) => [node.id, node.name]));
+  return (result.edges ?? [])
+    .filter((edge) => edge.kind === 'contains')
+    .map((edge) => `${byId.get(edge.source) ?? edge.source}->${byId.get(edge.target) ?? edge.target}`)
+    .sort();
+};
+
+describe('object-literal-members containment', () => {
+  const NESTED_JS = `$ns.controller = {
+  run () {},
+  ui: {
+    open () {},
+    close () {},
+  },
+};
+`;
+
+  it('joins a plain container to every member it mints', () => {
+    enable({ objects: ['$ns'] });
+    expect(containsPairs('src/a.js', CONTROLLER_JS)).toEqual([
+      'controller->init',
+      'controller->onDone',
+      'controller->refresh',
+    ]);
+  });
+
+  it('emits real node ids, in the `contains` direction, with no line or column', () => {
+    enable({ objects: ['$ns'] });
+    const result = extract('src/a.js', `$ns.controller = { run () {} };\n`);
+    const container = result.nodes.find((n) => n.name === 'controller')!;
+    const member = result.nodes.find((n) => n.name === 'run')!;
+    expect(result.edges).toEqual([
+      { source: container.id, target: member.id, kind: 'contains' },
+    ]);
+  });
+
+  it('joins a wrapper-produced `component` container to its members too', () => {
+    enable({ objects: ['$ns'], wrappers: ['$ui.component'] });
+    const source = `$ns.Widget = $ui.component('Widget', {
+  get shown () { return true; },
+  render () { return null; },
+  async activate () {},
+});
+`;
+    const result = extract('src/widget.jsx', source);
+    expect(result.nodes.find((n) => n.name === 'Widget')!.kind).toBe('component');
+    expect(containsPairs('src/widget.jsx', source)).toEqual([
+      'Widget->activate',
+      'Widget->render',
+      'Widget->shown',
+    ]);
+  });
+
+  it('runs the backbone through a nested member table', () => {
+    enable({ objects: ['$ns'], maxDepth: 2 });
+    expect(containsPairs('src/a.js', NESTED_JS)).toEqual([
+      'controller->run',
+      'controller->ui',
+      'ui->close',
+      'ui->open',
+    ]);
+  });
+
+  it('emits no containment when there is no container to hang members off', () => {
+    enable({ objects: ['$ns'], emitContainer: false });
+    expect(extract('src/a.js', CONTROLLER_JS).edges).toEqual([]);
+    expect(names('src/a.js', CONTROLLER_JS)).toEqual(['init', 'onDone', 'refresh']);
+  });
+
+  it('emits nothing at all for an object with no function members', () => {
+    enable({ objects: ['$ns'] });
+    expect(extract('src/a.js', `$ns.settings = { retries: 3 };\n`).edges).toEqual([]);
+  });
+
+  it('reaches the extraction result core assembles for the file', async () => {
+    const { extractFromSource } = await import('../src/extraction/tree-sitter');
+    enable({ objects: ['$ns'] });
+    const result = extractFromSource('src/a.js', CONTROLLER_JS, 'javascript', [
+      OBJECT_LITERAL_MEMBERS_PLUGIN_NAME,
+    ]);
+    const container = result.nodes.find((n) => n.name === 'controller')!;
+    const init = result.nodes.find((n) => n.name === 'init')!;
+    expect(
+      result.edges.some(
+        (edge) => edge.kind === 'contains' && edge.source === container.id && edge.target === init.id
+      )
+    ).toBe(true);
+  });
+
+  it('persists the containment, so the members are reachable as its children', async () => {
+    write('src/controller.js', CONTROLLER_JS);
+    writeConfig({ plugins: { [OBJECT_LITERAL_MEMBERS_PLUGIN_NAME]: { objects: ['$ns'] } } });
+    clearProjectConfigCache();
+    clearPluginConfigCache();
+    resetObjectLiteralMembersState();
+
+    const { cg, rows } = await index();
+    const pairs = rows(`SELECT s.name AS parent, t.name AS child
+                        FROM edges e
+                        JOIN nodes s ON s.id = e.source
+                        JOIN nodes t ON t.id = e.target
+                        WHERE e.kind = 'contains' AND s.name = 'controller'
+                        ORDER BY t.name`).map((r) => `${r.parent}->${r.child}`);
+    expect(pairs).toEqual(['controller->init', 'controller->onDone', 'controller->refresh']);
+
+    const container = rows(`SELECT id FROM nodes WHERE name = 'controller'`)[0]!.id as string;
+    const contained = cg.getChildren(container).map((n) => n.name).sort();
+    expect(contained).toEqual(['init', 'onDone', 'refresh']);
+  });
+
+  it('re-indexes to the identical edge set, so a sync churns nothing', async () => {
+    write('src/controller.js', CONTROLLER_JS);
+    writeConfig({ plugins: { [OBJECT_LITERAL_MEMBERS_PLUGIN_NAME]: { objects: ['$ns'] } } });
+    clearProjectConfigCache();
+    clearPluginConfigCache();
+    resetObjectLiteralMembersState();
+
+    const EDGE_SQL = `SELECT source, target FROM edges WHERE kind = 'contains' ORDER BY source, target`;
+    const first = (await index()).rows(EDGE_SQL).map((r) => `${r.source}|${r.target}`);
+    const second = (await reindex()).rows(EDGE_SQL).map((r) => `${r.source}|${r.target}`);
+    expect(second).toEqual(first);
+    expect(first.length).toBeGreaterThan(0);
+  });
+});

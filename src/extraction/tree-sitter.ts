@@ -6778,6 +6778,12 @@ export function extractFromSource(
         const fwResult = fw.extract(filePath, source);
         result.nodes.push(...fwResult.nodes);
         result.unresolvedReferences.push(...fwResult.references);
+        // A resolver that mints a container plus its members owes the graph the
+        // `contains` backbone between them — it runs after the walk, so it
+        // cannot join core's node stack and has to hand the edges over here.
+        if (fwResult.edges && fwResult.edges.length > 0) {
+          result.edges.push(...fwResult.edges);
+        }
         // Opt-in only (see FrameworkExtractionResult.reattributeFileScopeRefs).
         if (fwResult.reattributeFileScopeRefs && fwResult.nodes.length > 0) {
           reattributionSpans.push(...fwResult.nodes);
