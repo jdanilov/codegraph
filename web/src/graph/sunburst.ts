@@ -12,13 +12,15 @@
  * largest-first (the DaisyDisk convention) so the project reads as "where is
  * the mass". Either way the wedge itself is the LoC share.
  *
- * Radial DEPTH encodes what an arc is: a directory is one band thick, a file
- * and a symbol a third more ({@link depthFactor}). Bands pack from the inside
- * out — a band ends at its tallest wedge and the next band starts there — so
- * the rings never drift apart; a shorter wedge simply leaves a little space
- * toward the outside of its own band. Depth is also LABEL room: a name that
- * cannot follow its arc is drawn radially, and the long names are the files'
- * and the symbols'.
+ * Radial DEPTH encodes what an arc is: a directory is one ring thick, a file
+ * and a symbol a third more ({@link depthFactor}). Radii are **per branch, not
+ * per ring** (round 3): a wedge's children begin at THAT wedge's own outer
+ * radius, so a directory always touches the children it contains. The
+ * band-per-ring model this replaced sized every band by its tallest wedge,
+ * which left a ring of whitespace between a shallow directory and its own
+ * children — the wedges of one branch now form one continuous radial run.
+ * Depth is also LABEL room: a name that cannot follow its arc is drawn
+ * radially, and the long names are the files' and the symbols'.
  *
  * Three properties are load-bearing and worth stating outright:
  *
@@ -71,9 +73,11 @@ export const MAX_SLOTS_PER_PARENT = 96;
 /** Radius of the centre disk (the current root). */
 export const CENTRE_RADIUS = 62;
 
-const RING_GAP = 2;
-
-/** Rings get slightly thinner outward, so the disk stays a disk. */
+/**
+ * Base radial thickness of ring *n* — rings get slightly thinner outward, so
+ * the disk stays a disk. A wedge is this times its {@link depthFactor}; where
+ * it STARTS is its parent's outer radius, not a ring-wide band edge.
+ */
 function ringThickness(ring: number): number {
   return Math.max(30, 56 - 4 * (ring - 1));
 }
@@ -85,7 +89,7 @@ export const SYMBOL_DEPTH_FACTOR = 4 / 3;
 
 /**
  * How deep (radially) a wedge of this kind is drawn, as a multiple of its
- * band's base thickness.
+ * ring's base thickness.
  *
  * Directory 1 · file 4/3 · symbol 4/3 — **flipped in the round-2 review**. It
  * was directory 1 · file ¾ · symbol ½, on the theory that the busiest outer
@@ -101,21 +105,25 @@ export function depthFactor(kind: string): number {
   return SYMBOL_DEPTH_FACTOR;
 }
 
-/** Deepest a wedge is ever drawn, relative to its band's base thickness. */
+/** Deepest a wedge is ever drawn, relative to its ring's base thickness. */
 const MAX_DEPTH_FACTOR = Math.max(1, FILE_DEPTH_FACTOR, SYMBOL_DEPTH_FACTOR);
 
 /**
  * Outer radius of the deepest possible disk (every ring at its deepest kind).
  *
- * Only a FALLBACK for a controller with no layout yet — a real layout reports
- * its own `maxRadius`, which is what the camera fits to.
+ * Because children start at their parent's outer radius, the deepest BRANCH is
+ * exactly this sum — which is also the budget: {@link computeSunburst} refuses
+ * to draw past it, so the ring cap and this ceiling bound the disk together.
+ *
+ * Otherwise only a FALLBACK for a controller with no layout yet — a real layout
+ * reports its own `maxRadius`, which is what the camera fits to.
  */
 export const MAX_RADIUS = (() => {
   let radius = CENTRE_RADIUS;
   for (let ring = 1; ring <= MAX_RINGS; ring++) {
-    radius += ringThickness(ring) * MAX_DEPTH_FACTOR + RING_GAP;
+    radius += ringThickness(ring) * MAX_DEPTH_FACTOR;
   }
-  return radius - RING_GAP;
+  return radius;
 })();
 
 /** Sibling ORDER. The angle is always the LoC share — only order changes. */
@@ -172,15 +180,13 @@ export interface SunburstLayout {
   byNode: Map<string, SunburstArc>;
   /** Direct child id → the aggregate arc that swallowed it. */
   aggregatedInto: Map<string, SunburstArc>;
-  /** Arcs indexed by ring, so a hit test scans one ring, not the disk. */
-  byRing: SunburstArc[][];
   /**
-   * Radial band per ring (index = ring, `[0]` is the centre disk). A wedge
-   * starts at its band's `r0` and ends within it — shallower for a directory
-   * than for the file or symbol beside it — because the BAND is what packs,
-   * not the individual wedge.
+   * Arcs indexed by ring and **sorted by `a0`**, so a hit test binary-searches
+   * one ring per level rather than scanning the disk. Radii are per branch, so
+   * the ring alone no longer tells you the radius — the hit test checks the
+   * arc's own `[r0, r1)` after finding it by angle ({@link arcAt}).
    */
-  bands: Array<{ r0: number; r1: number }>;
+  byRing: SunburstArc[][];
   rings: number;
   /** True when depth, budget or the sliver floor hid something. */
   truncated: boolean;
@@ -398,7 +404,6 @@ export function computeSunburst(
   const byNode = new Map<string, SunburstArc>();
   const aggregatedInto = new Map<string, SunburstArc>();
   const byRing: SunburstArc[][] = [[]];
-  const bands: Array<{ r0: number; r1: number }> = [{ r0: 0, r1: CENTRE_RADIUS }];
   let truncated = false;
 
   interface Frontier {
@@ -406,22 +411,31 @@ export function computeSunburst(
     nodeId: string;
     a0: number;
     a1: number;
+    /** Where this parent's children START — its own outer radius. */
+    r0: number;
   }
 
   let frontier: Frontier[] = [
-    { arc: null, nodeId: rootId, a0: START_ANGLE, a1: START_ANGLE + TAU },
+    { arc: null, nodeId: rootId, a0: START_ANGLE, a1: START_ANGLE + TAU, r0: CENTRE_RADIUS },
   ];
   let rings = 0;
-  let bandStart = CENTRE_RADIUS;
+  let maxRadius = CENTRE_RADIUS;
 
   for (let ring = 1; ring <= maxRings && frontier.length > 0; ring++) {
-    const r0 = bandStart;
     const thickness = ringThickness(ring);
     const produced: SunburstArc[] = [];
 
     for (const item of frontier) {
       const childIds = model.childrenOf(item.nodeId);
       if (childIds.length === 0) continue;
+      // The radius budget is the other half of the depth cap: a branch that
+      // has run out of disk folds here exactly as a too-deep one does.
+      const r0 = item.r0;
+      if (r0 >= MAX_RADIUS) {
+        if (item.arc) item.arc.hiddenChildren = childIds.length;
+        truncated = true;
+        continue;
+      }
       const children = orderChildren(
         model,
         item.nodeId,
@@ -461,7 +475,7 @@ export function computeSunburst(
           a0,
           a1,
           r0,
-          r1: r0 + thickness * factor,
+          r1: Math.min(MAX_RADIUS, r0 + thickness * factor),
           parentKey: item.arc?.key ?? null,
           parentNodeId: item.nodeId,
           weight: slot.size,
@@ -490,21 +504,18 @@ export function computeSunburst(
     }
 
     const ringArcs: SunburstArc[] = [];
-    let bandEnd = r0;
     for (const arc of produced) {
       arcs.push(arc);
       ringArcs.push(arc);
       byKey.set(arc.key, arc);
-      if (arc.r1 > bandEnd) bandEnd = arc.r1;
+      if (arc.r1 > maxRadius) maxRadius = arc.r1;
       if (arc.nodeId) byNode.set(arc.nodeId, arc);
       else for (const id of arc.aggregated) aggregatedInto.set(id, arc);
     }
+    // Sorted by angle so {@link arcAt} can binary-search: the production order
+    // is already ascending, but the hit test must not depend on that.
+    ringArcs.sort((left, right) => left.a0 - right.a0);
     byRing[ring] = ringArcs;
-    // The band ends at its TALLEST wedge, and the next ring starts there: a
-    // ring of nothing but symbols is genuinely thinner, and a mixed ring keeps
-    // its directories touching the ring outside them.
-    bands[ring] = { r0, r1: bandEnd };
-    bandStart = bandEnd + RING_GAP;
     rings = ring;
 
     const next: Frontier[] = [];
@@ -515,7 +526,10 @@ export function computeSunburst(
         if (childCount > 0) truncated = true;
         continue;
       }
-      next.push({ arc, nodeId: arc.nodeId, a0: arc.a0, a1: arc.a1 });
+      // Per-branch radii: the children of THIS wedge start where it ends, so a
+      // directory is never separated from its own contents by a ring of blank
+      // disk (which is what a shared band edge produced for a shallow kind).
+      next.push({ arc, nodeId: arc.nodeId, a0: arc.a0, a1: arc.a1, r0: arc.r1 });
     }
     frontier = next;
   }
@@ -536,13 +550,12 @@ export function computeSunburst(
     byNode,
     aggregatedInto,
     byRing,
-    bands,
     rings,
     truncated,
     rootLoc: sizes.get(rootId) ?? root.weight,
     sort,
     centreRadius: CENTRE_RADIUS,
-    maxRadius: rings > 0 ? bands[rings]!.r1 : CENTRE_RADIUS,
+    maxRadius,
   };
 }
 
@@ -564,12 +577,21 @@ export function arcCentroid(arc: SunburstArc): Point {
 /**
  * Which arc covers a layout-space point, or `null` for the centre / outside.
  *
- * The ring is found from the radius, so a hit test scans one ring (≤ 2π/MIN
- * arcs) rather than the whole disk. The test is against the ring's **band**,
- * not the wedge's own (possibly shallower) outer radius: a file wedge draws ¾
- * of its band, and the quarter of empty band behind it still belongs to that
- * file as far as the pointer is concerned — shrinking the click target with the
- * paint would make symbols noticeably harder to hit.
+ * **Angle first, then radius** (round 3). Radii used to be per RING, so the
+ * radius alone picked the band and the angle picked the wedge inside it. With
+ * per-branch radii two wedges in the same ring can sit at different radii (and
+ * a wedge in ring 3 can start further in than one in ring 2), so the ring is no
+ * longer a radial interval: for each ring the arc owning the ANGLE is found by
+ * binary search — the arcs of a ring are angularly disjoint and sorted — and
+ * kept only if the radius lands in that arc's own `[r0, r1)`.
+ *
+ * Cost is `rings × log(arcs per ring)` — at most six short searches, which is
+ * cheaper than the old linear scan of a band.
+ *
+ * The wedge's PAINTED extent is now also its click target, which the band model
+ * deliberately avoided. It can be: a shallow wedge is no longer followed by a
+ * strip of empty band, because whatever it contains starts exactly where it
+ * ends.
  */
 export function arcAt(layout: SunburstLayout, x: number, y: number): SunburstArc | null {
   const radius = Math.hypot(x, y);
@@ -578,14 +600,33 @@ export function arcAt(layout: SunburstLayout, x: number, y: number): SunburstArc
   for (let ring = 1; ring <= layout.rings; ring++) {
     const arcsInRing = layout.byRing[ring];
     if (!arcsInRing || arcsInRing.length === 0) continue;
-    const band = layout.bands[ring];
-    if (!band || radius < band.r0 || radius > band.r1) continue;
-    for (const arc of arcsInRing) {
-      if (angle >= arc.a0 && angle < arc.a1) return arc;
-    }
-    return null;
+    const arc = arcAtAngle(arcsInRing, angle);
+    if (arc && radius >= arc.r0 && radius < arc.r1) return arc;
   }
   return null;
+}
+
+/**
+ * The arc of one ring covering `angle`, or `null` — binary search over arcs
+ * sorted by `a0`. A ring is not necessarily a full circle (a parent with no
+ * children produces nothing), hence the `a1` check on the candidate.
+ */
+function arcAtAngle(arcs: SunburstArc[], angle: number): SunburstArc | null {
+  let low = 0;
+  let high = arcs.length - 1;
+  let found = -1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (arcs[mid]!.a0 <= angle) {
+      found = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  if (found < 0) return null;
+  const arc = arcs[found]!;
+  return angle < arc.a1 ? arc : null;
 }
 
 /** Fold an angle into `[START_ANGLE, START_ANGLE + 2π)`, the layout's span. */

@@ -10,10 +10,18 @@
  *   - `#0<base64url>` — the same JSON, uncompressed, for a browser without
  *     `CompressionStream` (or when compression somehow grew the payload).
  *
- * The JSON is `{ r: string|null, c: string|null, m: 'kind'|'layer', k: string[] }`
- * — the sunburst's **root** node id, the active card id, the colour mode and
- * the enabled edge kinds. Keys are one letter because they are repeated in
- * every URL.
+ * The JSON is
+ * `{ r: string|null, s: string|null, c: string|null, m: 'kind'|'layer', k: string[] }`
+ * — the sunburst's **root** node id, the **selected** node id, the active card
+ * id, the colour mode and the enabled edge kinds. Keys are one letter because
+ * they are repeated in every URL.
+ *
+ * **The hash is also the history** (round 3). Selection and re-rooting write it
+ * with `pushState`, so Back/Forward walk the navigation the user actually did;
+ * camera and colour changes write it with `replaceState`, because nobody wants
+ * a history entry per scroll wheel notch. `s` exists for that: without the
+ * selection in the hash, Back could restore where you were looking but not what
+ * you had open.
  *
  * **Backward tolerance (phase E).** Before the sunburst the view was an
  * *expansion set* stored under `e`, which could run to hundreds of ids. An old
@@ -31,6 +39,8 @@ export const MAX_HASH_CHARS = 6000;
 export interface UrlState {
   /** Sunburst root; `null` when the URL predates phase E. */
   root: string | null;
+  /** Selected node id; `null` when nothing is selected (round 3). */
+  selection: string | null;
   /** Phase D's expansion set, read-only — a legacy link's best-effort root. */
   legacyExpanded: string[];
   cardId: string | null;
@@ -40,6 +50,7 @@ export interface UrlState {
 
 interface Encoded {
   r?: string | null;
+  s?: string | null;
   e?: string[];
   c?: string | null;
   m?: string;
@@ -50,6 +61,7 @@ interface Encoded {
 export async function encodeUrlState(state: Omit<UrlState, 'legacyExpanded'>): Promise<string> {
   const full: Encoded = {
     r: state.root,
+    s: state.selection,
     c: state.cardId,
     m: state.colorMode,
     ...(state.edgeKinds ? { k: state.edgeKinds } : {}),
@@ -75,6 +87,7 @@ export async function decodeUrlState(hash: string): Promise<UrlState | null> {
     const parsed = JSON.parse(json) as Encoded;
     return {
       root: typeof parsed.r === 'string' ? parsed.r : null,
+      selection: typeof parsed.s === 'string' ? parsed.s : null,
       legacyExpanded: Array.isArray(parsed.e)
         ? parsed.e.filter((id) => typeof id === 'string')
         : [],

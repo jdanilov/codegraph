@@ -141,18 +141,9 @@ export function NodePanel({
           </Section>
         ) : null}
 
-        <RelationSections
-          title="outgoing"
-          arrow="→"
-          relations={detail?.outgoing ?? []}
-          model={model}
-          contextFile={node.file}
-          onNavigate={onNavigate}
-        />
-        <RelationSections
-          title="incoming"
-          arrow="←"
-          relations={detail?.incoming ?? []}
+        <EdgesSection
+          incoming={detail?.incoming ?? []}
+          outgoing={detail?.outgoing ?? []}
           model={model}
           contextFile={node.file}
           onNavigate={onNavigate}
@@ -231,7 +222,57 @@ const INCOMING_KIND_LABELS: Record<string, string> = {
   extends: 'extended by',
 };
 
-function RelationSections({
+/**
+ * EDGES — the two directions **side by side**, under one heading (round 3).
+ *
+ * They used to stack: `outgoing · N` and every kind group under it, then
+ * `incoming · M` and every kind group under THAT, which pushed the incoming
+ * half off the bottom of a panel that already shares its column with the code.
+ * Two columns halve the height and put the question the panel exists to answer
+ * — what reaches this, what does it reach — in one screen. Everything inside a
+ * column is unchanged: grouped by kind, qualified names, and `extended by` for
+ * an incoming `extends`.
+ */
+function EdgesSection({
+  incoming,
+  outgoing,
+  model,
+  contextFile,
+  onNavigate,
+}: {
+  incoming: NodeRelation[];
+  outgoing: NodeRelation[];
+  model: GraphModel | null;
+  contextFile: string;
+  onNavigate(id: string): void;
+}) {
+  if (incoming.length === 0 && outgoing.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="text-[10px] uppercase tracking-[0.18em] text-muted">edges</div>
+      <div className="grid grid-cols-2 items-start gap-x-2">
+        <RelationColumn
+          title="incoming"
+          arrow="←"
+          relations={incoming}
+          model={model}
+          contextFile={contextFile}
+          onNavigate={onNavigate}
+        />
+        <RelationColumn
+          title="outgoing"
+          arrow="→"
+          relations={outgoing}
+          model={model}
+          contextFile={contextFile}
+          onNavigate={onNavigate}
+        />
+      </div>
+    </div>
+  );
+}
+
+function RelationColumn({
   title,
   arrow,
   relations,
@@ -248,10 +289,9 @@ function RelationSections({
 }) {
   const incoming = title === 'incoming';
   const groups = useMemo(() => groupByKind(relations), [relations]);
-  if (groups.length === 0) return null;
   return (
-    <div className="flex flex-col gap-1">
-      <div className="text-[10px] uppercase tracking-[0.18em] text-muted">
+    <div className="flex min-w-0 flex-col gap-1" data-testid={`edges-${title}`}>
+      <div className="text-[10px] text-muted/80">
         {title} · {relations.length}
       </div>
       {groups.map(([kind, items]) => (

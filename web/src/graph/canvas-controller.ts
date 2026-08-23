@@ -148,10 +148,13 @@ const LABEL_MIN_THICKNESS_PX = 11;
 const LABEL_MIN_CHARS = 5;
 
 /**
- * RADIAL fallback: when a wedge cannot carry text along its arc, the name is
- * drawn along the RADIUS instead — out from the centre through the wedge's
- * angular bisector, flipped 180° on the left half of the disk so it is never
- * upside down (the standard sunburst convention).
+ * RADIAL layout: the name runs along the RADIUS — out from the centre through
+ * the wedge's angular bisector, flipped 180° on the left half of the disk so it
+ * is never upside down (the standard sunburst convention).
+ *
+ * As of round 3 this is not a *fallback* but one of two orientations, picked by
+ * whichever of the wedge's two extents is longer (see `drawArcLabel`); the
+ * other orientation is still tried when the picked one cannot fit a name.
  *
  * Which is why the room the text has is the wedge's own geometry with the axes
  * swapped from the curved case: the **radial depth** (`r1 - r0`) is the line
@@ -836,15 +839,21 @@ export class CanvasController {
   }
 
   /**
-   * Name a wedge — along its arc when that fits, along its RADIUS when it
-   * doesn't.
+   * Name a wedge — along its arc, or along its RADIUS, whichever the wedge has
+   * more room for.
    *
-   * Curved text is the first choice: it reads at the ring thickness the wedge
-   * actually has and never crosses a neighbour. When the wedge is too short or
-   * too thin for it, the name is drawn radially instead, on the wedge's angular
-   * bisector — which is how a deep, narrow symbol wedge gets to keep its name.
-   * Only when neither fits legibly does the wedge stay bare and the hover
-   * tooltip carry the name.
+   * The orientation is chosen by **measuring the wedge, not by ranking the two
+   * layouts** (round 3). A wedge is a curved rectangle with two extents at the
+   * label's radius: the TANGENTIAL one (`span × midRadius`, the arc length) and
+   * the RADIAL one (`r1 - r0`). Text runs along the longer of the two — which
+   * is the only reading that survives per-branch radii, where a directory
+   * wedge can be wide and shallow while the symbol beside it is deep and
+   * narrow. Curved-first was a fixed preference and got this backwards on every
+   * deep, narrow wedge.
+   *
+   * Each layout keeps its own fit gates and its own ≥3-characters-or-nothing
+   * rule; if the chosen one does not fit, the other is tried before the wedge
+   * is left bare for the hover tooltip to name.
    */
   private drawArcLabel(
     ctx: CanvasRenderingContext2D,
@@ -855,20 +864,42 @@ export class CanvasController {
   ): void {
     const midRadius = (arc.r0 + arc.r1) / 2;
     const span = arc.a1 - arc.a0;
-    const thicknessPx = (arc.r1 - arc.r0) * k;
+    const tangentialPx = span * midRadius * k;
+    const radialPx = (arc.r1 - arc.r0) * k;
     const ink = dimmed ? DIM_LABEL_COLOR : readableOn(this.fillFor(arc, model));
 
-    if (span * midRadius * k >= LABEL_MIN_ARC_PX && thicknessPx >= LABEL_MIN_THICKNESS_PX) {
-      const fontPx = Math.max(9, Math.min(12.5, thicknessPx * 0.34));
-      ctx.font = `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
-      const text = fitText(ctx, arc.label, span * 0.9 * midRadius);
-      // `ex…` names nothing — fall through to the radial attempt instead.
-      if (text && !(text.endsWith('…') && text.length < LABEL_MIN_CHARS)) {
-        this.drawCurvedLabel(ctx, text, (arc.a0 + arc.a1) / 2, midRadius, ink);
-        return;
-      }
+    if (tangentialPx > radialPx) {
+      if (this.drawCurvedArcLabel(ctx, arc, midRadius, span, k, ink)) return;
+      this.drawRadialLabel(ctx, arc, midRadius, span, k, ink);
+      return;
     }
-    this.drawRadialLabel(ctx, arc, midRadius, span, k, ink);
+    if (this.drawRadialLabel(ctx, arc, midRadius, span, k, ink)) return;
+    this.drawCurvedArcLabel(ctx, arc, midRadius, span, k, ink);
+  }
+
+  /**
+   * Curved layout: the name follows the arc. `false` when the wedge is too
+   * short or too thin for it, or when what fits is not a name any more.
+   */
+  private drawCurvedArcLabel(
+    ctx: CanvasRenderingContext2D,
+    arc: SunburstArc,
+    midRadius: number,
+    span: number,
+    k: number,
+    ink: string
+  ): boolean {
+    const thicknessPx = (arc.r1 - arc.r0) * k;
+    if (span * midRadius * k < LABEL_MIN_ARC_PX || thicknessPx < LABEL_MIN_THICKNESS_PX) {
+      return false;
+    }
+    const fontPx = Math.max(9, Math.min(12.5, thicknessPx * 0.34));
+    ctx.font = `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
+    const text = fitText(ctx, arc.label, span * 0.9 * midRadius);
+    // `ex…` names nothing — let the caller try the other orientation.
+    if (!text || (text.endsWith('…') && text.length < LABEL_MIN_CHARS)) return false;
+    this.drawCurvedLabel(ctx, text, (arc.a0 + arc.a1) / 2, midRadius, ink);
+    return true;
   }
 
   /**
@@ -916,6 +947,9 @@ export class CanvasController {
    * upside down, so it is rotated a further 180° and reads inward — the
    * convention every sunburst uses, and the reason the label never has to be
    * mirrored per glyph.
+   *
+   * Returns whether it drew, so {@link drawArcLabel} can fall back to the
+   * curved layout when this one has nothing legible to show.
    */
   private drawRadialLabel(
     ctx: CanvasRenderingContext2D,
@@ -924,16 +958,16 @@ export class CanvasController {
     span: number,
     k: number,
     ink: string
-  ): void {
+  ): boolean {
     const depth = arc.r1 - arc.r0;
     const lengthPx = depth * k;
     const heightPx = span * midRadius * k;
-    if (lengthPx < RLABEL_MIN_LENGTH_PX || heightPx < RLABEL_MIN_HEIGHT_PX) return;
+    if (lengthPx < RLABEL_MIN_LENGTH_PX || heightPx < RLABEL_MIN_HEIGHT_PX) return false;
 
     const fontPx = Math.max(8, Math.min(RLABEL_MAX_FONT_PX, heightPx * 0.8));
     ctx.font = `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
     const text = fitText(ctx, arc.label, depth * 0.92);
-    if (!text || (text.endsWith('…') && text.length < RLABEL_MIN_CHARS)) return;
+    if (!text || (text.endsWith('…') && text.length < RLABEL_MIN_CHARS)) return false;
 
     const mid = (arc.a0 + arc.a1) / 2;
     ctx.save();
@@ -944,6 +978,7 @@ export class CanvasController {
     ctx.fillStyle = ink;
     ctx.fillText(text, 0, 0);
     ctx.restore();
+    return true;
   }
 
   private fillFor(arc: SunburstArc, model: GraphModel): string {

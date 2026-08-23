@@ -18,13 +18,17 @@
  *    warm one, and a node opened from here shows its diff first.
  *  - **Feedback export.** The active view plus the current selection, rendered
  *    as markdown to paste into an agent prompt.
- *  - **URL = state.** Current root, active card, colour mode and edge toggles
- *    live in the hash (see `lib/url-state.ts`), restored on load. A phase D
- *    link carrying an expansion set still opens — it re-roots to what those
- *    ids have in common.
+ *  - **URL = state.** Current root, SELECTION, active card, colour mode and
+ *    edge toggles live in the hash (see `lib/url-state.ts`), restored on load.
+ *    A phase D link carrying an expansion set still opens — it re-roots to what
+ *    those ids have in common.
+ *  - **URL = history** (round 3). Navigation — selecting, clearing the
+ *    selection, re-rooting, switching card — is written with `pushState`, so
+ *    the browser's Back/Forward walk the user's own path through the graph;
+ *    camera and colour changes only ever `replaceState`. `popstate` applies the
+ *    whole hash back onto the canvas without writing anything itself.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Search, Settings as SettingsIcon } from 'lucide-react';
 
 import { CommandPalette } from '@/components/command-palette';
 import { SettingsDialog } from '@/components/settings-dialog';
@@ -56,7 +60,7 @@ import {
   type ChangesPayload,
   type ExploreResult,
 } from '@/lib/api';
-import { decodeUrlState, encodeUrlState } from '@/lib/url-state';
+import { decodeUrlState, encodeUrlState, type UrlState } from '@/lib/url-state';
 
 export default function App() {
   const { status, model, error, indexing, indexLog, runIndex } = useGraphData();
@@ -103,8 +107,18 @@ export default function App() {
   changesRef.current = changes;
   const activeRef = useRef(activeId);
   activeRef.current = activeId;
+  const modelRef = useRef(model);
+  modelRef.current = model;
+  const selectedRef = useRef(selectedNode);
+  selectedRef.current = selectedNode;
+  const colorModeRef = useRef(colorMode);
+  colorModeRef.current = colorMode;
+  /** True once the hash has been read — nothing is written before that. */
   const restoredRef = useRef(false);
+  const restoreStarted = useRef(false);
   const urlTimer = useRef<number | null>(null);
+  /** What the hash currently says — every write is diffed against it. */
+  const lastHashRef = useRef<HashState | null>(null);
 
   // ---------------------------------------------------------------- data ---
 
@@ -274,16 +288,61 @@ export default function App() {
 
   // ----------------------------------------------------------- URL state ---
 
-  /** Restore once, as soon as there is a model to restore INTO. */
-  useEffect(() => {
-    if (restoredRef.current || !model) return;
-    restoredRef.current = true;
-    const controller = controllerRef.current;
-    void decodeUrlState(window.location.hash).then((state) => {
-      if (!state || !controller) {
-        scheduleUrlUpdate();
-        return;
-      }
+  /**
+   * Debounced hash write. The debounce is also the history's coalescer: a
+   * re-root that moves the selection with it is one entry, not two.
+   *
+   * **Navigation pushes, everything else replaces.** Root, selection and the
+   * active card are places you can go Back to; the camera (pan / zoom / fit)
+   * and the colour mode are how you are looking at the place you are already
+   * in, and one history entry per wheel notch would make Back useless. A hover
+   * changes neither, so it never writes at all — and an identical state is
+   * dropped before it can become a duplicate entry.
+   */
+  const scheduleUrlUpdate = useCallback(() => {
+    if (!restoredRef.current) return;
+    if (urlTimer.current !== null) window.clearTimeout(urlTimer.current);
+    urlTimer.current = window.setTimeout(() => {
+      urlTimer.current = null;
+      const controller = controllerRef.current;
+      if (!controller) return;
+      const next: HashState = {
+        root: controller.getRoot(),
+        selection: selectedRef.current?.id ?? null,
+        cardId: activeRef.current,
+        colorMode: colorModeRef.current,
+        edgeKinds: controller.enabledEdgeKinds(),
+      };
+      const previous = lastHashRef.current;
+      if (previous && sameHashState(previous, next)) return;
+      const navigational =
+        !previous ||
+        previous.root !== next.root ||
+        previous.selection !== next.selection ||
+        previous.cardId !== next.cardId;
+      lastHashRef.current = next;
+      void encodeUrlState(next).then((hash) => {
+        // The FIRST write of a session replaces: the entry the browser already
+        // has for this page is the one the user arrived on.
+        if (navigational && previous) window.history.pushState(null, '', hash);
+        else window.history.replaceState(null, '', hash);
+      });
+    }, 300);
+  }, []);
+
+  /**
+   * Put a decoded hash back on screen — the ONE place a URL becomes a view.
+   *
+   * Used by the initial restore and by Back/Forward alike, which is the point:
+   * a history entry is just a hash, so applying one must not be a special case.
+   * It records what it applied in `lastHashRef`, so the writes that every
+   * setter below schedules find nothing to say and no entry is pushed for a
+   * navigation the browser already performed.
+   */
+  const applyUrlState = useCallback(
+    (state: UrlState) => {
+      const controller = controllerRef.current;
+      if (!controller) return;
       setColorMode(state.colorMode);
       if (state.edgeKinds && state.edgeKinds.length > 0) controller.setEdgeKinds(state.edgeKinds);
 
@@ -303,38 +362,66 @@ export default function App() {
         });
       } else if (cardId !== PROJECT_VIEW_ID) {
         const result = cardsRef.current.find((card) => card.id === cardId)?.result;
-        if (result) controller.setHighlight({ nodes: result.nodeIds, edges: result.edgeRefs });
+        controller.setHighlight(result ? { nodes: result.nodeIds, edges: result.edgeRefs } : null);
+      } else {
+        controller.setHighlight(null);
       }
 
       // A phase E link names its root outright; a phase D one carries the old
       // expansion set, which `setExpanded` translates into the closest root.
       if (state.root) controller.setRoot(state.root, false);
       else if (state.legacyExpanded.length > 0) controller.setExpanded(state.legacyExpanded);
-    });
-  }, [model, loadChanges]);
 
-  /** Debounced hash write; the canvas fires a view change on every re-root. */
-  const scheduleUrlUpdate = useCallback(() => {
-    if (!restoredRef.current) return;
-    if (urlTimer.current !== null) window.clearTimeout(urlTimer.current);
-    urlTimer.current = window.setTimeout(() => {
-      urlTimer.current = null;
-      const controller = controllerRef.current;
-      if (!controller) return;
-      void encodeUrlState({
+      const selected = state.selection ? (modelRef.current?.get(state.selection) ?? null) : null;
+      controller.setSelected(selected?.id ?? null);
+      setSelectedNode(selected);
+
+      lastHashRef.current = {
         root: controller.getRoot(),
-        cardId: activeRef.current,
-        colorMode,
+        selection: selected?.id ?? null,
+        cardId,
+        colorMode: state.colorMode,
         edgeKinds: controller.enabledEdgeKinds(),
-      }).then((hash) => {
-        window.history.replaceState(null, '', hash);
-      });
-    }, 350);
-  }, [colorMode]);
+      };
+    },
+    [loadChanges]
+  );
+
+  /** Restore once, as soon as there is a model to restore INTO. */
+  useEffect(() => {
+    if (restoreStarted.current || !model) return;
+    restoreStarted.current = true;
+    void decodeUrlState(window.location.hash).then((state) => {
+      if (state) applyUrlState(state);
+      // Only now may anything be written — a write racing the restore would
+      // push the DEFAULT view over the one the link asked for.
+      restoredRef.current = true;
+      scheduleUrlUpdate();
+    });
+  }, [model, applyUrlState, scheduleUrlUpdate]);
 
   useEffect(() => {
     scheduleUrlUpdate();
-  }, [activeId, colorMode, scheduleUrlUpdate]);
+  }, [activeId, colorMode, selectedNode, scheduleUrlUpdate]);
+
+  /**
+   * Back / Forward. The hash IS the state, so the handler simply applies it —
+   * and cancels any write still in flight, which would otherwise land a moment
+   * later and overwrite the entry the user just navigated to.
+   */
+  useEffect(() => {
+    const onPopState = (): void => {
+      if (urlTimer.current !== null) {
+        window.clearTimeout(urlTimer.current);
+        urlTimer.current = null;
+      }
+      void decodeUrlState(window.location.hash).then((state) => {
+        if (state) applyUrlState(state);
+      });
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [applyUrlState]);
 
   /**
    * The canvas reports a view summary on every re-root, re-fit and edge redraw.
@@ -454,34 +541,18 @@ export default function App() {
       {/* Left column: everything you DRIVE the disk with. */}
       <div className="pointer-events-none absolute inset-y-0 left-0 p-4">
         <div className="flex max-h-full w-[22rem] flex-col gap-3">
+          {/* Search (⌘P) and settings are icon buttons in the CODEGRAPH panel's
+              own title bar now (round 3) — one header instead of a header plus
+              a row of chrome under it. */}
           <StatusPanel
             status={status}
             error={error}
             indexing={indexing}
             indexLog={indexLog}
             onIndex={() => void runIndex()}
+            onOpenPalette={() => setPaletteOpen(true)}
+            onOpenSettings={() => setSettingsOpen(true)}
           />
-          <div className="pointer-events-auto flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setPaletteOpen(true)}
-              data-testid="open-palette"
-              className="flex flex-1 items-center gap-2 rounded-lg border border-border bg-surface/70 px-3 py-1.5 text-[11px] text-muted shadow-sm backdrop-blur-md hover:border-accent/50 hover:text-foreground"
-            >
-              <Search className="h-3 w-3" />
-              <span className="flex-1 text-left">Search the graph…</span>
-              <kbd className="rounded border border-border px-1 py-0.5 text-[9px]">⌘P</kbd>
-            </button>
-            <button
-              type="button"
-              onClick={() => setSettingsOpen(true)}
-              aria-label="Settings"
-              data-testid="open-settings"
-              className="rounded-lg border border-border bg-surface/70 p-2 text-muted shadow-sm backdrop-blur-md hover:border-accent/50 hover:text-foreground"
-            >
-              <SettingsIcon className="h-3.5 w-3.5" />
-            </button>
-          </div>
 
           <CardsPanel
             cards={cards}
@@ -569,6 +640,32 @@ export default function App() {
         projectName={status?.projectName}
       />
     </div>
+  );
+}
+
+/**
+ * The hash's payload as the shell holds it — what a write is diffed against.
+ *
+ * Deliberately the same fields `encodeUrlState` takes, so "did anything change"
+ * and "what do we write" can never drift apart.
+ */
+interface HashState {
+  root: string | null;
+  selection: string | null;
+  cardId: string | null;
+  colorMode: ColorMode;
+  edgeKinds: string[];
+}
+
+/** Identical state = no history entry (and no write at all). */
+function sameHashState(a: HashState, b: HashState): boolean {
+  return (
+    a.root === b.root &&
+    a.selection === b.selection &&
+    a.cardId === b.cardId &&
+    a.colorMode === b.colorMode &&
+    a.edgeKinds.length === b.edgeKinds.length &&
+    a.edgeKinds.every((kind, index) => kind === b.edgeKinds[index])
   );
 }
 

@@ -550,6 +550,84 @@ own numbers and wording; no contract item and no endpoint shape changed.
   cannot disagree after a write. The server round-trip was never at fault:
   `PUT /api/settings` with `sortMode` → `GET` returns it (verified live).
 
+### Phase F clarifications — round 3 (additive; supersedes three round-2 items)
+
+A third manual review. Everything here refines the layout, the labels and the
+chrome; no contract item and no endpoint shape changed.
+
+- **Radii are PER BRANCH, not per ring.** A wedge's children start at **that
+  wedge's own outer radius** (`parent.r1`), so a directory always touches the
+  children it contains. *Supersedes the band model* ("bands pack from the inside
+  out — a band ends at its tallest wedge and the next band starts there"), which
+  sized every band by its **tallest** wedge: with directories 1 deep and files
+  4/3 deep, a directory whose siblings were files was followed by a strip of
+  blank disk before its own children began. Measured on a real 14.2k-node
+  project (83 roots × both sort modes, 14,756 parent→child pairs): **every**
+  pair had a gap, mean 6.2 layout units, worst 20.7 — a third of a ring of
+  whitespace. It is now exactly 0 for every pair. The 2-unit inter-ring gap went
+  with the bands; ring 1 still starts at the centre disk's edge.
+  - The disk stays bounded by the same two caps: **6 rings**, and
+    `MAX_RADIUS` — now `CENTRE_RADIUS + Σ ringThickness(n) × 4/3` = **430**
+    (down from 440, since the gaps are gone), which is exactly the deepest
+    possible branch. A branch that would pass it folds there, reporting
+    `truncated` like the depth cap does. On the same project the project root
+    draws 327 arcs over 6 rings out to radius 350; the deepest sampled branch
+    reached 363.
+  - `SunburstLayout.bands[]` is **gone**. Hit testing is now **angle first,
+    then radius**: for each ring, a binary search over that ring's arcs (sorted
+    by `a0`, angularly disjoint) finds the arc owning the angle, and it is kept
+    only if the radius lands in its own `[r0, r1)`. Cost is
+    `rings × log(arcs/ring)` — cheaper than the band scan it replaces. Ring is
+    no longer a radial interval, so the search cannot stop at the first ring
+    whose band contains the radius.
+  - *Supersedes round 2's "hit testing is still against the band"*: the wedge's
+    painted extent IS its click target now. Nothing was lost — a shallow wedge
+    is no longer followed by empty band, because whatever it contains starts
+    where it ends.
+  - Still a **pure deterministic function of (model, rootId, options)**;
+    verified by re-running every sampled layout and comparing the arcs.
+- **Label orientation is MEASURED, not preferred.** For each wedge, compare its
+  **tangential** extent at the label radius (`span × midRadius`, in px) with its
+  **radial** extent (`r1 - r0`, in px) and run the text along the longer one:
+  tangential > radial → the curved-along-the-arc layout, else the radial one.
+  *Supersedes round 2's "curved is the first choice, radial is the fallback"* —
+  a fixed preference reads backwards on exactly the wedges per-branch radii
+  produce, deep and narrow. Both layouts keep their own gates
+  (curved: ≥38px of arc, ≥11px thick; radial: ≥18px long, ≥8px high, both
+  evaluated before any `measureText`) and the **≥3-characters-or-nothing** rule;
+  if the picked orientation cannot fit a name, the other is tried before the
+  wedge is left bare for the hover tooltip.
+- **Search and settings are icon buttons in the CODEGRAPH panel's header**,
+  beside its collapse control, using the same `PanelButton` as every other
+  title bar. The "Search the graph…" bar and the settings button that sat in a
+  row of their own under the panel are gone; ⌘P is unchanged, and the two
+  buttons keep their `open-palette` / `open-settings` test ids.
+- **The node panel's EDGES are side by side.** One `edges` heading over two
+  columns, `incoming` | `outgoing`, each with its own count and its own
+  kind-grouped list. They used to stack, which pushed the incoming half off the
+  bottom of a panel that shares its column with the code. Qualified names and
+  the `extended by` relabelling of an incoming `extends` are unchanged.
+- **Back/Forward walk the selection history.** The hash is the state, so it is
+  also the history: **navigation pushes, everything else replaces.**
+  - `pushState` for a change of **root**, **selection** (including clearing it)
+    or **active card**; `replaceState` for the camera (pan / zoom / fit), the
+    colour mode and the edge-kind set. A hover changes none of them and writes
+    nothing.
+  - The URL gained **`s`** — the selected node id — alongside `r`/`c`/`m`/`k`.
+    Without it Back could restore where you were looking but not what you had
+    open.
+  - Writes are debounced (300ms), which is also the coalescer: a re-root that
+    moves the selection with it is **one** entry. The shell keeps the state the
+    hash currently carries and **diffs before writing** — identical state is
+    dropped, so nothing can spam the history. The first write of a session
+    replaces (the entry the user arrived on).
+  - `popstate` decodes the hash and applies the **whole** state (root,
+    selection, card + its highlight, colour mode, edge kinds) through the same
+    function the initial restore uses, then records it as the current state —
+    so the writes its own setters schedule find nothing to say and no entry is
+    pushed for a navigation the browser already performed. Any write still in
+    flight is cancelled first.
+
 Standing views (always-present cards, client-side): **Project** (whole graph)
 and **Changes** (`/api/changes`, refreshed on `dataVersion` change).
 
@@ -584,6 +662,11 @@ paths, line spans, user note) to paste into an agent prompt. Client-side only.
    fallback labels, flipped depth-by-kind, `+N` fold arcs, a centre circle that
    names the current root, no bottom band, collapsible left-hand panels, a
    provenance-free legend, `extended by`, and the settings `<label>` fix.
+   **Round 3** (third manual review): per-branch radii (no whitespace between a
+   wedge and its own children) with angle-first hit testing, label orientation
+   picked by the wedge's longer extent, search + settings as icon buttons in the
+   CODEGRAPH header, side-by-side node-panel edges, and browser Back/Forward as
+   selection history.
 
 ## House rules for every phase
 

@@ -6,11 +6,20 @@
  * you are waiting for an index, not while you are reading the graph.
  */
 import { useState } from 'react';
-import { Activity, ChevronDown, ChevronUp, Loader2, Play } from 'lucide-react';
+import {
+  Activity,
+  ChevronDown,
+  ChevronUp,
+  Loader2,
+  Play,
+  Search,
+  Settings as SettingsIcon,
+} from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
+import { PanelButton } from './side-panel';
 import type { Status } from '@/lib/api';
 import { cn, formatNumber } from '@/lib/utils';
 
@@ -20,9 +29,21 @@ export interface StatusPanelProps {
   indexing: boolean;
   indexLog: string[];
   onIndex(): void;
+  /** ⌘P — the palette trigger lives in this header (round 3). */
+  onOpenPalette(): void;
+  /** Settings — likewise, beside the collapse control. */
+  onOpenSettings(): void;
 }
 
-export function StatusPanel({ status, error, indexing, indexLog, onIndex }: StatusPanelProps) {
+export function StatusPanel({
+  status,
+  error,
+  indexing,
+  indexLog,
+  onIndex,
+  onOpenPalette,
+  onOpenSettings,
+}: StatusPanelProps) {
   const [open, setOpen] = useState(false);
   const busy = indexing || Boolean(status?.indexing);
   const needsIndex = Boolean(status && !status.indexed);
@@ -68,14 +89,28 @@ export function StatusPanel({ status, error, indexing, indexLog, onIndex }: Stat
             {status?.root ?? ''}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setOpen((value) => !value)}
-          className="shrink-0 rounded p-1 text-muted hover:text-foreground"
-          aria-label={open ? 'Collapse details' : 'Expand details'}
-        >
-          {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-        </button>
+        {/* Round 3: the two things you drive the app with — search (⌘P) and
+            settings — are icon buttons in THIS header, beside the collapse
+            control, rather than a row of chrome under the panel. Same
+            `PanelButton` every other panel title bar uses. */}
+        <div className="flex shrink-0 items-center gap-0.5">
+          <PanelButton
+            onClick={onOpenPalette}
+            label="Search the graph (⌘P)"
+            data-testid="open-palette"
+          >
+            <Search className="h-3.5 w-3.5" />
+          </PanelButton>
+          <PanelButton onClick={onOpenSettings} label="Settings" data-testid="open-settings">
+            <SettingsIcon className="h-3.5 w-3.5" />
+          </PanelButton>
+          <PanelButton
+            onClick={() => setOpen((value) => !value)}
+            label={open ? 'Collapse details' : 'Expand details'}
+          >
+            {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+          </PanelButton>
+        </div>
       </div>
 
       {open || needsIndex || error ? (
