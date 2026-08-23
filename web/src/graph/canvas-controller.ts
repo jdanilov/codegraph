@@ -53,6 +53,7 @@ import {
   DEFAULT_SORT_MODE,
   MAX_ARCS,
   MAX_RADIUS,
+  TAU,
   arcAt,
   arcCentroid,
   computeSunburst,
@@ -217,6 +218,35 @@ const RLABEL_MAX_FONT_PX = 12;
  */
 const LABEL_SETTLE_MS = 100;
 
+/**
+ * How recently the camera must have moved for a frame to be BLITTED rather
+ * than re-drawn (performance round G5).
+ *
+ * A camera-only gesture — a pan drag, a wheel zoom — changes nothing about the
+ * scene, only where it sits on screen, so the frame is a transform of the last
+ * one: the painter keeps a snapshot of every full frame and stamps it back
+ * through the camera delta instead of re-executing thousands of arcs, labels
+ * and ropes. Deliberately SHORTER than {@link LABEL_SETTLE_MS}: the settle
+ * window keeps the frame loop alive for 100ms after the gesture stops, so a
+ * window of 50ms guarantees the loop reaches a frame that is a real (full)
+ * redraw — which is what refreshes the snapshot and the label plan.
+ */
+const BLIT_GESTURE_MS = 50;
+
+/**
+ * Slack, in SCREEN px, added to the viewport before anything is culled.
+ *
+ * Everything a wedge paints outside its own annulus lives inside it: focus and
+ * hover outlines (≤2px), the changed/impacted rim, the change markers, and the
+ * glyphs of a curved label. The margin is what makes the conservative cull
+ * predicate cover them without any of them being modelled — see
+ * {@link makeCull}.
+ */
+const CULL_MARGIN_PX = 24;
+
+/** Entries a colour cache holds before it is dropped wholesale and refilled. */
+const COLOR_CACHE_MAX = 4000;
+
 /** ⌘P reveal pulse: three gentle breaths on the wedge the user landed on. */
 const PULSE_MS = 1000;
 const PULSE_CYCLES = 3;
@@ -294,6 +324,49 @@ interface DrawnEdge {
    * cross-disk curve, which lives in workspace space.
    */
   diskId: string | null;
+}
+
+/**
+ * The camera a snapshot of the last full frame was painted under.
+ *
+ * A camera is exactly (origin, scale) — every disk, arc, rope and tether is
+ * placed through those two — so re-projecting a finished frame onto a new
+ * camera is one `drawImage`: `new = newOrigin + (old − oldOrigin) × ratio`,
+ * which composes a pan and a cursor-anchored zoom alike. The device pixel ratio
+ * and the CSS size ride along because a change to either means the snapshot's
+ * pixels no longer describe this canvas at all.
+ */
+interface SnapshotCamera {
+  originX: number;
+  originY: number;
+  scale: number;
+  ratio: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * The viewport, expressed in the LOCAL units of whatever is being painted, plus
+ * the two conservative windows an annulus sector is tested against.
+ *
+ * See {@link makeCull} for the geometry and {@link arcVisible} for the
+ * correctness rule (a reject must be provable; drawing something offscreen is
+ * merely wasteful).
+ */
+export interface ViewCull {
+  /** The padded screen rect in local units. */
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  /** Distance interval from the local origin to the rect. */
+  dMin: number;
+  dMax: number;
+  /** True when the rect contains the origin — then every angle is on screen. */
+  full: boolean;
+  /** Angular window the rect subtends at the origin (only when `!full`). */
+  a0: number;
+  a1: number;
 }
 
 /**
@@ -488,8 +561,34 @@ export class CanvasController {
 
   /** `(font bucket, text)` → measured width in SCREEN px. */
   private readonly textWidths = new Map<string, number>();
+  /** `(colour mode, arc key)` → the arc's base fill, before any alpha. */
+  private readonly arcFills = new Map<string, string>();
   /** When the camera last moved — the label pass waits for this to go stale. */
   private cameraMovedAt = -Infinity;
+
+  /**
+   * Anything but the camera changed since the last full redraw (round G5).
+   *
+   * Set by {@link requestDraw}, which is what EVERY mutation path already calls
+   * — so a new one is dirty by default and the snapshot can only ever be blitted
+   * for a frame that is genuinely a camera transform of the last one. The two
+   * camera-only paths (a pan drag, the wheel) opt out through
+   * {@link requestCameraDraw}.
+   */
+  private sceneDirty = true;
+  /** When a camera-ONLY gesture last moved the camera. */
+  private cameraGestureAt = -Infinity;
+  /** The last full frame's pixels, at the backing-store resolution. */
+  private snapshotCanvas: HTMLCanvasElement | null = null;
+  /** The camera those pixels were painted under — `null` when they are stale. */
+  private snapshotCamera: SnapshotCamera | null = null;
+  /**
+   * A pointer position whose hit test was deferred because the camera was in
+   * motion. Applied on the first settled frame, so a wheel zoom neither pays
+   * for a hit test per frame nor leaves the hover pointing at the wedge that
+   * used to be under the cursor.
+   */
+  private pendingHover: Point | null = null;
 
   /** ⌘P landing pulse: which node, in which disk, and when it starts. */
   private pulseNodeId: string | null = null;
@@ -550,6 +649,9 @@ export class CanvasController {
     this.model = model;
     this.layoutCache.clear();
     this.aggregateCounts.clear();
+    // Fills are derived from (node, colour mode, the model's layer vocabulary),
+    // so a new model is the one thing that can change one without the key.
+    this.arcFills.clear();
 
     if (!previous || !sameProject) {
       this.disks = [makeDisk(PRIMARY_DISK_ID, initialRoot(model), 0, 0, true, null)];
@@ -1081,6 +1183,10 @@ export class CanvasController {
     if (this.frame !== null) cancelAnimationFrame(this.frame);
     this.resizeObserver.disconnect();
     this.canvas.remove();
+    // The snapshot is a second backing store the size of the canvas — let it go
+    // with the canvas it mirrors.
+    this.snapshotCanvas = null;
+    this.snapshotCamera = null;
   }
 
   // --------------------------------------------------------------- layout ---
@@ -1382,26 +1488,71 @@ export class CanvasController {
 
   // -------------------------------------------------------------- painting ---
 
+  /**
+   * Ask for a frame because SOMETHING CHANGED — the model, the layouts, the
+   * hover, a filter, a card, a disk's position…
+   *
+   * This is the default and every mutation path uses it: it marks the scene
+   * dirty, which is what forbids the next frame from being a blit of the last
+   * one. A path that genuinely only moved the camera opts out explicitly
+   * ({@link requestCameraDraw}); anything that forgets to is merely slower, not
+   * wrong, which is the right way round for a cache like this.
+   */
   private requestDraw(): void {
+    this.sceneDirty = true;
+    this.scheduleFrame();
+  }
+
+  /** Ask for a frame after a CAMERA-ONLY gesture — a pan drag, a wheel zoom. */
+  private requestCameraDraw(): void {
+    this.cameraGestureAt = performance.now();
+    this.scheduleFrame();
+  }
+
+  /** One frame, coalesced. Neither marks nor clears {@link sceneDirty}. */
+  private scheduleFrame(): void {
     if (this.frame !== null || this.disposed) return;
     this.frame = requestAnimationFrame(() => {
       this.frame = null;
       if (this.disposed) return;
       this.draw();
-      if (this.disks.some((disk) => disk.transitionStart > 0)) this.requestDraw();
+      if (this.disks.some((disk) => disk.transitionStart > 0)) this.scheduleFrame();
     });
   }
 
   private draw(): void {
     const ctx = this.ctx;
     const ratio = window.devicePixelRatio || 1;
+
+    // A hit test the camera's motion deferred lands here, on the first settled
+    // frame, so the hover it produces is painted by the redraw below rather
+    // than by a frame of its own.
+    if (this.pendingHover && !this.cameraSettling()) {
+      const at = this.pendingHover;
+      this.pendingHover = null;
+      this.updateHover(at);
+    }
+
+    // Mid-gesture, with nothing but the camera changed: stamp the last full
+    // frame back through the camera delta and stop. Everything below is skipped
+    // — arcs, labels, ropes, hit-testable state — because none of it can differ.
+    if (this.blitFrame(ratio)) return;
+
+    // Cleared BEFORE painting: a mutation that lands mid-frame (a summary
+    // callback re-entering the controller) must survive as dirty, so the next
+    // frame is a real redraw and the snapshot below is skipped.
+    this.sceneDirty = false;
+
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.clearRect(0, 0, this.width, this.height);
     ctx.fillStyle = BACKGROUND;
     ctx.fillRect(0, 0, this.width, this.height);
 
     const model = this.model;
-    if (!model) return;
+    if (!model) {
+      this.snapshotCamera = null;
+      return;
+    }
 
     if (this.edgesDirty) this.rebuildEdges();
 
@@ -1425,16 +1576,24 @@ export class CanvasController {
       const eased = 1 - Math.pow(1 - progress, 3);
       const animationScale = disk.transitionFrom + (1 - disk.transitionFrom) * eased;
 
+      // A disk whose whole bounding circle is off screen paints nothing: no
+      // arcs, no centre, no labels, no ropes of its own. Its TETHER and its
+      // cross-disk relations are not its own — they live in workspace space and
+      // are culled by their own curve below, since either can cross a viewport
+      // that neither of its two disks touches.
+      const k = scale * animationScale;
+      const cull = this.cullFor(origin.x + disk.x * scale, origin.y + disk.y * scale, k);
+      if (cull.dMin > layout.maxRadius) continue;
+
       ctx.save();
       ctx.translate(origin.x + disk.x * scale, origin.y + disk.y * scale);
-      ctx.scale(scale * animationScale, scale * animationScale);
+      ctx.scale(k, k);
       ctx.globalAlpha = progress < 1 ? 0.25 + 0.75 * eased : 1;
 
-      const k = scale * animationScale;
-      this.drawArcs(ctx, disk, layout, model, k);
-      this.drawCentre(ctx, disk, layout, k);
-      this.drawEdges(ctx, disk.id, k);
-      this.drawLabels(ctx, disk, model, k);
+      this.drawArcs(ctx, disk, layout, model, k, cull);
+      if (cull.dMin <= layout.centreRadius) this.drawCentre(ctx, disk, layout, k);
+      this.drawEdges(ctx, disk.id, k, cull);
+      this.drawLabels(ctx, disk, model, k, cull);
 
       ctx.restore();
     }
@@ -1442,12 +1601,13 @@ export class CanvasController {
     // Cross-disk relations live in workspace space and are drawn once, over the
     // disks: a curve that vanished under an opaque wedge would claim a
     // connection it never showed.
+    const workspaceCull = this.cullFor(origin.x, origin.y, scale);
     ctx.save();
     ctx.translate(origin.x, origin.y);
     ctx.scale(scale, scale);
     // Tethers first, so a code edge is never hidden under one.
-    this.drawTethers(ctx, scale);
-    this.drawEdges(ctx, null, scale);
+    this.drawTethers(ctx, scale, workspaceCull);
+    this.drawEdges(ctx, null, scale, workspaceCull);
     ctx.restore();
 
     this.drawDiskChrome(ctx);
@@ -1455,10 +1615,122 @@ export class CanvasController {
 
     // Two things keep the frame loop alive on their own: the ⌘P pulse, and the
     // camera-settle window that owes the labels one more (full) pass.
-    if (this.pulseNodeId !== null || this.cameraSettling()) this.requestDraw();
+    if (this.pulseNodeId !== null || this.cameraSettling()) this.scheduleFrame();
 
     // The edge count is part of the summary, and it only ever changes here.
     if (this.drawnEdges.length !== this.emittedEdges) this.emitSummary();
+
+    this.captureSnapshot(ratio, origin, scale);
+  }
+
+  /**
+   * The camera-gesture fast path: re-project the last full frame instead of
+   * re-executing the scene. `true` when the frame was served this way.
+   *
+   * A pan is pixel-exact (the delta is a translation); a zoom is the same frame
+   * scaled about the point the gesture anchored it at, so it goes slightly soft
+   * until the gesture stops — the same trade the label plan already makes, and
+   * for the same reason: the settled frame that follows is the real one.
+   *
+   * Every condition below is a reason the snapshot cannot describe this frame:
+   * the scene changed, a disk is animating, the pulse is breathing, the canvas
+   * or its device pixel ratio moved under it, a NON-camera drag is in flight
+   * (the wedge ghost, a disk being moved), or the gesture has simply stopped.
+   */
+  private blitFrame(ratio: number): boolean {
+    const snapshot = this.snapshotCamera;
+    const source = this.snapshotCanvas;
+    if (!snapshot || !source || this.sceneDirty) return false;
+    if (performance.now() - this.cameraGestureAt >= BLIT_GESTURE_MS) return false;
+    if (snapshot.ratio !== ratio) return false;
+    if (snapshot.width !== this.width || snapshot.height !== this.height) return false;
+    if (this.pulseNodeId !== null) return false;
+    if (this.drag !== null && this.drag.mode !== 'pan') return false;
+    if (this.disks.some((disk) => disk.transitionStart > 0)) return false;
+
+    const origin = this.origin();
+    const factor = this.scale() / snapshot.scale;
+    if (!Number.isFinite(factor) || factor <= 0) return false;
+
+    const ctx = this.ctx;
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.clearRect(0, 0, this.width, this.height);
+    ctx.fillStyle = BACKGROUND;
+    ctx.fillRect(0, 0, this.width, this.height);
+    // `new = newOrigin + (old − oldOrigin) × factor`, written as the rectangle
+    // the whole snapshot lands in.
+    ctx.drawImage(
+      source,
+      origin.x - snapshot.originX * factor,
+      origin.y - snapshot.originY * factor,
+      snapshot.width * factor,
+      snapshot.height * factor
+    );
+
+    // The settle window owes this frame a real redraw; keep the loop alive.
+    if (this.pulseNodeId !== null || this.cameraSettling()) this.scheduleFrame();
+    return true;
+  }
+
+  /**
+   * Keep the frame just painted, with the camera it was painted under.
+   *
+   * Skipped — and the previous snapshot dropped — while anything is animating:
+   * a transition or pulse frame is a moment in an animation, not a scene at
+   * rest, and blitting one after the animation finished would show the picture
+   * mid-morph. Dropping rather than keeping is the safe direction: no snapshot
+   * simply means the next gesture frame is a full redraw.
+   */
+  private captureSnapshot(ratio: number, origin: Point, scale: number): void {
+    const animating =
+      this.sceneDirty || this.pulseNodeId !== null || this.disks.some((d) => d.transitionStart > 0);
+    const width = this.canvas.width;
+    const height = this.canvas.height;
+    if (animating || width === 0 || height === 0) {
+      this.snapshotCamera = null;
+      return;
+    }
+    let target = this.snapshotCanvas;
+    if (!target) {
+      target = document.createElement('canvas');
+      this.snapshotCanvas = target;
+    }
+    if (target.width !== width || target.height !== height) {
+      target.width = width;
+      target.height = height;
+    }
+    const ctx = target.getContext('2d');
+    if (!ctx) {
+      this.snapshotCamera = null;
+      return;
+    }
+    // Canvas → canvas, never `getImageData`: this is a GPU blit, a readback is
+    // a synchronisation point.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(this.canvas, 0, 0);
+    this.snapshotCamera = {
+      originX: origin.x,
+      originY: origin.y,
+      scale,
+      ratio,
+      width: this.width,
+      height: this.height,
+    };
+  }
+
+  /**
+   * The viewport in the local units of a frame whose origin sits at screen
+   * `(cx, cy)` and whose unit is `k` screen px — a disk's frame, or the
+   * workspace's.
+   */
+  private cullFor(cx: number, cy: number, k: number): ViewCull {
+    return makeCull(
+      (-CULL_MARGIN_PX - cx) / k,
+      (-CULL_MARGIN_PX - cy) / k,
+      (this.width + CULL_MARGIN_PX - cx) / k,
+      (this.height + CULL_MARGIN_PX - cy) / k
+    );
   }
 
   /** Is the camera still moving (or freshly stopped)? */
@@ -1476,11 +1748,16 @@ export class CanvasController {
     disk: DiskState,
     layout: SunburstLayout,
     model: GraphModel,
-    k: number
+    k: number,
+    cull: ViewCull
   ): void {
     const pulseAlpha = disk.id === this.pulseDiskId ? this.pulseAlpha() : 0;
     const focus = this.hasFocus();
     for (const arc of layout.arcs) {
+      // Off screen: rejected before any path work, and before the rim and the
+      // change markers that ride the same wedge. Iteration order and everything
+      // painted for a surviving arc are untouched.
+      if (!arcVisible(cull, arc)) continue;
       // A category switched off in the legend is not painted at all — it is not
       // dimmed, it is absent (its angular space stays, so nothing else moves).
       if (this.isHiddenArc(arc)) continue;
@@ -1734,13 +2011,16 @@ export class CanvasController {
    * green/amber direction colours. The anchor is the collapsed wedge's mid
    * angle, so the line leaves the disk pointing at the thing it expanded.
    */
-  private drawTethers(ctx: CanvasRenderingContext2D, k: number): void {
+  private drawTethers(ctx: CanvasRenderingContext2D, k: number, cull: ViewCull): void {
     if (this.disks.length < 2) return;
     ctx.lineCap = 'round';
     ctx.setLineDash([]);
     for (const disk of this.disks) {
       const curve = this.tetherOf(disk);
       if (!curve) continue;
+      // A tether belongs to neither disk's frame, so it is culled by its own
+      // hull: the curve can cross a viewport that shows neither of its ends.
+      if (!boxVisible(cull, [curve.start, curve.control1, curve.control2, curve.end])) continue;
       const hot = this.tetherHoverDiskId === disk.id;
       ctx.strokeStyle = hot ? TETHER_COLOR_HOVER : TETHER_COLOR;
       ctx.lineWidth = (hot ? TETHER_WIDTH_PX * 1.6 : TETHER_WIDTH_PX) / k;
@@ -1820,12 +2100,20 @@ export class CanvasController {
   }
 
   /** Paint the relations belonging to one disk (`null` = the cross-disk set). */
-  private drawEdges(ctx: CanvasRenderingContext2D, diskId: string | null, k: number): void {
+  private drawEdges(
+    ctx: CanvasRenderingContext2D,
+    diskId: string | null,
+    k: number,
+    cull: ViewCull
+  ): void {
     if (this.drawnEdges.length === 0) return;
     ctx.lineCap = 'round';
     for (const drawn of this.drawnEdges) {
       if (drawn.diskId !== diskId) continue;
       if (drawn.points.length < 2) continue;
+      // A rope is culled by its own bounding box, in the frame its polyline is
+      // expressed in — the same rule for a bundled curve and a cross-disk one.
+      if (!boxVisible(cull, drawn.points)) continue;
       const hovered = drawn.edge.key === this.hoveredEdgeKey;
       ctx.beginPath();
       ctx.moveTo(drawn.points[0]!.x, drawn.points[0]!.y);
@@ -1857,7 +2145,8 @@ export class CanvasController {
     ctx: CanvasRenderingContext2D,
     disk: DiskState,
     model: GraphModel,
-    k: number
+    k: number,
+    cull: ViewCull
   ): void {
     // While the camera is moving the last PLAN is replayed through arithmetic
     // gates only. Rebuilding it costs an orientation choice and a `measureText`
@@ -1865,11 +2154,15 @@ export class CanvasController {
     // review reported; the gates below are a handful of multiplications and the
     // real pass runs the moment the gesture stops.
     const reuse = this.cameraSettling() && disk.labelPlan !== null;
-    const plan = reuse ? disk.labelPlan! : this.buildLabelPlan(ctx, disk, k);
+    const plan = reuse ? disk.labelPlan! : this.buildLabelPlan(ctx, disk, k, cull);
     if (!reuse) disk.labelPlan = plan;
 
     for (const label of plan) {
       const arc = label.geom.arc;
+      // Off screen: rejected before the ink is even resolved. A replayed plan
+      // was measured against a different viewport, so the gate belongs here as
+      // well as in the pass that builds one.
+      if (!arcVisible(cull, arc)) continue;
       if (this.isHiddenArc(arc)) continue;
       if (reuse && !this.planStillFits(label, k)) continue;
       // A hollow (expanded-away) wedge has the canvas background behind its
@@ -1895,10 +2188,15 @@ export class CanvasController {
   private buildLabelPlan(
     ctx: CanvasRenderingContext2D,
     disk: DiskState,
-    k: number
+    k: number,
+    cull: ViewCull
   ): PlannedLabel[] {
     const plan: PlannedLabel[] = [];
     for (const geom of disk.labelGeom) {
+      // The `measureText` this pass exists to spend is spent on what is on
+      // screen. The plan is therefore viewport-shaped — which is exactly what
+      // the replay above re-checks it against.
+      if (!arcVisible(cull, geom.arc)) continue;
       if (this.isHiddenArc(geom.arc)) continue;
       const label = this.planLabel(ctx, geom, k);
       if (label) plan.push(label);
@@ -2115,11 +2413,27 @@ export class CanvasController {
     ctx.restore();
   }
 
+  /**
+   * An arc's BASE fill — before any alpha, emphasis or dimming.
+   *
+   * Memoised per `(colour mode, arc key)`, which is the whole of what it
+   * depends on: an arc key is a node id (or `agg|…`), and the palette's answer
+   * for a node under a mode is fixed for the lifetime of the model. Without the
+   * cache this was a `model.get` plus a `colorForNode` per arc per frame, twice
+   * over for a labelled one. Dropped whole when a new model arrives (that is
+   * the one thing that can change a colour without changing the key) and when
+   * it outgrows its cap; the mode is in the key, so switching modes needs
+   * nothing.
+   */
   private fillFor(arc: SunburstArc, model: GraphModel): string {
-    if (!arc.nodeId) return AGGREGATE_FILL;
-    const node = model.get(arc.nodeId);
-    if (!node) return AGGREGATE_FILL;
-    return colorForNode(node, this.colorMode, model.layers);
+    const key = `${this.colorMode}|${arc.key}`;
+    const cached = this.arcFills.get(key);
+    if (cached !== undefined) return cached;
+    const node = arc.nodeId ? model.get(arc.nodeId) : undefined;
+    const fill = node ? colorForNode(node, this.colorMode, model.layers) : AGGREGATE_FILL;
+    if (this.arcFills.size >= COLOR_CACHE_MAX * 4) this.arcFills.clear();
+    this.arcFills.set(key, fill);
+    return fill;
   }
 
   // ------------------------------------------------------- workspace chrome ---
@@ -2558,7 +2872,9 @@ export class CanvasController {
         this.panX += dx;
         this.panY += dy;
         this.cameraMoved();
-        this.requestDraw();
+        // Camera only: the scene is unchanged, so the frame is the last one
+        // translated — see `blitFrame`.
+        this.requestCameraDraw();
         return;
       }
       if (drag.mode === 'move-disk') {
@@ -2579,6 +2895,18 @@ export class CanvasController {
       return;
     }
     if (this.disks.some((disk) => disk.transitionStart > 0)) return;
+    // A hit test costs an angle-first search per disk plus a pass over every
+    // rope, and a hover CHANGE dirties the scene — both of which would land in
+    // the middle of a wheel zoom, which has no drag to suppress it the way a
+    // pan does. It is deferred to the settled frame instead: the pointer has
+    // not moved, only what is under it, so answering once at the end is the
+    // same answer for less work.
+    if (this.cameraSettling()) {
+      this.pendingHover = position;
+      this.scheduleFrame();
+      return;
+    }
+    this.pendingHover = null;
     this.updateHover(position);
   };
 
@@ -2628,6 +2956,9 @@ export class CanvasController {
   private readonly onPointerDown = (event: PointerEvent): void => {
     if (event.button !== 0) return;
     const position = this.pointerPosition(event);
+    // A hover the camera deferred is abandoned, not delivered late: a gesture
+    // has started, and every drag suppresses the hover for its duration.
+    this.pendingHover = null;
 
     const base: DragState = {
       mode: 'pan',
@@ -2724,6 +3055,7 @@ export class CanvasController {
 
   private readonly onPointerLeave = (): void => {
     this.drag = null;
+    this.pendingHover = null;
     this.closeHoverDiskId = null;
     this.tetherHoverDiskId = null;
     this.setHover(null, null, null);
@@ -2819,7 +3151,9 @@ export class CanvasController {
     this.panX = position.x - before.x * scale - centre.x;
     this.panY = position.y - before.y * scale - centre.y;
     this.cameraMoved();
-    this.requestDraw();
+    // Camera only, exactly like a pan: the blit scales the last frame about the
+    // point the gesture pinned, which is what (origin, scale) then vs now says.
+    this.requestCameraDraw();
     this.emitSummary();
   };
 
@@ -3057,8 +3391,116 @@ function fontSpec(fontPx: number, k: number): string {
 /** Entries the text-metrics cache holds before it stops growing. */
 const TEXT_CACHE_MAX = 4000;
 
-/** `#rrggbb` (or `rgba(...)`) → `rgba(...)` at the given alpha. */
-function withAlpha(color: string, alpha: number): string {
+// ---------------------------------------------------------------- culling ---
+
+/**
+ * The viewport, as the two windows an annulus sector can be rejected against.
+ *
+ * **The correctness rule** (round G5): the predicate may only reject what
+ * *provably* cannot touch the rect. A false negative — drawing something that
+ * turns out to be off screen — costs a path nobody sees; a false positive is a
+ * hole in the picture. So both windows are outer bounds and nothing here is
+ * ever tightened:
+ *
+ *  - the **radial** window is `[closest point of the rect, farthest corner]`
+ *    from the local origin — every point of the rect has a radius inside it;
+ *  - the **angular** window is the cone the rect subtends at the origin. A rect
+ *    that CONTAINS the origin subtends everything, so there is no angular
+ *    constraint at all (`full`). Otherwise the rect is convex and misses the
+ *    origin, so it sits in an open half-plane through it: the cone is narrower
+ *    than π and is spanned by the four corners, which is what makes taking the
+ *    minimal arc through them exact rather than a guess.
+ *
+ * A sector that intersects the rect has a point in both, whose radius lies in
+ * both radial intervals and whose angle lies in both angular ones — so failing
+ * either test is a proof of disjointness. The converse does not hold and is not
+ * claimed. The rect handed in is already padded by {@link CULL_MARGIN_PX}, so
+ * strokes, rims and glyphs that sit slightly outside their wedge are covered
+ * without being modelled.
+ */
+export function makeCull(x0: number, y0: number, x1: number, y1: number): ViewCull {
+  const nearX = Math.min(Math.max(0, x0), x1);
+  const nearY = Math.min(Math.max(0, y0), y1);
+  const dMin = Math.hypot(nearX, nearY);
+  const dMax = Math.hypot(Math.max(Math.abs(x0), Math.abs(x1)), Math.max(Math.abs(y0), Math.abs(y1)));
+  const full = x0 <= 0 && x1 >= 0 && y0 <= 0 && y1 >= 0;
+  if (full) return { x0, y0, x1, y1, dMin, dMax, full, a0: 0, a1: TAU };
+
+  // The rect's own centre is inside it, hence inside the cone — so every corner
+  // is within π of it and the wrapped deltas order themselves without a case.
+  const base = Math.atan2((y0 + y1) / 2, (x0 + x1) / 2);
+  let lo = 0;
+  let hi = 0;
+  for (const x of [x0, x1]) {
+    for (const y of [y0, y1]) {
+      const delta = wrapToPi(Math.atan2(y, x) - base);
+      if (delta < lo) lo = delta;
+      if (delta > hi) hi = delta;
+    }
+  }
+  return { x0, y0, x1, y1, dMin, dMax, full, a0: base + lo, a1: base + hi };
+}
+
+/** Could this wedge touch the viewport? Conservative — see {@link makeCull}. */
+export function arcVisible(cull: ViewCull, arc: { r0: number; r1: number; a0: number; a1: number }): boolean {
+  if (arc.r1 < cull.dMin || arc.r0 > cull.dMax) return false;
+  if (cull.full) return true;
+  return anglesOverlap(arc.a0, arc.a1, cull.a0, cull.a1);
+}
+
+/** Could this polyline (or Bézier hull) touch the viewport? Box test only. */
+function boxVisible(cull: ViewCull, points: readonly Point[]): boolean {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const point of points) {
+    if (point.x < minX) minX = point.x;
+    if (point.x > maxX) maxX = point.x;
+    if (point.y < minY) minY = point.y;
+    if (point.y > maxY) maxY = point.y;
+  }
+  return !(maxX < cull.x0 || minX > cull.x1 || maxY < cull.y0 || minY > cull.y1);
+}
+
+/**
+ * Do two angular intervals overlap on the circle?
+ *
+ * Both are given as `[start, start + length]` with a non-negative length, which
+ * is how the layout writes an arc (`a1 > a0`, up to a full turn) and how
+ * {@link makeCull} writes its cone. Two arcs of a circle meet exactly when one
+ * of them contains the other's start — walk back from any shared point to one
+ * start and you either stay inside the other arc the whole way or leave it
+ * through its own start.
+ */
+export function anglesOverlap(a0: number, a1: number, w0: number, w1: number): boolean {
+  const arcSpan = a1 - a0;
+  const windowSpan = w1 - w0;
+  if (arcSpan >= TAU || windowSpan >= TAU) return true;
+  return wrapToTau(w0 - a0) <= arcSpan || wrapToTau(a0 - w0) <= windowSpan;
+}
+
+/** `angle` folded into `[-π, π)`. */
+function wrapToPi(angle: number): number {
+  const wrapped = wrapToTau(angle);
+  return wrapped >= Math.PI ? wrapped - TAU : wrapped;
+}
+
+/** `angle` folded into `[0, 2π)`. */
+function wrapToTau(angle: number): number {
+  const wrapped = angle % TAU;
+  return wrapped < 0 ? wrapped + TAU : wrapped;
+}
+
+// ----------------------------------------------------------------- colour ---
+
+/**
+ * `#rrggbb` (or `rgba(...)`) → `rgba(...)` at the given alpha.
+ *
+ * The uncached form. Every call site goes through {@link withAlpha}; this one
+ * is what that memoises, and what a probe compares it against.
+ */
+export function computeWithAlpha(color: string, alpha: number): string {
   if (color.startsWith('rgba(')) {
     return color.replace(/rgba\(([^,]+),([^,]+),([^,]+),[^)]+\)/, `rgba($1,$2,$3,${alpha})`);
   }
@@ -3070,8 +3512,31 @@ function withAlpha(color: string, alpha: number): string {
   return `rgba(${r},${g},${b},${alpha})`;
 }
 
-/** Dark ink on a bright arc, light ink on a dark one. */
-function readableOn(color: string): string {
+const ALPHA_CACHE = new Map<string, string>();
+
+/**
+ * {@link computeWithAlpha}, memoised on `(colour, alpha)` — byte-identical
+ * output, without the parse, the shifts and the template per arc per frame.
+ *
+ * The alphas are a small set by construction: the ring step
+ * (`0.94 − 0.055 × (ring − 1)`), that times {@link DIM_ALPHA}, the 0.85 floors,
+ * the two edge weights, and `0.85 × alpha` for a change marker. The one
+ * continuous caller is the ⌘P pulse, for a second at a time — which is why the
+ * cache is emptied wholesale at its cap rather than frozen: an entry the pulse
+ * pushed out has to be able to come back.
+ */
+export function withAlpha(color: string, alpha: number): string {
+  const key = `${color}|${alpha}`;
+  const cached = ALPHA_CACHE.get(key);
+  if (cached !== undefined) return cached;
+  const value = computeWithAlpha(color, alpha);
+  if (ALPHA_CACHE.size >= COLOR_CACHE_MAX) ALPHA_CACHE.clear();
+  ALPHA_CACHE.set(key, value);
+  return value;
+}
+
+/** Dark ink on a bright arc, light ink on a dark one. Uncached form. */
+export function computeReadableOn(color: string): string {
   if (!color.startsWith('#') || color.length !== 7) return '#e6edf7';
   const value = Number.parseInt(color.slice(1), 16);
   const r = (value >> 16) & 255;
@@ -3079,6 +3544,18 @@ function readableOn(color: string): string {
   const b = value & 255;
   const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
   return luminance > 0.6 ? '#0b1220' : '#eef4ff';
+}
+
+const INK_CACHE = new Map<string, string>();
+
+/** {@link computeReadableOn}, memoised — one entry per colour in the palette. */
+export function readableOn(color: string): string {
+  const cached = INK_CACHE.get(color);
+  if (cached !== undefined) return cached;
+  const ink = computeReadableOn(color);
+  if (INK_CACHE.size >= COLOR_CACHE_MAX) INK_CACHE.clear();
+  INK_CACHE.set(color, ink);
+  return ink;
 }
 
 /**

@@ -1183,6 +1183,119 @@ contract item and no endpoint shape changed.
 - **The legend list is ~30px taller**, so a project with a dozen kinds shows
   another row or two before it scrolls.
 
+### Performance round (G5) — gesture blit, viewport culling, colour caches (additive; nothing on screen changed)
+
+A render round, not a design round: **nothing about the picture changed**, and
+at rest every frame is pixel-identical to G4's. What changed is what a frame
+COSTS. Three expanded disks, zoomed in, dragging the camera measured ~33ms per
+committed frame — a frame budget and a half, i.e. visible jitter on the one
+gesture the user makes constantly. All three fixes live in the controller;
+`sunburst.ts` and `workspace.ts` are still pure and are untouched.
+
+- **A camera-only gesture BLITS the last frame instead of re-drawing it.** A
+  camera is exactly `(origin, scale)`; every disk, arc, rope, tether and
+  screen-space affordance is placed through those two. So while a pan drag or a
+  wheel zoom is in flight the painter does not execute the scene at all: it
+  keeps a snapshot of the last full frame (canvas → canvas `drawImage`, never
+  `getImageData` — a readback is a synchronisation point) together with the
+  camera it was painted under, and re-projects it as
+  `new = newOrigin + (old − oldOrigin) × (newScale / oldScale)`. Deriving the
+  transform from the two cameras rather than from a pan delta is what makes it
+  compose a **cursor-anchored** zoom for free, since the wheel handler expresses
+  its anchoring as a new `(origin, scale)` pair and nothing else. A pan is
+  therefore pixel-exact; a zoom goes slightly soft (and the two screen-sized
+  affordances — the close `×`, the tether's direction dot — scale with it) until
+  the gesture stops. That is the same trade the G4 label plan already makes, and
+  it resolves the same way: the settle window keeps the frame loop alive for
+  100ms after the last camera move, the blit window is only 50ms, so the loop is
+  **guaranteed** to reach a real redraw — which repaints everything crisply,
+  re-plans the labels and refreshes the snapshot.
+  - **Invalidation is default-deny, not a list.** `requestDraw()` — what every
+    mutation path in the controller already calls — marks the scene dirty, and a
+    dirty scene can never be blitted. Only two call sites opt out
+    (`requestCameraDraw()`): the `pan` branch of the pointer drag and the wheel
+    handler. So the model, a layout, a root, a disk being added / moved / closed,
+    a wedge drag or its ghost, a re-root transition, hover, selection, a card's
+    highlight, impact mode, the legend filters, the colour mode, the sort mode,
+    the change markers, the edge-kind filters and a resize all force a full
+    redraw **by construction**, and a future mutation path that forgets about
+    the snapshot is merely slower, never wrong. On top of that the blit refuses
+    outright while any disk is mid-transition, while the ⌘P pulse is breathing,
+    for any drag that is not a pan, and whenever the device pixel ratio or the
+    canvas's CSS size differs from the snapshot's. The snapshot is **dropped**
+    (not kept) on any frame that is a moment in an animation, so a gesture
+    starting right after one can never stamp back a half-morphed picture.
+  - **A hover that arrives mid-gesture is deferred, not dropped.** A pan drag
+    already suppressed the hover; a wheel zoom has no drag to suppress it with,
+    and a hover CHANGE would both dirty the scene and pay for a hit test per
+    frame. The pointer position is parked instead and hit-tested once, on the
+    first settled frame — the pointer did not move, only what is under it, so
+    one answer at the end is the same answer for less work. A press abandons a
+    parked hover rather than delivering it late.
+- **The settled redraw culls to the viewport.** Making the gesture cheap is not
+  enough when the frame it settles into is itself over budget. Three levels,
+  all conservative:
+  - **disk** — a disk whose bounding circle (`maxRadius` about its workspace
+    position) misses the canvas rect paints nothing: no arcs, no centre, no
+    labels, none of its own bundled ropes. Its **tether and its cross-disk
+    relations are not culled with it** — they live in workspace space and can
+    cross a viewport that shows neither of their two disks, so they are culled
+    by their own curve's bounding box (endpoints plus control points) instead.
+  - **arc** — the screen rect is mapped into the disk's local frame and reduced
+    to a distance interval from the centre plus, when the centre is off screen,
+    an angular window. A wedge is rejected when `[r0, r1]` misses the distance
+    interval or `[a0, a1]` misses the angular window. The same reject runs in
+    the label pass (both when a plan is built and when one is replayed) and
+    covers the rim, the focus outlines and the change markers, which ride the
+    wedge they annotate.
+  - **The correctness rule, which is the whole of this item:** the predicate may
+    only reject what *provably* cannot touch the rect. A **false negative**
+    (painting something that turns out to be off screen) costs a path nobody
+    sees; a **false positive** is a hole in the picture. So both windows are
+    outer bounds — the distance interval runs from the rect's nearest point to
+    its farthest corner, and a rect that CONTAINS the centre subtends every
+    angle and therefore constrains nothing. The angular window is exact because
+    a rect that misses the centre is convex and sits in an open half-plane
+    through it, so its cone is narrower than π and is spanned by its four
+    corners. The rect is padded by 24 screen px before any of this, which covers
+    strokes, rims and glyphs that sit slightly outside their wedge without any
+    of them being modelled. **Hit testing is not culled** — it works from the
+    pointer, not the viewport, and already binary-searches per ring.
+  - Probed (throwaway numeric probe over the real modules, bundled with
+    esbuild): **32,000** (camera, viewport, arc) cases drawn from 28 real
+    `computeSunburst` layouts plus hand-built adversarial ones (full-circle
+    arcs, a wedge straddling the ±π seam, a viewport containing the centre) —
+    **23,237 rejects, 0 violations** against an oracle that samples the sector
+    densely *and* tests the rect's own corners against the sector; **20,000**
+    angular-overlap cases, 0 violations; and a mutation control (the same
+    predicate with its windows shrunk a few percent) that the oracle catches on
+    393 cases, so "zero" is a result rather than a blind spot.
+- **Colour work is memoised, per-frame string building is not.** `withAlpha`
+  was parsing a hex colour and building an `rgba(...)` template per arc per
+  frame (twice for a labelled one); it is now a map keyed `(colour, alpha)`,
+  byte-identical output — the alphas are a small set by construction (the ring
+  step, that times the dim factor, the 0.85 floors, the two edge weights), and
+  the one continuous caller is the ⌘P pulse, which is why the cache is emptied
+  wholesale at its cap rather than frozen: an entry the pulse pushed out has to
+  be able to come back. Each arc's **base fill** is cached per
+  `(colour mode, arc key)` — an arc key is a node id, and the palette's answer
+  for a node under a mode is fixed for the model's lifetime — which removes a
+  `model.get` plus a palette lookup per arc per frame; a new model drops it, and
+  the mode is in the key so switching modes needs no invalidation at all. Ink
+  (`readableOn`) rides the same scheme. **Emphasis and dimming are deliberately
+  NOT cached**: they change with the hover and are already set lookups.
+  - Probed: **11,520** memoised-vs-uncached comparisons across the whole kind
+    palette, the edge-direction colours, the `rgba(...)` chrome colours and two
+    malformed inputs × every alpha the painter uses, before *and* after the cap
+    emptied the cache — 0 mismatches.
+- **Explicit non-goals, deferred.** No `Path2D` caching per arc (the win is
+  real but it needs a per-layout invalidation story of its own, and culling
+  already removes most of the path work). No device-pixel-ratio downshift while
+  a gesture is in flight (the blit makes the gesture cheap without trading
+  sharpness at rest, and a ratio change is exactly what invalidates a snapshot).
+  Neither is required by anything above, and both would be judged on their own
+  measurements.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all
