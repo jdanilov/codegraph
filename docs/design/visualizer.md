@@ -476,6 +476,80 @@ additive fields noted below.
   explanatory paragraphs ("The whole project, with every top-level folder
   collapsed…" and "Click a directory arc to open it…") are gone.
 
+### Phase F clarifications — round 2 (additive; supersedes four phase F items)
+
+A second manual review of the phase F build. Everything here refines phase F's
+own numbers and wording; no contract item and no endpoint shape changed.
+
+- **The fallback label is RADIAL, not screen-horizontal.** When a name cannot
+  follow its arc it is drawn **along the radius**, on the wedge's angular
+  bisector, flipped 180° on the left half of the disk (`cos(mid) < 0`) so it is
+  never upside down — the convention every sunburst uses. The room it has is the
+  wedge's own geometry with the axes swapped from the curved case: the **radial
+  depth** (`r1 - r0`) is the line's LENGTH, the **angular chord at the centroid**
+  (`span × midRadius`) its HEIGHT. Gates (≥18px of length, ≥8px of height, both
+  evaluated before any `measureText`) and the **≥3-characters-or-nothing** rule
+  are unchanged. *Supersedes phase F's "Label fallback".* The horizontal
+  fallback scattered text at every angle across the disk and collided with
+  neighbours; radial text is bounded by the wedge that owns it.
+- **Depth by kind is FLIPPED: directory 1, file 4/3, symbol 4/3.** Radial depth
+  is now the label's room, and the long names are the files' and the symbols'
+  (`canvas-controller.ts` vs `graph`), so the wedges that carry them get a third
+  more room than a directory rather than less. *Supersedes phase F's "Radial
+  depth encodes the kind" ratios (1 · ¾ · ½); everything else about it stands* —
+  bands still pack from the inside out and end at their tallest wedge, hit
+  testing is still against the **band** (so the empty band behind a shallow
+  DIRECTORY wedge still belongs to that directory), and a fold arc still takes
+  the deepest factor among the children it folded. `MAX_RADIUS` (the fallback
+  used before a layout exists) is computed at the deepest factor; a real layout
+  reports its own `maxRadius`, which is what the camera fits to.
+- **A fold arc is labelled `+N`.** "smaller" ate the room the number needed;
+  the arc is drawn at the same size as its neighbours and the tooltip still
+  explains what it folded and how to reach it.
+- **The centre circle names WHERE YOU ARE.** The current root's name, prominent,
+  with its LoC under it (`5,176 loc`) — and, when there is somewhere up, a small
+  secondary `▲ <parent>` hint above it. It is still a button and still re-roots
+  one level out; at the project root the hint is simply absent and the name is
+  the project root directory's. *Supersedes phase F's "The centre circle names
+  its destination"*: the disk shows one subtree at a time and the centre is the
+  only thing that can say which one, which matters more than pre-announcing a
+  click's destination — especially now that the breadcrumb is gone.
+- **The bottom band is gone.** No breadcrumb, no edge-kind chips: up-navigation
+  is the centre circle, ⌘P and the URL. `CanvasController` keeps
+  `setEdgeKinds`/`enabledEdgeKinds` (URL state still restores them) and
+  `ViewSummary` still carries `breadcrumb`, `edgeKinds` and `enabledKinds` — but
+  nothing renders them, and `<GraphCanvas>`'s only chrome is the arc tooltip.
+- **Collapse is now every panel's affordance, on both columns.** The QUESTIONS
+  and LEGEND panels fold to their title bars exactly like the node and code
+  panels (same `PanelButton`, same chevrons); the legend keeps its mode switch
+  and `fit` in the title bar while folded, and the questions panel gives its
+  `flex-1` back to the column. State is per panel and lives in the shell.
+- **The legend drops the provenance rows.** Colour swatches (kind/layer) and
+  incoming-green / outgoing-amber only. Dashed rendering on the canvas is
+  untouched — `EDGE_PROVENANCE_LEGEND` simply has no reader in the UI any more;
+  the node panel already names a synthesized relation in words on the row
+  itself. *Supersedes "The legend carries both vocabularies"'s provenance half.*
+- **An incoming `extends` reads `extended by`.** Edges are stored in the
+  direction the source declares them, so an incoming inheritance edge means
+  "that symbol extends THIS one"; `INCOMING_KIND_LABELS` in the node panel is
+  the (currently single-entry) table for that. The other incoming groups are
+  left alone deliberately — `implements`/`overrides` have the same shape and can
+  join the table the day anyone finds them confusing, while `calls`/`imports`/
+  `references` read fine under the ← arrow and gain nothing from a passive
+  voice on every row.
+- **A `<label>` must not wrap a group of buttons.** The settings dialog's
+  "Graph order" control was inside the shared `Field`, which renders a
+  `<label>`; a label forwards every click that does not land on interactive
+  content to its **first labelable descendant**, so clicking the caption, the
+  hint, or the empty row beside the two buttons synthesised a click on the FIRST
+  button (`structural`) and silently discarded the user's choice — which Save
+  then honestly persisted. `Field` takes a `group` flag and renders
+  `<div role="group">` for control sets; only a single-input field stays a
+  `<label>`. Save additionally re-publishes the **persisted** order to the shell
+  (`onSortModeChange(view.sortMode)`), so the file, the dialog and the disk
+  cannot disagree after a write. The server round-trip was never at fault:
+  `PUT /api/settings` with `sortMode` → `GET` returns it (verified live).
+
 Standing views (always-present cards, client-side): **Project** (whole graph)
 and **Changes** (`/api/changes`, refreshed on `dataVersion` change).
 
@@ -506,7 +580,10 @@ paths, line spans, user note) to paste into an agent prompt. Client-side only.
    tooltips, no on-canvas telemetry. Then a second pass over the **panels**:
    legend + fit to the left column, selection split into node + code panels
    that collapse, qualified references, agreeing card counts, one owner for
-   Escape, transition-free DOM.
+   Escape, transition-free DOM. **Round 2** (second manual review): radial
+   fallback labels, flipped depth-by-kind, `+N` fold arcs, a centre circle that
+   names the current root, no bottom band, collapsible left-hand panels, a
+   provenance-free legend, `extended by`, and the settings `<label>` fix.
 
 ## House rules for every phase
 

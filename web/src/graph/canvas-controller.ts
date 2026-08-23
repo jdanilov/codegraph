@@ -148,18 +148,27 @@ const LABEL_MIN_THICKNESS_PX = 11;
 const LABEL_MIN_CHARS = 5;
 
 /**
- * Horizontal fallback (phase F): when a wedge cannot carry text along its arc,
- * the name is drawn screen-aligned through the wedge's centroid instead. Two
- * cheap gates keep it off the hot path — the horizontal room inside the wedge
- * must beat {@link HLABEL_MIN_WIDTH_PX}, the vertical room
- * {@link HLABEL_MIN_HEIGHT_PX} — and a fit that leaves fewer than
- * {@link HLABEL_MIN_CHARS} characters (ellipsis included) is dropped: three
+ * RADIAL fallback: when a wedge cannot carry text along its arc, the name is
+ * drawn along the RADIUS instead — out from the centre through the wedge's
+ * angular bisector, flipped 180° on the left half of the disk so it is never
+ * upside down (the standard sunburst convention).
+ *
+ * Which is why the room the text has is the wedge's own geometry with the axes
+ * swapped from the curved case: the **radial depth** (`r1 - r0`) is the line
+ * LENGTH, the **angular chord at the centroid** is its HEIGHT. Both gates are
+ * checked before any `measureText`, and a fit that leaves fewer than
+ * {@link RLABEL_MIN_CHARS} characters (ellipsis included) is dropped: three
  * letters name something, one plus a dot names nothing.
+ *
+ * (Round 1 drew this fallback screen-horizontally through the centroid, which
+ * scattered text across the disk at every angle and collided with neighbours.
+ * Radial text is why files and symbols now get the deeper wedge — see
+ * `depthFactor` — the depth IS the label's room.)
  */
-const HLABEL_MIN_WIDTH_PX = 18;
-const HLABEL_MIN_HEIGHT_PX = 8;
-const HLABEL_MIN_CHARS = 4;
-const HLABEL_MAX_FONT_PX = 12;
+const RLABEL_MIN_LENGTH_PX = 18;
+const RLABEL_MIN_HEIGHT_PX = 8;
+const RLABEL_MIN_CHARS = 4;
+const RLABEL_MAX_FONT_PX = 12;
 
 /** Opacity multiplier for anything the current focus dims. */
 const DIM_ALPHA = 0.26;
@@ -396,7 +405,7 @@ export class CanvasController {
    *
    * "Visible" means an arc actually exists for it. Re-rooting to its parent is
    * the normal answer, but a node can still be swallowed by its parent's
-   * `+N smaller` arc (a directory of 900 files), so the fallback re-roots onto
+   * `+N` fold arc (a directory of 900 files), so the fallback re-roots onto
    * the node ITSELF: the centre disk always renders the root, so ⌘P can reach
    * anything in the graph.
    */
@@ -756,25 +765,32 @@ export class CanvasController {
     ctx.lineWidth = 1.4 / k;
     ctx.stroke();
 
-    // The centre is a BUTTON, so it names its destination rather than itself
-    // (phase F): the parent you land on by clicking it. At the project root
-    // there is nowhere up, so it names the root directory — and either way the
-    // second line is the LoC the disk in front of you actually weighs.
+    // The centre names WHERE YOU ARE (round 2): the current root, prominent,
+    // with the LoC the disk in front of you weighs under it. It is still a
+    // button, so the destination of clicking it is a small secondary hint above
+    // the name (`▲ <parent>`); at the project root there is nowhere up and the
+    // hint is simply absent.
     const parentId = layout.root.parent;
     const parent = parentId ? this.model?.get(parentId) : undefined;
-    const canGoUp = Boolean(parent);
-    const title = (parent ?? layout.root).name || 'project';
+    const title = layout.root.name || 'project';
     const width = (layout.centreRadius - 12) * 2;
 
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
+
+    if (parent) {
+      ctx.font = `500 ${9 / k}px ui-sans-serif, system-ui, sans-serif`;
+      ctx.fillStyle = 'rgba(170, 190, 220, 0.55)';
+      ctx.fillText(fitText(ctx, `▲ ${parent.name}`, width), 0, -20 / k);
+    }
+
     ctx.fillStyle = '#dbe4f2';
-    ctx.font = `600 ${12.5 / k}px ui-sans-serif, system-ui, sans-serif`;
-    ctx.fillText(fitText(ctx, canGoUp ? `▲ ${title}` : title, width), 0, -5 / k);
+    ctx.font = `600 ${13 / k}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.fillText(fitText(ctx, title, width), 0, (parent ? -2 : -5) / k);
 
     ctx.font = `500 ${10 / k}px ui-sans-serif, system-ui, sans-serif`;
     ctx.fillStyle = 'rgba(190, 205, 230, 0.72)';
-    ctx.fillText(fitText(ctx, `${formatNumber(layout.rootLoc)} loc`, width), 0, 10 / k);
+    ctx.fillText(fitText(ctx, `${formatNumber(layout.rootLoc)} loc`, width), 0, (parent ? 14 : 10) / k);
   }
 
   private drawEdges(ctx: CanvasRenderingContext2D, k: number): void {
@@ -820,14 +836,15 @@ export class CanvasController {
   }
 
   /**
-   * Name a wedge — along its arc when that fits, horizontally when it doesn't.
+   * Name a wedge — along its arc when that fits, along its RADIUS when it
+   * doesn't.
    *
    * Curved text is the first choice: it reads at the ring thickness the wedge
    * actually has and never crosses a neighbour. When the wedge is too short or
-   * too thin for it, the name is drawn screen-aligned through the wedge's
-   * centroid instead (phase F) — which is how a deep, narrow symbol wedge gets
-   * to keep its name. Only when neither fits legibly does the wedge stay bare
-   * and the hover tooltip carry the name.
+   * too thin for it, the name is drawn radially instead, on the wedge's angular
+   * bisector — which is how a deep, narrow symbol wedge gets to keep its name.
+   * Only when neither fits legibly does the wedge stay bare and the hover
+   * tooltip carry the name.
    */
   private drawArcLabel(
     ctx: CanvasRenderingContext2D,
@@ -845,13 +862,13 @@ export class CanvasController {
       const fontPx = Math.max(9, Math.min(12.5, thicknessPx * 0.34));
       ctx.font = `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
       const text = fitText(ctx, arc.label, span * 0.9 * midRadius);
-      // `ex…` names nothing — fall through to the horizontal attempt instead.
+      // `ex…` names nothing — fall through to the radial attempt instead.
       if (text && !(text.endsWith('…') && text.length < LABEL_MIN_CHARS)) {
         this.drawCurvedLabel(ctx, text, (arc.a0 + arc.a1) / 2, midRadius, ink);
         return;
       }
     }
-    this.drawHorizontalLabel(ctx, arc, midRadius, span, k, ink);
+    this.drawRadialLabel(ctx, arc, midRadius, span, k, ink);
   }
 
   /**
@@ -886,17 +903,21 @@ export class CanvasController {
   }
 
   /**
-   * Screen-aligned fallback: how much horizontal room is there *inside* this
-   * wedge?
+   * Radial fallback: the name runs OUT ALONG THE RADIUS, on the wedge's
+   * angular bisector.
    *
-   * The wedge is approximated by the rectangle through its centroid with the
-   * radial and tangential half-extents it actually has, rotated to the wedge's
-   * mid angle. A horizontal line through the centre of that rectangle runs out
-   * at `min(radialHalf / |cos|, tangentialHalf / |sin|)` — two divisions, no
-   * allocation, which is what keeps this affordable once per wedge per frame.
-   * Both gates are checked BEFORE any `measureText`.
+   * The room is the wedge's own geometry, no approximation needed: the line
+   * length is the wedge's radial depth and the cap height is the angular chord
+   * at the centroid (`span × midRadius`). Both are known before any
+   * `measureText`, which is what keeps this affordable once per wedge per
+   * frame.
+   *
+   * On the left half of the disk (`cos(mid) < 0`) the text would come out
+   * upside down, so it is rotated a further 180° and reads inward — the
+   * convention every sunburst uses, and the reason the label never has to be
+   * mirrored per glyph.
    */
-  private drawHorizontalLabel(
+  private drawRadialLabel(
     ctx: CanvasRenderingContext2D,
     arc: SunburstArc,
     midRadius: number,
@@ -904,32 +925,25 @@ export class CanvasController {
     k: number,
     ink: string
   ): void {
-    const mid = (arc.a0 + arc.a1) / 2;
-    const cos = Math.abs(Math.cos(mid));
-    const sin = Math.abs(Math.sin(mid));
-    const radialHalf = (arc.r1 - arc.r0) / 2;
-    const tangentHalf = (span * midRadius) / 2;
-    const halfWidth = Math.min(
-      cos > 1e-6 ? radialHalf / cos : Infinity,
-      sin > 1e-6 ? tangentHalf / sin : Infinity
-    );
-    const halfHeight = Math.min(
-      sin > 1e-6 ? radialHalf / sin : Infinity,
-      cos > 1e-6 ? tangentHalf / cos : Infinity
-    );
-    const widthPx = halfWidth * 2 * k;
-    const heightPx = halfHeight * 2 * k;
-    if (widthPx < HLABEL_MIN_WIDTH_PX || heightPx < HLABEL_MIN_HEIGHT_PX) return;
+    const depth = arc.r1 - arc.r0;
+    const lengthPx = depth * k;
+    const heightPx = span * midRadius * k;
+    if (lengthPx < RLABEL_MIN_LENGTH_PX || heightPx < RLABEL_MIN_HEIGHT_PX) return;
 
-    const fontPx = Math.max(8, Math.min(HLABEL_MAX_FONT_PX, heightPx * 0.8));
+    const fontPx = Math.max(8, Math.min(RLABEL_MAX_FONT_PX, heightPx * 0.8));
     ctx.font = `500 ${fontPx / k}px ui-sans-serif, system-ui, sans-serif`;
-    const text = fitText(ctx, arc.label, halfWidth * 2 * 0.92);
-    if (!text || (text.endsWith('…') && text.length < HLABEL_MIN_CHARS)) return;
+    const text = fitText(ctx, arc.label, depth * 0.92);
+    if (!text || (text.endsWith('…') && text.length < RLABEL_MIN_CHARS)) return;
 
+    const mid = (arc.a0 + arc.a1) / 2;
+    ctx.save();
+    ctx.translate(Math.cos(mid) * midRadius, Math.sin(mid) * midRadius);
+    ctx.rotate(Math.cos(mid) < 0 ? mid + Math.PI : mid);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = ink;
-    ctx.fillText(text, Math.cos(mid) * midRadius, Math.sin(mid) * midRadius);
+    ctx.fillText(text, 0, 0);
+    ctx.restore();
   }
 
   private fillFor(arc: SunburstArc, model: GraphModel): string {
@@ -1156,7 +1170,7 @@ export class CanvasController {
     }
 
     if (!arc.nodeId) {
-      // A `+N smaller` arc: re-rooting onto its parent gives the folded
+      // A `+N` fold arc: re-rooting onto its parent gives the folded
       // children the full circle. At ring 1 the parent IS the root, so there is
       // nowhere further to go — ⌘P is the way in, and the tooltip says so.
       if (arc.parentNodeId !== this.rootId) this.setRoot(arc.parentNodeId);

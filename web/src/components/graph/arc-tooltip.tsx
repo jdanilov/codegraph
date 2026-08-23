@@ -4,7 +4,7 @@
  * The disk encodes size as ANGLE, which is readable in the large and vague in
  * the small — so the tooltip carries the exact number (LoC for a directory or
  * file, span length for a symbol) plus what the arc is and, when it is a
- * `+N smaller` aggregate, how to reach what it folded away.
+ * `+N` fold arc, how to reach what it folded away.
  */
 import { Layers3 } from 'lucide-react';
 

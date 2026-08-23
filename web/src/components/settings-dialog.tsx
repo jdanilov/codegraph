@@ -8,6 +8,11 @@
  * The API key is never echoed back in full — the server returns a mask. So the
  * field starts holding that mask and is only ever PUT when the user actually
  * edits it; an untouched form round-trips without touching the stored key.
+ *
+ * The form is only rendered once the current settings have loaded (`loading`),
+ * so nothing the user picks can be overwritten by a late GET — the ONE way the
+ * state changes is a click. Which is why the `<label>`-forwarding bug fixed in
+ * {@link Field} was enough to lose a Graph-order choice on its own.
  */
 import { useEffect, useState } from 'react';
 import { Check, Loader2, Settings as SettingsIcon, X } from 'lucide-react';
@@ -85,7 +90,12 @@ export function SettingsDialog({ open, onClose, onSortModeChange }: SettingsDial
       };
       // Omitting the key leaves the stored one alone; sending "" clears it.
       if (keyDirty) patch['anthropicApiKey'] = apiKey.trim() || null;
-      apply(await saveSettings(patch));
+      const view = await saveSettings(patch);
+      apply(view);
+      // Re-publish the PERSISTED order, not the one that was clicked: after a
+      // save the disk, the dialog and `~/.codegraph/ui.json` must agree, and
+      // this is the only place all three are known at once.
+      onSortModeChange?.(toSortMode(view.sortMode));
       setSaved(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -139,6 +149,7 @@ export function SettingsDialog({ open, onClose, onSortModeChange }: SettingsDial
             </Field>
 
             <Field
+              group
               label="Graph order"
               hint="How siblings are arranged around the disk. The wedge size is always the share of lines of code — this only changes the order."
             >
@@ -216,20 +227,44 @@ export function SettingsDialog({ open, onClose, onSortModeChange }: SettingsDial
   );
 }
 
+/**
+ * One labelled row of the form.
+ *
+ * `group` is load-bearing, and is the fix for "Save resets the Graph order"
+ * (round 2). A `<label>` forwards every click that does not land on interactive
+ * content to its **first labelable descendant** — so with the two order buttons
+ * wrapped in a label, clicking the caption, the hint, or any of the empty row
+ * beside the buttons synthesised a click on the FIRST button (`structural`) and
+ * silently threw the user's choice away. Save then honestly persisted what the
+ * form now held. A group of buttons is not a labelled control: it renders as a
+ * plain `<div role="group">` with a caption, and only a genuine single-input
+ * field keeps the `<label>` (where the click-to-focus behaviour is the point).
+ */
 function Field({
   label,
   hint,
+  group,
   children,
 }: {
   label: string;
   hint: string;
+  /** True when `children` is a set of controls rather than one input. */
+  group?: boolean;
   children: React.ReactNode;
 }) {
-  return (
-    <label className="flex flex-col gap-1">
+  const body = (
+    <>
       <span className="text-[11px] font-medium">{label}</span>
       {children}
       <span className="text-[10px] text-muted">{hint}</span>
-    </label>
+    </>
   );
+  if (group) {
+    return (
+      <div className="flex flex-col gap-1" role="group" aria-label={label}>
+        {body}
+      </div>
+    );
+  }
+  return <label className="flex flex-col gap-1">{body}</label>;
 }

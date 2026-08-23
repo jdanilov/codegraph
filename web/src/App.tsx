@@ -82,6 +82,10 @@ export default function App() {
   // folded while they walk the graph.
   const [nodePanelCollapsed, setNodePanelCollapsed] = useState(false);
   const [codePanelCollapsed, setCodePanelCollapsed] = useState(false);
+  // …and so do the two LEFT-hand panels (round 2): the disk is the app, and
+  // both columns should be able to get out of its way with the same gesture.
+  const [cardsPanelCollapsed, setCardsPanelCollapsed] = useState(false);
+  const [legendPanelCollapsed, setLegendPanelCollapsed] = useState(false);
   /** Colour keys currently on the disk — the LEGEND's only input. */
   const [colorKeys, setColorKeys] = useState<string[]>([]);
   const colorKeysRef = useRef('');
@@ -494,6 +498,8 @@ export default function App() {
             onDelete={removeCard}
             onNavigate={navigate}
             onExport={() => setFeedbackOpen(true)}
+            collapsed={cardsPanelCollapsed}
+            onToggleCollapsed={() => setCardsPanelCollapsed((value) => !value)}
           />
 
           <LegendPanel
@@ -502,6 +508,8 @@ export default function App() {
             layers={model?.layers ?? []}
             present={colorKeys}
             onFit={() => controllerRef.current?.fitView()}
+            collapsed={legendPanelCollapsed}
+            onToggleCollapsed={() => setLegendPanelCollapsed((value) => !value)}
           />
         </div>
       </div>

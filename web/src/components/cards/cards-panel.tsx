@@ -16,6 +16,8 @@
 import { useState } from 'react';
 import {
   Braces,
+  ChevronDown,
+  ChevronRight,
   FileDiff,
   Files,
   FolderTree,
@@ -27,6 +29,7 @@ import {
   Trash2,
 } from 'lucide-react';
 
+import { PanelButton } from '@/components/graph/side-panel';
 import { Card as Surface } from '@/components/ui/card';
 import { DIRECTORY_KIND, type GraphModel } from '@/graph/model';
 import { colorForKind } from '@/graph/palette';
@@ -59,6 +62,9 @@ export interface CardsPanelProps {
   onDelete(id: string): void;
   onNavigate(id: string): void;
   onExport(): void;
+  /** Folded to its title bar — same affordance as every other panel (round 2). */
+  collapsed: boolean;
+  onToggleCollapsed(): void;
 }
 
 export function CardsPanel({
@@ -76,6 +82,8 @@ export function CardsPanel({
   onDelete,
   onNavigate,
   onExport,
+  collapsed,
+  onToggleCollapsed,
 }: CardsPanelProps) {
   const [question, setQuestion] = useState('');
   const activeCard = cards.find((card) => card.id === activeId) ?? null;
@@ -87,6 +95,16 @@ export function CardsPanel({
     onAsk(trimmed);
   };
 
+  // Folded: the title bar and nothing else, and — the point of folding — the
+  // column's height goes back to the legend under it.
+  if (collapsed) {
+    return (
+      <Surface className="pointer-events-auto flex shrink-0 flex-col p-3" data-testid="cards-panel">
+        <PanelHeader collapsed onToggleCollapsed={onToggleCollapsed} />
+      </Surface>
+    );
+  }
+
   // Sized by the column, not by the viewport (phase F): the legend now sits
   // under this panel, so a fixed `max-h` against `100vh` could push it off the
   // bottom of a short window. `flex-1 min-h-0` lets it give room back.
@@ -95,9 +113,7 @@ export function CardsPanel({
       className="pointer-events-auto flex min-h-0 flex-1 flex-col p-3"
       data-testid="cards-panel"
     >
-      <div className="flex shrink-0 items-center gap-2 text-[10px] uppercase tracking-[0.2em] text-muted">
-        <MessageSquare className="h-3 w-3" /> questions
-      </div>
+      <PanelHeader collapsed={false} onToggleCollapsed={onToggleCollapsed} />
 
       <div className="mt-2 flex shrink-0 items-center gap-1.5">
         <input
@@ -190,6 +206,33 @@ export function CardsPanel({
         <Share2 className="h-3 w-3" /> export feedback
       </button>
     </Surface>
+  );
+}
+
+/** Title bar — the panel's name and the collapse toggle, nothing else. */
+function PanelHeader({
+  collapsed,
+  onToggleCollapsed,
+}: {
+  collapsed: boolean;
+  onToggleCollapsed(): void;
+}) {
+  return (
+    <div className="flex shrink-0 items-center gap-2 text-[10px] uppercase tracking-[0.2em] text-muted">
+      <MessageSquare className="h-3 w-3" />
+      <span className="flex-1">questions</span>
+      <PanelButton
+        onClick={onToggleCollapsed}
+        label={collapsed ? 'Expand panel' : 'Collapse panel'}
+        data-testid="cards-collapse"
+      >
+        {collapsed ? (
+          <ChevronRight className="h-3.5 w-3.5" />
+        ) : (
+          <ChevronDown className="h-3.5 w-3.5" />
+        )}
+      </PanelButton>
+    </div>
   );
 }
 

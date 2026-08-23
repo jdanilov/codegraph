@@ -12,11 +12,13 @@
  * largest-first (the DaisyDisk convention) so the project reads as "where is
  * the mass". Either way the wedge itself is the LoC share.
  *
- * Radial DEPTH encodes what an arc is: a directory owns its whole ring band, a
- * file three quarters of it, a symbol half ({@link depthFactor}). Bands still
- * pack from the inside out — a band ends at its tallest wedge and the next band
- * starts there — so the rings never drift apart; a shorter wedge simply leaves
- * a little space toward the outside of its own band.
+ * Radial DEPTH encodes what an arc is: a directory is one band thick, a file
+ * and a symbol a third more ({@link depthFactor}). Bands pack from the inside
+ * out — a band ends at its tallest wedge and the next band starts there — so
+ * the rings never drift apart; a shorter wedge simply leaves a little space
+ * toward the outside of its own band. Depth is also LABEL room: a name that
+ * cannot follow its arc is drawn radially, and the long names are the files'
+ * and the symbols'.
  *
  * Three properties are load-bearing and worth stating outright:
  *
@@ -30,7 +32,7 @@
  *     also *bounds every ring*: a full circle can hold at most `2π / MIN` arcs,
  *     so the render budget can never be blown by breadth, only by depth.
  *  3. **Tail aggregation.** Children whose natural share falls below the sliver
- *     are folded into one `+N smaller` arc per parent, so a directory of 900
+ *     are folded into one `+N` fold arc per parent, so a directory of 900
  *     tiny files is one honest arc rather than 900 unreadable hairlines.
  *
  * Symbols are drawn only where their file's wedge is wide enough to read
@@ -76,18 +78,22 @@ function ringThickness(ring: number): number {
   return Math.max(30, 56 - 4 * (ring - 1));
 }
 
-/** Share of its ring band a file wedge occupies. */
-export const FILE_DEPTH_FACTOR = 0.75;
-/** Share of its ring band a symbol wedge occupies. */
-export const SYMBOL_DEPTH_FACTOR = 0.5;
+/** Depth of a file wedge as a multiple of its ring's base thickness. */
+export const FILE_DEPTH_FACTOR = 4 / 3;
+/** Depth of a symbol wedge as a multiple of its ring's base thickness. */
+export const SYMBOL_DEPTH_FACTOR = 4 / 3;
 
 /**
- * How deep (radially) a wedge of this kind is drawn, as a share of its band.
+ * How deep (radially) a wedge of this kind is drawn, as a multiple of its
+ * band's base thickness.
  *
- * Directory 1 · file ¾ · symbol ½. The kind is legible from the wedge's own
- * shape before any colour is read, and the outer rings — which are the busiest
- * — become the shallowest, which is what stops a symbol ring from reading as a
- * second directory ring.
+ * Directory 1 · file 4/3 · symbol 4/3 — **flipped in the round-2 review**. It
+ * was directory 1 · file ¾ · symbol ½, on the theory that the busiest outer
+ * rings should be the shallowest. The label pass proved the opposite: a name
+ * that will not fit along its arc is drawn RADIALLY (out along the wedge), so
+ * radial depth is exactly the room a label has — and file and symbol names are
+ * the long ones (`canvas-controller.ts` vs `graph`). Directories keep the base
+ * thickness; everything that carries a long name gets a third more room.
  */
 export function depthFactor(kind: string): number {
   if (kind === DIRECTORY_KIND) return 1;
@@ -95,10 +101,20 @@ export function depthFactor(kind: string): number {
   return SYMBOL_DEPTH_FACTOR;
 }
 
-/** Outer radius of the deepest possible disk (every ring full depth). */
+/** Deepest a wedge is ever drawn, relative to its band's base thickness. */
+const MAX_DEPTH_FACTOR = Math.max(1, FILE_DEPTH_FACTOR, SYMBOL_DEPTH_FACTOR);
+
+/**
+ * Outer radius of the deepest possible disk (every ring at its deepest kind).
+ *
+ * Only a FALLBACK for a controller with no layout yet — a real layout reports
+ * its own `maxRadius`, which is what the camera fits to.
+ */
 export const MAX_RADIUS = (() => {
   let radius = CENTRE_RADIUS;
-  for (let ring = 1; ring <= MAX_RINGS; ring++) radius += ringThickness(ring) + RING_GAP;
+  for (let ring = 1; ring <= MAX_RINGS; ring++) {
+    radius += ringThickness(ring) * MAX_DEPTH_FACTOR + RING_GAP;
+  }
   return radius - RING_GAP;
 })();
 
@@ -119,7 +135,7 @@ export interface Point {
 }
 
 export interface SunburstArc {
-  /** Stable key: the node id, or `agg|<parent id>` for a `+N smaller` arc. */
+  /** Stable key: the node id, or `agg|<parent id>` for a `+N` fold arc. */
   key: string;
   /** Model node this arc renders. `null` for an aggregate arc. */
   nodeId: string | null;
@@ -160,8 +176,9 @@ export interface SunburstLayout {
   byRing: SunburstArc[][];
   /**
    * Radial band per ring (index = ring, `[0]` is the centre disk). A wedge
-   * starts at its band's `r0` and ends within it, shorter for a file or a
-   * symbol — the BAND is what packs, not the individual wedge.
+   * starts at its band's `r0` and ends within it — shallower for a directory
+   * than for the file or symbol beside it — because the BAND is what packs,
+   * not the individual wedge.
    */
   bands: Array<{ r0: number; r1: number }>;
   rings: number;
@@ -242,7 +259,7 @@ interface Slot {
  * is what stops a 300-child directory from rendering as a fine-toothed comb);
  * if the children fit, every one of them is drawn, with the tiny ones resting
  * on the sliver floor. If they don't, the SMALLEST are folded into the
- * `+N smaller` arc — which is a size decision, while the order the survivors
+ * `+N` fold arc — which is a size decision, while the order the survivors
  * are drawn in stays whatever the caller asked for (phase F: the structural
  * sort must not be re-shuffled by the fold). The aggregate arc is always last.
  *
@@ -434,7 +451,7 @@ export function computeSunburst(
           ? depthFactor(node.kind)
           : slot.ids.reduce(
               (deepest, id) => Math.max(deepest, depthFactor(model.get(id)?.kind ?? '')),
-              SYMBOL_DEPTH_FACTOR
+              1
             );
         const arc: SunburstArc = {
           key: slot.id ?? aggregateKey(item.nodeId),
@@ -449,7 +466,9 @@ export function computeSunburst(
           parentNodeId: item.nodeId,
           weight: slot.size,
           hiddenChildren: node ? model.childrenOf(node.id).length : slot.ids.length,
-          label: node ? node.name : `+${slot.ids.length} smaller`,
+          // A fold arc is labelled `+N`, nothing more: it is drawn at the same
+          // size as its neighbours and "smaller" ate the room a real name needs.
+          label: node ? node.name : `+${slot.ids.length}`,
           kind: node ? node.kind : AGGREGATE_KIND,
         };
         if (node?.layer) arc.layer = node.layer;

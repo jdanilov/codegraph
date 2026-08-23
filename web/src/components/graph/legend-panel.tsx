@@ -7,29 +7,31 @@
  * else. The `Fit` control came with it — re-fitting the disk is a navigation
  * action, and navigation lives on the left.
  *
- * The panel carries BOTH colour vocabularies:
+ * The panel carries the two colour vocabularies:
  *
  *  - **arcs** — the active colour mode's swatches, listing only what is
  *    actually mounted, so it shrinks as you drill in;
- *  - **edges** — direction (incoming green, outgoing amber) and provenance
- *    (solid parsed, dashed synthesized).
+ *  - **edges** — direction: incoming green, outgoing amber.
  *
  * Every value is imported from `@/graph/palette`, never re-typed here: the
  * canvas paints from the same tables, so the legend cannot drift from the disk.
  *
- * What is NOT here any more: the wedge/budget count, the ring count and the
- * edges-rendered readout. That was renderer telemetry — no question a developer
- * reading a codebase actually asks (phase F, "no renderer telemetry on screen").
+ * What is NOT here: the wedge/budget count, the ring count and the
+ * edges-rendered readout — that was renderer telemetry, no question a developer
+ * reading a codebase actually asks (phase F, "no renderer telemetry on screen")
+ * — and, from round 2, the solid/dashed PROVENANCE rows. The canvas still
+ * dashes a synthesized relation; a legend row explaining it cost four lines of
+ * a panel that has to fit under the questions, for a distinction the node panel
+ * already spells out in words on the relation itself.
+ *
+ * Like the two right-hand panels, the legend COLLAPSES to its title bar rather
+ * than closing (round 2) — the same affordance, in the same place.
  */
-import { Crosshair, Palette } from 'lucide-react';
+import { ChevronDown, ChevronRight, Crosshair, Palette } from 'lucide-react';
 
+import { PanelButton } from '@/components/graph/side-panel';
 import { Card } from '@/components/ui/card';
-import {
-  EDGE_DIRECTION_LEGEND,
-  EDGE_PROVENANCE_LEGEND,
-  legendEntries,
-  type ColorMode,
-} from '@/graph/palette';
+import { EDGE_DIRECTION_LEGEND, legendEntries, type ColorMode } from '@/graph/palette';
 import { cn } from '@/lib/utils';
 
 export interface LegendPanelProps {
@@ -41,9 +43,19 @@ export interface LegendPanelProps {
   present: string[];
   /** Reset zoom and centre the disk. */
   onFit(): void;
+  collapsed: boolean;
+  onToggleCollapsed(): void;
 }
 
-export function LegendPanel({ mode, onModeChange, layers, present, onFit }: LegendPanelProps) {
+export function LegendPanel({
+  mode,
+  onModeChange,
+  layers,
+  present,
+  onFit,
+  collapsed,
+  onToggleCollapsed,
+}: LegendPanelProps) {
   const entries = legendEntries(mode, new Set(present), layers);
   const canSwitch = layers.length > 0;
 
@@ -82,55 +94,57 @@ export function LegendPanel({ mode, onModeChange, layers, present, onFit }: Lege
           >
             <Crosshair className="h-3 w-3" /> fit
           </button>
+          <PanelButton
+            onClick={onToggleCollapsed}
+            label={collapsed ? 'Expand panel' : 'Collapse panel'}
+            data-testid="legend-collapse"
+          >
+            {collapsed ? (
+              <ChevronRight className="h-3.5 w-3.5" />
+            ) : (
+              <ChevronDown className="h-3.5 w-3.5" />
+            )}
+          </PanelButton>
         </div>
       </div>
 
-      <ul className="mt-2.5 flex max-h-48 flex-col gap-1 overflow-auto">
-        {entries.map((entry) => (
-          <li key={entry.key} className="flex items-center gap-2 text-[11px] text-muted">
-            <span
-              className="h-2.5 w-2.5 shrink-0 rounded-full"
-              style={{ backgroundColor: entry.color }}
-            />
-            <span className="truncate">{entry.label}</span>
-          </li>
-        ))}
-        {entries.length === 0 ? <li className="text-[11px] text-muted">nothing mounted</li> : null}
-      </ul>
+      {collapsed ? null : (
+        <>
+          <ul className="mt-2.5 flex max-h-48 flex-col gap-1 overflow-auto">
+            {entries.map((entry) => (
+              <li key={entry.key} className="flex items-center gap-2 text-[11px] text-muted">
+                <span
+                  className="h-2.5 w-2.5 shrink-0 rounded-full"
+                  style={{ backgroundColor: entry.color }}
+                />
+                <span className="truncate">{entry.label}</span>
+              </li>
+            ))}
+            {entries.length === 0 ? (
+              <li className="text-[11px] text-muted">nothing mounted</li>
+            ) : null}
+          </ul>
 
-      <div className="mt-2.5 border-t border-border/60 pt-2">
-        <span className="text-[9px] uppercase tracking-[0.18em] text-muted">edges</span>
-        <ul className="mt-1 flex flex-col gap-1">
-          {EDGE_DIRECTION_LEGEND.map((entry) => (
-            <li
-              key={entry.key}
-              className="flex items-center gap-2 text-[11px] text-muted"
-              title={entry.meaning}
-            >
-              <span
-                className="h-0.5 w-3.5 shrink-0 rounded-full"
-                style={{ backgroundColor: entry.color }}
-              />
-              <span className="truncate">{entry.label}</span>
-            </li>
-          ))}
-          {EDGE_PROVENANCE_LEGEND.map((entry) => (
-            <li
-              key={entry.key}
-              className="flex items-center gap-2 text-[11px] text-muted"
-              title={entry.meaning}
-            >
-              <span
-                className={cn(
-                  'w-3.5 shrink-0 border-t',
-                  entry.dashed ? 'border-dashed border-muted' : 'border-solid border-muted'
-                )}
-              />
-              <span className="truncate">{entry.label}</span>
-            </li>
-          ))}
-        </ul>
-      </div>
+          <div className="mt-2.5 border-t border-border/60 pt-2">
+            <span className="text-[9px] uppercase tracking-[0.18em] text-muted">edges</span>
+            <ul className="mt-1 flex flex-col gap-1">
+              {EDGE_DIRECTION_LEGEND.map((entry) => (
+                <li
+                  key={entry.key}
+                  className="flex items-center gap-2 text-[11px] text-muted"
+                  title={entry.meaning}
+                >
+                  <span
+                    className="h-0.5 w-3.5 shrink-0 rounded-full"
+                    style={{ backgroundColor: entry.color }}
+                  />
+                  <span className="truncate">{entry.label}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </>
+      )}
     </Card>
   );
 }

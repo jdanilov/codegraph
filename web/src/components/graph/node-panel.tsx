@@ -217,6 +217,20 @@ export function vscodeUrl(root: string | null, file: string, line: number): stri
   return `vscode://file${path}:${line}`;
 }
 
+/**
+ * Edge kinds that read backwards on the INCOMING side.
+ *
+ * An edge is stored in the direction the source declares it, so an incoming
+ * `extends` means "that symbol extends THIS one" — labelling the group
+ * `extends` said the opposite of what the row meant. The passive voice is the
+ * honest label. (`calls`, `imports`, `references`, `instantiates` and the rest
+ * stay as they are: the ← arrow already carries "…by" for a verb that has no
+ * direction problem, and `called by` on every row adds noise without meaning.)
+ */
+const INCOMING_KIND_LABELS: Record<string, string> = {
+  extends: 'extended by',
+};
+
 function RelationSections({
   title,
   arrow,
@@ -232,6 +246,7 @@ function RelationSections({
   contextFile: string;
   onNavigate(id: string): void;
 }) {
+  const incoming = title === 'incoming';
   const groups = useMemo(() => groupByKind(relations), [relations]);
   if (groups.length === 0) return null;
   return (
@@ -240,7 +255,12 @@ function RelationSections({
         {title} · {relations.length}
       </div>
       {groups.map(([kind, items]) => (
-        <Section key={kind} title={`${arrow} ${kind}`} count={items.length} defaultOpen>
+        <Section
+          key={kind}
+          title={`${arrow} ${(incoming && INCOMING_KIND_LABELS[kind]) || kind}`}
+          count={items.length}
+          defaultOpen
+        >
           <RelationList
             items={items}
             model={model}
