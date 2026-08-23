@@ -48,6 +48,7 @@ import { StatusPanel } from '@/components/graph/status-panel';
 import type {
   CanvasController,
   ChangeMarker,
+  StoredWorkspace,
   ViewSummary,
 } from '@/graph/canvas-controller';
 import { DIRECTORY_KIND, type GraphModel, type ModelNode } from '@/graph/model';
@@ -66,7 +67,7 @@ import {
   type ChangesPayload,
   type ExploreResult,
 } from '@/lib/api';
-import { useStoredState } from '@/lib/prefs';
+import { readPref, useStoredState, writePref } from '@/lib/prefs';
 import { decodeUrlState, encodeUrlState, type UrlState } from '@/lib/url-state';
 
 export default function App() {
@@ -150,6 +151,9 @@ export default function App() {
   const urlTimer = useRef<number | null>(null);
   /** What the hash currently says — every write is diffed against it. */
   const lastHashRef = useRef<HashState | null>(null);
+  /** Project whose stored workspace has already been put back on the canvas. */
+  const workspaceRestored = useRef<string | null>(null);
+  const workspaceTimer = useRef<number | null>(null);
 
   // ---------------------------------------------------------------- data ---
 
@@ -517,6 +521,51 @@ export default function App() {
     []
   );
 
+  // ----------------------------------------------------------- workspace ---
+
+  /**
+   * Which disks are open and where they sit, remembered per project.
+   *
+   * A refresh used to throw the whole workspace away — every disk the user had
+   * dragged out, and the arrangement they had put them in, which is real work.
+   * It is `localStorage` and not the URL for the same reason the panel widths
+   * are: it describes THIS browser's arrangement, not the view a link shares,
+   * and the hash still owns (and on any conflict wins) the primary disk's root,
+   * selection and camera. The write is debounced, because dragging a disk moves
+   * it on every pointer frame.
+   */
+  const persistWorkspace = useCallback(
+    (workspace: StoredWorkspace) => {
+      const project = modelRef.current?.root;
+      // Nothing is stored before the restore has run: an empty workspace
+      // reported during startup would otherwise erase the stored one.
+      if (!project || workspaceRestored.current !== project) return;
+      if (workspaceTimer.current !== null) window.clearTimeout(workspaceTimer.current);
+      workspaceTimer.current = window.setTimeout(() => {
+        workspaceTimer.current = null;
+        writePref(workspaceKey(project), workspace);
+      }, WORKSPACE_WRITE_MS);
+    },
+    []
+  );
+
+  /** Put the stored workspace back, once, as soon as there is a model. */
+  useEffect(() => {
+    const controller = controllerRef.current;
+    if (!controller || !model) return;
+    if (workspaceRestored.current === model.root) return;
+    workspaceRestored.current = model.root;
+    const stored = readPref<StoredWorkspace | null>(workspaceKey(model.root), null);
+    if (stored && Array.isArray(stored.disks)) controller.restoreWorkspace(stored);
+  }, [model]);
+
+  useEffect(
+    () => () => {
+      if (workspaceTimer.current !== null) window.clearTimeout(workspaceTimer.current);
+    },
+    []
+  );
+
   // ------------------------------------------------------------ commands ---
 
   /**
@@ -696,6 +745,7 @@ export default function App() {
         onColorModeChange={setColorMode}
         sortMode={sortMode}
         onViewChange={handleViewChange}
+        onWorkspaceChange={persistWorkspace}
         onController={(controller) => {
           controllerRef.current = controller;
         }}
@@ -811,6 +861,7 @@ export default function App() {
 
       <CommandPalette
         open={paletteOpen}
+        model={model}
         onClose={() => setPaletteOpen(false)}
         onPick={navigateFromSearch}
       />
@@ -860,6 +911,26 @@ function sameHashState(a: HashState, b: HashState): boolean {
     a.edgeKinds.length === b.edgeKinds.length &&
     a.edgeKinds.every((kind, index) => kind === b.edgeKinds[index])
   );
+}
+
+/** How long the workspace has to sit still before it is written down. */
+const WORKSPACE_WRITE_MS = 300;
+
+/**
+ * Where one project's workspace is stored.
+ *
+ * The project's absolute root path is the identity the client already has (it
+ * is what `/api/graph` reports), but it is not a key: it is long and full of
+ * separators. It is hashed instead, so the key is short, stable and opaque —
+ * and two projects can never collide into one arrangement.
+ */
+function workspaceKey(root: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < root.length; i++) {
+    hash ^= root.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `workspace.${(hash >>> 0).toString(36)}`;
 }
 
 /** Right column: the phase F width, still the default. */

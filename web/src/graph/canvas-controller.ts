@@ -137,9 +137,41 @@ export interface CanvasHighlight {
   impacted?: Iterable<string>;
 }
 
+/**
+ * One spawned disk, as the workspace is written down and read back (round
+ * G5.2). Node ids are the model's own — the same ones the URL hash carries in
+ * `r`/`s` — so a stored workspace survives a re-index of the same project.
+ */
+export interface StoredDisk {
+  rootId: string;
+  /** The node it was spawned from; it may never be rooted above this. */
+  floorId: string | null;
+  x: number;
+  y: number;
+}
+
+/**
+ * The part of the workspace that is NOT in the URL: which disks are open and
+ * where everything sits.
+ *
+ * The primary disk's root, selection and camera stay hash-owned — they are the
+ * view you would send someone — so only its POSITION is here.
+ */
+export interface StoredWorkspace {
+  primaryX: number;
+  primaryY: number;
+  disks: StoredDisk[];
+}
+
 export interface CanvasCallbacks {
   onSelect(node: ModelNode | null): void;
   onViewChange(summary: ViewSummary): void;
+  /**
+   * The workspace's SHAPE changed — a disk was spawned, closed, moved or
+   * re-rooted. Fired on the pointer's own cadence while a disk is dragged; the
+   * shell is expected to debounce before it persists anything.
+   */
+  onWorkspaceChange?(workspace: StoredWorkspace): void;
   /**
    * Tooltips are for WEDGES ONLY (phase F). An edge never raises one: a rope of
    * bundled curves put a tooltip under the pointer everywhere the user was
@@ -219,21 +251,6 @@ const RLABEL_MAX_FONT_PX = 12;
 const LABEL_SETTLE_MS = 100;
 
 /**
- * How recently the camera must have moved for a frame to be BLITTED rather
- * than re-drawn (performance round G5).
- *
- * A camera-only gesture — a pan drag, a wheel zoom — changes nothing about the
- * scene, only where it sits on screen, so the frame is a transform of the last
- * one: the painter keeps a snapshot of every full frame and stamps it back
- * through the camera delta instead of re-executing thousands of arcs, labels
- * and ropes. Deliberately SHORTER than {@link LABEL_SETTLE_MS}: the settle
- * window keeps the frame loop alive for 100ms after the gesture stops, so a
- * window of 50ms guarantees the loop reaches a frame that is a real (full)
- * redraw — which is what refreshes the snapshot and the label plan.
- */
-const BLIT_GESTURE_MS = 50;
-
-/**
  * Slack, in SCREEN px, added to the viewport before anything is culled.
  *
  * Everything a wedge paints outside its own annulus lives inside it: focus and
@@ -246,6 +263,15 @@ const CULL_MARGIN_PX = 24;
 
 /** Entries a colour cache holds before it is dropped wholesale and refilled. */
 const COLOR_CACHE_MAX = 4000;
+
+/**
+ * Room left around a wedge that a ⌘P jump had to pan onto the screen.
+ *
+ * Big enough that the wedge lands *inside* the picture rather than flush
+ * against an edge with its label cut off, small enough that the pan stays the
+ * minimal one anybody would call minimal.
+ */
+const REVEAL_PAD_PX = 90;
 
 /** ⌘P reveal pulse: three gentle breaths on the wedge the user landed on. */
 const PULSE_MS = 1000;
@@ -324,64 +350,6 @@ interface DrawnEdge {
    * cross-disk curve, which lives in workspace space.
    */
   diskId: string | null;
-}
-
-/**
- * The camera a snapshot of the last full frame was painted under.
- *
- * A camera is exactly (origin, scale) — every disk, arc, rope and tether is
- * placed through those two — so re-projecting a finished frame onto a new
- * camera is one `drawImage`: `new = newOrigin + (old − oldOrigin) × ratio`,
- * which composes a pan and a cursor-anchored zoom alike. The device pixel ratio
- * and the CSS size ride along because a change to either means the snapshot's
- * pixels no longer describe this canvas at all.
- *
- * The snapshot IS the scene canvas, which is the viewport grown by
- * {@link SceneFrame} on every side, so the margin travels with it: `origin` is
- * still in VIEWPORT coordinates, and the snapshot's own top-left sits at
- * `(−marginX, −marginY)` in that frame.
- */
-export interface SnapshotCamera {
-  originX: number;
-  originY: number;
-  scale: number;
-  ratio: number;
-  /** The viewport's CSS size, i.e. the centre quadrant of the snapshot. */
-  width: number;
-  height: number;
-  /** Margin painted on each side, in CSS px. */
-  marginX: number;
-  marginY: number;
-  /** The snapshot's full CSS size — the viewport plus both of its margins. */
-  spanWidth: number;
-  spanHeight: number;
-}
-
-/**
- * The offscreen frame a full redraw paints into: the viewport plus a margin of
- * half a viewport on each side, so the rendered area is 2w × 2h with the real
- * viewport as its centre quadrant.
- *
- * Everything below the compositing step is written in VIEWPORT coordinates and
- * never learns about the margin — the frame's base transform carries it, and it
- * is an exact whole number of DEVICE pixels (`marginDeviceX/Y`) so that the
- * centre quadrant rasterises identically to painting straight onto the canvas.
- *
- * `offscreen: false` is the degraded path (no second 2D context available): the
- * frame is the visible canvas itself with no margin, which paints correctly and
- * simply cannot be blitted.
- */
-interface SceneFrame {
-  ctx: CanvasRenderingContext2D;
-  offscreen: boolean;
-  /** Margin per side, in CSS px and in device px — the latter is integral. */
-  marginX: number;
-  marginY: number;
-  marginDeviceX: number;
-  marginDeviceY: number;
-  /** The frame's full CSS size, exactly `viewport + 2 × margin`. */
-  spanWidth: number;
-  spanHeight: number;
 }
 
 /**
@@ -467,6 +435,21 @@ interface DiskState {
   source: string | null;
   /** Disk the drag-away started in — where this disk's tether is anchored. */
   sourceDiskId: string | null;
+  /**
+   * The highest node this disk may ever be rooted at — the node it was spawned
+   * from, fixed for its whole life. `null` on the primary disk, which the
+   * project root already stops.
+   *
+   * A spawned disk means "show me THIS subtree, over here". Letting it walk
+   * above its own origin breaks that claim in two ways at once: two disks end
+   * up pointing at the same root, or a secondary quietly drifts up to the
+   * project root and becomes a second copy of the primary — and the tether
+   * still says it came out of a wedge that is now above it. So the floor is a
+   * property of the DISK, not of its current root: drilling in and re-rooting
+   * back out inside the subtree are both free, going above it is simply not a
+   * move this disk has.
+   */
+  floorId: string | null;
 
   layout: SunburstLayout | null;
   labelGeom: ArcLabelGeom[];
@@ -606,27 +589,6 @@ export class CanvasController {
   private cameraMovedAt = -Infinity;
 
   /**
-   * Anything but the camera changed since the last full redraw (round G5).
-   *
-   * Set by {@link requestDraw}, which is what EVERY mutation path already calls
-   * — so a new one is dirty by default and the snapshot can only ever be blitted
-   * for a frame that is genuinely a camera transform of the last one. The two
-   * camera-only paths (a pan drag, the wheel) opt out through
-   * {@link requestCameraDraw}.
-   */
-  private sceneDirty = true;
-  /** When a camera-ONLY gesture last moved the camera. */
-  private cameraGestureAt = -Infinity;
-  /**
-   * Where a full redraw paints: the viewport grown by half of itself on every
-   * side, at the backing-store resolution. It is also the snapshot — the frame
-   * is never copied anywhere, the visible canvas takes its centre quadrant.
-   */
-  private sceneCanvas: HTMLCanvasElement | null = null;
-  private sceneCtx: CanvasRenderingContext2D | null = null;
-  /** The camera those pixels were painted under — `null` when they are stale. */
-  private snapshotCamera: SnapshotCamera | null = null;
-  /**
    * A pointer position whose hit test was deferred because the camera was in
    * motion. Applied on the first settled frame, so a wheel zoom neither pays
    * for a hit test per frame nor leaves the hover pointing at the wedge that
@@ -710,6 +672,7 @@ export class CanvasController {
     } else {
       // A disk whose root no longer exists has nothing to draw. The primary
       // falls back to the project root; a secondary simply goes away.
+      const before = this.disks.length;
       this.disks = this.disks.filter((disk) => disk.primary || model.nodes.has(disk.rootId));
       const primary = this.primary();
       if (!model.nodes.has(primary.rootId)) primary.rootId = initialRoot(model);
@@ -723,6 +686,9 @@ export class CanvasController {
       for (const kind of model.edgeKinds) if (!known.has(kind)) this.enabledKinds.add(kind);
       this.enabledKinds = new Set([...this.enabledKinds].filter((k) => model.edgeKinds.includes(k)));
       if (this.selected && !model.nodes.has(this.selected)) this.selected = null;
+      // A re-index that removed a disk's root removed the disk with it — the
+      // stored workspace has to lose it too.
+      if (this.disks.length !== before) this.notifyWorkspace();
     }
     this.rebuildAllLayouts();
   }
@@ -854,6 +820,73 @@ export class CanvasController {
     return this.disks.length;
   }
 
+  /** The workspace as it stands, for the shell to write down. */
+  workspaceLayout(): StoredWorkspace {
+    const primary = this.primary();
+    return {
+      primaryX: primary.x,
+      primaryY: primary.y,
+      disks: this.disks
+        .filter((disk) => !disk.primary)
+        .map((disk) => ({
+          rootId: disk.rootId,
+          floorId: disk.floorId,
+          x: disk.x,
+          y: disk.y,
+        })),
+    };
+  }
+
+  /**
+   * Put a stored workspace back — the page-refresh half of {@link workspaceLayout}.
+   *
+   * Deliberately quiet: no transitions, no camera move, no selection, and the
+   * primary disk's ROOT is not touched at all (the hash owns it, and the hash
+   * wins). A stored disk whose root no longer exists is dropped silently — a
+   * re-index between two visits can remove nodes, and losing one disk is a much
+   * better outcome than a disk rooted at nothing. Whatever survives is
+   * published back through `onWorkspaceChange`, so the store is rewritten
+   * without the disks that went away.
+   */
+  restoreWorkspace(workspace: StoredWorkspace): void {
+    const model = this.model;
+    if (!model) return;
+    const primary = this.primary();
+    if (Number.isFinite(workspace.primaryX)) primary.x = workspace.primaryX;
+    if (Number.isFinite(workspace.primaryY)) primary.y = workspace.primaryY;
+
+    for (const stored of workspace.disks) {
+      if (!model.nodes.has(stored.rootId)) continue;
+      if (!Number.isFinite(stored.x) || !Number.isFinite(stored.y)) continue;
+      const floorId =
+        stored.floorId && model.nodes.has(stored.floorId) ? stored.floorId : stored.rootId;
+      this.diskSeq += 1;
+      this.disks.push(
+        makeDisk(
+          `disk:${this.diskSeq}`,
+          stored.rootId,
+          stored.x,
+          stored.y,
+          false,
+          // The tether hangs off the node the disk came out of, which is its
+          // floor; the disk it was dragged FROM is not worth storing, since
+          // `tetherOf` already falls back to whichever disk still shows it.
+          floorId,
+          PRIMARY_DISK_ID,
+          floorId
+        )
+      );
+    }
+    this.rebuildExpandedNodes();
+    this.rebuildAllLayouts();
+    this.notifyWorkspace();
+  }
+
+  /** Tell the shell the workspace moved, so it can write it down. */
+  private notifyWorkspace(): void {
+    this.callbacks.onWorkspaceChange?.(this.workspaceLayout());
+  }
+
   /**
    * Spawn a disk rooted at `nodeId` near a workspace point — the drop half of
    * the drag-away gesture. Placement is nudged clear of every existing disk, so
@@ -877,6 +910,7 @@ export class CanvasController {
     const placement = layout ?? this.layoutFor(nodeId);
     const placed = placeSpawnedDisk(this.placements(), at, placement.maxRadius);
     this.diskSeq += 1;
+    // The root it is born with IS its floor, for the rest of its life.
     const disk = makeDisk(
       `disk:${this.diskSeq}`,
       placement.rootId,
@@ -884,12 +918,14 @@ export class CanvasController {
       placed.y,
       false,
       nodeId,
-      sourceDiskId
+      sourceDiskId,
+      placement.rootId
     );
     this.disks.push(disk);
     this.rebuildExpandedNodes();
     this.focusedDiskId = disk.id;
     this.rebuildAllLayouts();
+    this.notifyWorkspace();
     return disk;
   }
 
@@ -910,6 +946,7 @@ export class CanvasController {
     if (this.pulseDiskId === id) this.pulseNodeId = null;
     // Its source wedge is whole again — every layout is rebuilt for that.
     this.rebuildAllLayouts();
+    this.notifyWorkspace();
   }
 
   /**
@@ -945,10 +982,42 @@ export class CanvasController {
     this.setDiskRoot(this.primary(), id, animate);
   }
 
+  /**
+   * May this disk be rooted at `id`? Everything at or below its floor, which is
+   * everything for the primary.
+   *
+   * Written as a containment test rather than as `rootId === floorId` so it
+   * holds no matter how the disk got where it is — a re-root that somehow
+   * landed outside the subtree is refused rather than silently allowed to keep
+   * climbing.
+   */
+  private canRootAt(disk: DiskState, id: string): boolean {
+    const floor = disk.floorId;
+    if (!floor || id === floor) return true;
+    const model = this.model;
+    if (!model) return true;
+    return model.ancestors(id).includes(floor);
+  }
+
+  /**
+   * Where this disk's centre circle goes when clicked — `null` when there is
+   * nowhere up, which is the project root for the primary disk and the FLOOR
+   * for a spawned one. The `▲ <parent>` hint reads off the same answer, so the
+   * button and the affordance offering it can never disagree.
+   */
+  private upTarget(disk: DiskState): string | null {
+    const parent = this.model?.get(disk.rootId)?.parent ?? null;
+    return parent && this.canRootAt(disk, parent) ? parent : null;
+  }
+
   /** Re-root one disk. Secondary disks never touch the URL or the history. */
   private setDiskRoot(disk: DiskState, id: string, animate = true): void {
     const model = this.model;
     if (!model || !model.nodes.has(id) || id === disk.rootId) return;
+    // The floor is enforced HERE — the one funnel every re-root goes through
+    // (the centre circle, Backspace, Enter, a card, ⌘P's drill-down) — rather
+    // than at each of them.
+    if (!this.canRootAt(disk, id)) return;
     const previousDepth = model.get(disk.rootId)?.depth ?? 0;
     const nextDepth = model.get(id)?.depth ?? 0;
     disk.rootId = id;
@@ -972,12 +1041,21 @@ export class CanvasController {
       disk.transitionStart = performance.now();
     }
     this.rebuildLayout(disk);
+    // The primary's root is the hash's business; a secondary's is the store's.
+    if (!disk.primary) this.notifyWorkspace();
   }
 
-  /** Step one level out — the centre circle and the breadcrumb both do this. */
+  /**
+   * Step one level out — Backspace and the centre circle both do this.
+   *
+   * A disk already sitting on its floor has nowhere up: nothing happens. It is
+   * deliberately a no-op and not "close the disk" — Backspace is navigation,
+   * and a key that navigates four times and then destroys the thing you were
+   * navigating is a key nobody can hold down.
+   */
   rootUp(): void {
     const disk = this.focused();
-    const parent = this.model?.get(disk.rootId)?.parent;
+    const parent = this.upTarget(disk);
     if (parent) this.setDiskRoot(disk, parent);
   }
 
@@ -1007,15 +1085,22 @@ export class CanvasController {
    * Select a node and bring its arc on screen — the ⌘P landing.
    *
    * Phase G: if ANY disk already renders the node, that disk answers — reveal
-   * and pulse there, and take the focus with it. Nothing moves, because the
-   * thing the user asked for is already on screen; re-rooting the primary disk
-   * to show a second copy of it would be strictly worse.
+   * and pulse there, and take the focus with it. Nothing re-roots, because the
+   * thing the user asked for is already drawn; re-rooting to show a second copy
+   * of it would be strictly worse. The camera does move, but only if it has to
+   * and only as far as it has to: {@link panIntoView} slides the wedge onto the
+   * screen and changes nothing else — no zoom, no re-framing.
    *
-   * Otherwise this is the pre-phase-G behaviour on the primary disk. "Visible"
-   * means an arc actually exists for it: re-rooting to its parent is the normal
-   * answer, but a node can still be swallowed by its parent's `+N` fold arc (a
-   * directory of 900 files), so the fallback re-roots onto the node ITSELF —
-   * the centre disk always renders the root, so ⌘P can reach anything.
+   * Otherwise the node has to be drilled to, and the disk that drills is the
+   * one already CLOSEST to it: the disk whose root is the deepest ancestor of
+   * the target (the focused one first on a tie). That keeps a ⌘P jump inside
+   * the subtree the user is standing in instead of always yanking the primary
+   * disk somewhere else — and, because a disk only ever qualifies for a target
+   * inside its own subtree, it can never take a secondary disk above its floor.
+   * "Visible" then means an arc actually exists: re-rooting to the parent is
+   * the normal answer, but a node can still be swallowed by its parent's `+N`
+   * fold arc (a directory of 900 files), so the fallback re-roots onto the node
+   * ITSELF — the centre disk always renders the root, so ⌘P can reach anything.
    */
   reveal(id: string, pulse = false): boolean {
     const model = this.model;
@@ -1024,7 +1109,7 @@ export class CanvasController {
     if (!node) return false;
 
     const showing = this.diskShowing(id);
-    const disk = showing ?? this.primary();
+    const disk = showing ?? this.drillDiskFor(id);
     if (showing) {
       this.focusedDiskId = showing.id;
     } else {
@@ -1035,6 +1120,7 @@ export class CanvasController {
       }
       this.focusedDiskId = disk.id;
     }
+    this.panIntoView(disk, id);
 
     this.selected = id;
     if (pulse) {
@@ -1055,14 +1141,83 @@ export class CanvasController {
   /**
    * A disk that already renders `id` — the focused one first, then creation
    * order, so a ⌘P repeat keeps landing in the same place.
+   *
+   * "Renders" honours the legend: a wedge whose category is switched off is not
+   * painted at all, so a disk holding only that is not showing the node and the
+   * drill-down below has to answer instead. The disk's own ROOT always counts —
+   * the centre circle is drawn whatever the filters say.
    */
   private diskShowing(id: string): DiskState | null {
+    const shows = (disk: DiskState): boolean => {
+      if (disk.rootId === id) return true;
+      const arc = disk.layout?.byNode.get(id);
+      return arc !== undefined && !this.isHiddenArc(arc);
+    };
     const focused = this.focused();
-    if (focused.layout?.byNode.has(id) || focused.rootId === id) return focused;
+    if (shows(focused)) return focused;
+    return this.disks.find(shows) ?? null;
+  }
+
+  /**
+   * The disk a ⌘P jump should DRILL when no disk renders the target: the one
+   * whose root is the deepest ancestor of it, i.e. the shortest way down.
+   *
+   * Ties go to the focused disk, which is the pre-existing behaviour and the
+   * right one — "the disk I am working in" is the answer the user expects when
+   * two of them are equally close. A disk only ever qualifies for a node inside
+   * its own subtree, so a secondary disk chosen here is drilling DOWN by
+   * construction and its floor is never in question.
+   */
+  private drillDiskFor(id: string): DiskState {
+    const model = this.model;
+    const primary = this.primary();
+    if (!model) return primary;
+    const focused = this.focused();
+    const chain = new Set([id, ...model.ancestors(id)]);
+    let best: DiskState | null = null;
+    let bestDepth = -1;
     for (const disk of this.disks) {
-      if (disk.layout?.byNode.has(id) || disk.rootId === id) return disk;
+      if (!chain.has(disk.rootId)) continue;
+      const depth = model.get(disk.rootId)?.depth ?? 0;
+      if (depth > bestDepth || (depth === bestDepth && disk.id === focused.id)) {
+        best = disk;
+        bestDepth = depth;
+      }
     }
-    return null;
+    return best ?? primary;
+  }
+
+  /**
+   * Slide the camera the SMALLEST distance that puts a node's wedge on screen.
+   *
+   * A jump that lands on something already visible must not move the picture at
+   * all, and one that lands off screen must not re-frame the workspace either —
+   * the user's zoom is theirs. So this is a pure translation, computed from the
+   * wedge's own anchor (its centroid, or the disk's centre when the node IS the
+   * root) against the free viewport inset by {@link REVEAL_PAD_PX}, and it is a
+   * no-op whenever the anchor is already inside that box.
+   */
+  private panIntoView(disk: DiskState, id: string): void {
+    const arc = disk.layout?.byNode.get(id) ?? null;
+    const point = this.toScreen(anchorOf(disk, arc));
+    const gutter = this.width > GUTTER_MIN_WIDTH ? PANEL_GUTTER : 0;
+    const left = gutter + REVEAL_PAD_PX;
+    const right = Math.max(left, this.width - REVEAL_PAD_PX);
+    const top = REVEAL_PAD_PX;
+    const bottom = Math.max(top, this.height - REVEAL_PAD_PX);
+
+    let dx = 0;
+    let dy = 0;
+    if (point.x < left) dx = left - point.x;
+    else if (point.x > right) dx = right - point.x;
+    if (point.y < top) dy = top - point.y;
+    else if (point.y > bottom) dy = bottom - point.y;
+    if (dx === 0 && dy === 0) return;
+
+    this.panX += dx;
+    this.panY += dy;
+    this.cameraMoved();
+    this.emitSummary();
   }
 
   /**
@@ -1227,11 +1382,6 @@ export class CanvasController {
     if (this.frame !== null) cancelAnimationFrame(this.frame);
     this.resizeObserver.disconnect();
     this.canvas.remove();
-    // The scene canvas is a second backing store, four times the visible pixel
-    // count — let it go with the canvas it feeds.
-    this.sceneCanvas = null;
-    this.sceneCtx = null;
-    this.snapshotCamera = null;
   }
 
   // --------------------------------------------------------------- layout ---
@@ -1534,34 +1684,22 @@ export class CanvasController {
   // -------------------------------------------------------------- painting ---
 
   /**
-   * Ask for a frame because SOMETHING CHANGED — the model, the layouts, the
-   * hover, a filter, a card, a disk's position…
+   * Ask for a frame — the model, the layouts, the hover, a filter, a card, a
+   * disk's position, or just the camera. One entry point, coalesced to one
+   * `requestAnimationFrame`.
    *
-   * This is the default and every mutation path uses it: it marks the scene
-   * dirty, which is what forbids the next frame from being a blit of the last
-   * one. A path that genuinely only moved the camera opts out explicitly
-   * ({@link requestCameraDraw}); anything that forgets to is merely slower, not
-   * wrong, which is the right way round for a cache like this.
+   * Round G5.2 removed the camera-only fast path that used to sit beside this
+   * one: a gesture frame is now the same culled redraw as any other frame, so
+   * there is no snapshot to keep, nothing to invalidate, and no way for the
+   * picture to be stale.
    */
   private requestDraw(): void {
-    this.sceneDirty = true;
-    this.scheduleFrame();
-  }
-
-  /** Ask for a frame after a CAMERA-ONLY gesture — a pan drag, a wheel zoom. */
-  private requestCameraDraw(): void {
-    this.cameraGestureAt = performance.now();
-    this.scheduleFrame();
-  }
-
-  /** One frame, coalesced. Neither marks nor clears {@link sceneDirty}. */
-  private scheduleFrame(): void {
     if (this.frame !== null || this.disposed) return;
     this.frame = requestAnimationFrame(() => {
       this.frame = null;
       if (this.disposed) return;
       this.draw();
-      if (this.disks.some((disk) => disk.transitionStart > 0)) this.scheduleFrame();
+      if (this.disks.some((disk) => disk.transitionStart > 0)) this.requestDraw();
     });
   }
 
@@ -1577,34 +1715,16 @@ export class CanvasController {
       this.updateHover(at);
     }
 
-    // Mid-gesture, with nothing but the camera changed: stamp the last full
-    // frame back through the camera delta and stop. Everything below is skipped
-    // — arcs, labels, ropes, hit-testable state — because none of it can differ.
-    if (this.blitFrame(ratio)) return;
-
-    // Cleared BEFORE painting: a mutation that lands mid-frame (a summary
-    // callback re-entering the controller) must survive as dirty, so the next
-    // frame is a real redraw and the snapshot below is skipped.
-    this.sceneDirty = false;
-
-    // The frame is painted into the expanded scene canvas and composited at the
-    // end. Everything from here down is written in VIEWPORT coordinates: the
-    // margin lives in the base transform, which is why nothing else in the
-    // painter — chrome, ghost, labels — has to know about it.
-    const frame = this.sceneFrame(ratio);
-    const ctx = frame.ctx;
+    // Straight onto the visible canvas, in CSS px. Every frame is a real frame.
+    const ctx = this.ctx;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    ctx.clearRect(0, 0, frame.spanWidth, frame.spanHeight);
+    ctx.globalAlpha = 1;
+    ctx.clearRect(0, 0, this.width, this.height);
     ctx.fillStyle = BACKGROUND;
-    ctx.fillRect(0, 0, frame.spanWidth, frame.spanHeight);
-    ctx.setTransform(ratio, 0, 0, ratio, frame.marginDeviceX, frame.marginDeviceY);
+    ctx.fillRect(0, 0, this.width, this.height);
 
     const model = this.model;
-    if (!model) {
-      this.snapshotCamera = null;
-      this.composite(frame);
-      return;
-    }
+    if (!model) return;
 
     if (this.edgesDirty) this.rebuildEdges();
 
@@ -1634,7 +1754,7 @@ export class CanvasController {
       // are culled by their own curve below, since either can cross a viewport
       // that neither of its two disks touches.
       const k = scale * animationScale;
-      const cull = this.cullFor(frame, origin.x + disk.x * scale, origin.y + disk.y * scale, k);
+      const cull = this.cullFor(origin.x + disk.x * scale, origin.y + disk.y * scale, k);
       if (cull.dMin > layout.maxRadius) continue;
 
       ctx.save();
@@ -1653,7 +1773,7 @@ export class CanvasController {
     // Cross-disk relations live in workspace space and are drawn once, over the
     // disks: a curve that vanished under an opaque wedge would claim a
     // connection it never showed.
-    const workspaceCull = this.cullFor(frame, origin.x, origin.y, scale);
+    const workspaceCull = this.cullFor(origin.x, origin.y, scale);
     ctx.save();
     ctx.translate(origin.x, origin.y);
     ctx.scale(scale, scale);
@@ -1665,212 +1785,31 @@ export class CanvasController {
     this.drawDiskChrome(ctx);
     this.drawGhost(ctx);
 
-    this.composite(frame);
-
     // Two things keep the frame loop alive on their own: the ⌘P pulse, and the
     // camera-settle window that owes the labels one more (full) pass.
-    if (this.pulseNodeId !== null || this.cameraSettling()) this.scheduleFrame();
+    if (this.pulseNodeId !== null || this.cameraSettling()) this.requestDraw();
 
     // The edge count is part of the summary, and it only ever changes here.
     if (this.drawnEdges.length !== this.emittedEdges) this.emitSummary();
-
-    this.captureSnapshot(frame, ratio, origin, scale);
   }
 
   /**
-   * The camera-gesture fast path: re-project the last full frame instead of
-   * re-executing the scene. `true` when the frame was served this way.
-   *
-   * A pan is pixel-exact (the delta is a translation); a zoom is the same frame
-   * scaled about the point the gesture anchored it at, so it goes slightly soft
-   * until the gesture stops — the same trade the label plan already makes, and
-   * for the same reason: the settled frame that follows is the real one.
-   *
-   * The snapshot is the EXPANDED frame ({@link SceneFrame}), so a gesture can
-   * travel half a viewport in any direction — or zoom out to about half — and
-   * still be reading pixels that were painted. Past that the snapshot simply
-   * runs out and the background shows through, which the settled redraw fills
-   * in within {@link LABEL_SETTLE_MS}.
-   *
-   * Every condition below is a reason the snapshot cannot describe this frame:
-   * the scene changed, a disk is animating, the pulse is breathing, the canvas
-   * or its device pixel ratio moved under it, a NON-camera drag is in flight
-   * (the wedge ghost, a disk being moved), or the gesture has simply stopped.
-   */
-  private blitFrame(ratio: number): boolean {
-    const snapshot = this.snapshotCamera;
-    const source = this.sceneCanvas;
-    if (!snapshot || !source || this.sceneDirty) return false;
-    if (performance.now() - this.cameraGestureAt >= BLIT_GESTURE_MS) return false;
-    if (snapshot.ratio !== ratio) return false;
-    if (snapshot.width !== this.width || snapshot.height !== this.height) return false;
-    // The size check is against the EXPANDED frame, which is what the snapshot
-    // actually is: a scene canvas resized under it (a viewport resize, a ratio
-    // change) holds pixels for a geometry this camera cannot describe.
-    const metrics = this.sceneMetrics(ratio);
-    if (snapshot.marginX !== metrics.marginX || snapshot.marginY !== metrics.marginY) return false;
-    if (snapshot.spanWidth !== metrics.spanWidth || snapshot.spanHeight !== metrics.spanHeight) {
-      return false;
-    }
-    if (source.width !== metrics.backingWidth || source.height !== metrics.backingHeight) {
-      return false;
-    }
-    if (this.pulseNodeId !== null) return false;
-    if (this.drag !== null && this.drag.mode !== 'pan') return false;
-    if (this.disks.some((disk) => disk.transitionStart > 0)) return false;
-
-    const origin = this.origin();
-    const factor = this.scale() / snapshot.scale;
-    if (!Number.isFinite(factor) || factor <= 0) return false;
-
-    const ctx = this.ctx;
-    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    // Whatever the snapshot does not reach — a pan past the margin — is
-    // background, never stale pixels.
-    ctx.fillStyle = BACKGROUND;
-    ctx.fillRect(0, 0, this.width, this.height);
-    const placement = blitPlacement(snapshot, origin, factor);
-    ctx.drawImage(source, placement.x, placement.y, placement.width, placement.height);
-
-    // The settle window owes this frame a real redraw; keep the loop alive.
-    if (this.pulseNodeId !== null || this.cameraSettling()) this.scheduleFrame();
-    return true;
-  }
-
-  /** {@link sceneMetrics} for the canvas as it is sized right now. */
-  private sceneMetrics(ratio: number): SceneMetrics {
-    return sceneMetrics(this.canvas.width, this.canvas.height, ratio);
-  }
-
-  /**
-   * The offscreen frame this redraw paints into, sized to the current viewport.
-   *
-   * Falls back to the visible canvas with no margin when a second 2D context is
-   * unavailable — the picture is then exactly what it was before this round
-   * (viewport-sized, culled to the viewport) and simply cannot be blitted,
-   * which {@link captureSnapshot} enforces by dropping the camera.
-   */
-  private sceneFrame(ratio: number): SceneFrame {
-    const metrics = this.sceneMetrics(ratio);
-    let canvas = this.sceneCanvas;
-    if (!canvas) {
-      canvas = document.createElement('canvas');
-      this.sceneCanvas = canvas;
-      this.sceneCtx = null;
-    }
-    if (canvas.width !== metrics.backingWidth || canvas.height !== metrics.backingHeight) {
-      canvas.width = metrics.backingWidth;
-      canvas.height = metrics.backingHeight;
-      // A resized canvas is a cleared canvas: the pixels the snapshot pointed
-      // at are gone whether or not the camera says so.
-      this.snapshotCamera = null;
-    }
-    const ctx = this.sceneCtx ?? canvas.getContext('2d');
-    if (!ctx) {
-      return {
-        ctx: this.ctx,
-        offscreen: false,
-        marginX: 0,
-        marginY: 0,
-        marginDeviceX: 0,
-        marginDeviceY: 0,
-        spanWidth: this.width,
-        spanHeight: this.height,
-      };
-    }
-    this.sceneCtx = ctx;
-    return {
-      ctx,
-      offscreen: true,
-      marginX: metrics.marginX,
-      marginY: metrics.marginY,
-      marginDeviceX: metrics.marginDeviceX,
-      marginDeviceY: metrics.marginDeviceY,
-      spanWidth: metrics.spanWidth,
-      spanHeight: metrics.spanHeight,
-    };
-  }
-
-  /**
-   * Put the frame's centre quadrant — the real viewport — on screen.
-   *
-   * One `drawImage` in DEVICE pixels, source and destination the same size, so
-   * it is a straight copy and the visible canvas is byte-identical to what the
-   * pre-margin painter produced. Canvas → canvas, never `getImageData`.
-   */
-  private composite(frame: SceneFrame): void {
-    const source = this.sceneCanvas;
-    if (!frame.offscreen || !source) return;
-    const width = this.canvas.width;
-    const height = this.canvas.height;
-    if (width === 0 || height === 0) return;
-    const ctx = this.ctx;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.globalAlpha = 1;
-    ctx.drawImage(
-      source,
-      frame.marginDeviceX,
-      frame.marginDeviceY,
-      width,
-      height,
-      0,
-      0,
-      width,
-      height
-    );
-  }
-
-  /**
-   * Keep the frame just painted, with the camera it was painted under.
-   *
-   * The frame IS the snapshot — nothing is copied — so this only records the
-   * camera that makes those pixels readable. Skipped, and the previous camera
-   * dropped, while anything is animating: a transition or pulse frame is a
-   * moment in an animation, not a scene at rest, and blitting one after the
-   * animation finished would show the picture mid-morph. Dropping rather than
-   * keeping is the safe direction: no snapshot simply means the next gesture
-   * frame is a full redraw.
-   */
-  private captureSnapshot(frame: SceneFrame, ratio: number, origin: Point, scale: number): void {
-    const animating =
-      this.sceneDirty || this.pulseNodeId !== null || this.disks.some((d) => d.transitionStart > 0);
-    if (animating || !frame.offscreen || this.canvas.width === 0 || this.canvas.height === 0) {
-      this.snapshotCamera = null;
-      return;
-    }
-    this.snapshotCamera = {
-      originX: origin.x,
-      originY: origin.y,
-      scale,
-      ratio,
-      width: this.width,
-      height: this.height,
-      marginX: frame.marginX,
-      marginY: frame.marginY,
-      spanWidth: frame.spanWidth,
-      spanHeight: frame.spanHeight,
-    };
-  }
-
-  /**
-   * The EXPANDED viewport in the local units of a frame whose origin sits at
-   * screen `(cx, cy)` and whose unit is `k` screen px — a disk's frame, or the
+   * The viewport in the local units of a frame whose origin sits at screen
+   * `(cx, cy)` and whose unit is `k` screen px — a disk's frame, or the
    * workspace's.
    *
-   * The rect is the frame that was actually painted, margin included, which is
-   * what makes the snapshot cover a pan of half a screen in any direction: cull
-   * to the viewport and a pan drags black in behind it. {@link CULL_MARGIN_PX}
-   * still rides on top, for the strokes and glyphs that sit slightly outside
-   * their wedge at the rect's own edge.
+   * The rect is the VISIBLE canvas, padded by {@link CULL_MARGIN_PX} for the
+   * strokes and glyphs that sit slightly outside their wedge at its own edge.
+   * Round G5.2 took the half-viewport margin back out with the blit it existed
+   * for: every frame is painted for the pixels the screen actually shows, so
+   * there is nothing off screen that a later frame has to be able to reuse.
    */
-  private cullFor(frame: SceneFrame, cx: number, cy: number, k: number): ViewCull {
-    const padX = frame.marginX + CULL_MARGIN_PX;
-    const padY = frame.marginY + CULL_MARGIN_PX;
+  private cullFor(cx: number, cy: number, k: number): ViewCull {
     return makeCull(
-      (-padX - cx) / k,
-      (-padY - cy) / k,
-      (this.width + padX - cx) / k,
-      (this.height + padY - cy) / k
+      (-CULL_MARGIN_PX - cx) / k,
+      (-CULL_MARGIN_PX - cy) / k,
+      (this.width + CULL_MARGIN_PX - cx) / k,
+      (this.height + CULL_MARGIN_PX - cy) / k
     );
   }
 
@@ -2116,9 +2055,10 @@ export class CanvasController {
     // The centre names WHERE YOU ARE (round 2): the current root, prominent,
     // with the LoC the disk in front of you weighs under it. It is still a
     // button, so the destination of clicking it is a small secondary hint above
-    // the name (`▲ <parent>`); at the project root there is nowhere up and the
-    // hint is simply absent.
-    const parentId = layout.root.parent;
+    // the name (`▲ <parent>`); where there is nowhere up — the project root on
+    // the primary disk, the FLOOR on a spawned one — the hint is simply absent,
+    // which is the whole of how the floor is advertised.
+    const parentId = this.upTarget(disk);
     const parent = parentId ? this.model?.get(parentId) : undefined;
     const title = layout.root.name || 'project';
     const width = (layout.centreRadius - 12) * 2;
@@ -3013,9 +2953,7 @@ export class CanvasController {
         this.panX += dx;
         this.panY += dy;
         this.cameraMoved();
-        // Camera only: the scene is unchanged, so the frame is the last one
-        // translated — see `blitFrame`.
-        this.requestCameraDraw();
+        this.requestDraw();
         return;
       }
       if (drag.mode === 'move-disk') {
@@ -3026,6 +2964,7 @@ export class CanvasController {
           disk.y += dy / scale;
           this.edgesDirty = true;
           this.requestDraw();
+          this.notifyWorkspace();
         }
         return;
       }
@@ -3037,14 +2976,16 @@ export class CanvasController {
     }
     if (this.disks.some((disk) => disk.transitionStart > 0)) return;
     // A hit test costs an angle-first search per disk plus a pass over every
-    // rope, and a hover CHANGE dirties the scene — both of which would land in
-    // the middle of a wheel zoom, which has no drag to suppress it the way a
-    // pan does. It is deferred to the settled frame instead: the pointer has
-    // not moved, only what is under it, so answering once at the end is the
-    // same answer for less work.
+    // rope, and a hover change rebuilds the edge set on top of that — both of
+    // which would land in the middle of a wheel zoom, which has no drag to
+    // suppress it the way a pan does. It is deferred to the settled frame
+    // instead: the pointer has not moved, only what is under it, so answering
+    // once at the end is the same answer for less work. (Kept in round G5.2:
+    // the redraw is direct now, but the hit test the deferral skips is exactly
+    // the per-tick work a wheel gesture cannot afford.)
     if (this.cameraSettling()) {
       this.pendingHover = position;
-      this.scheduleFrame();
+      this.requestDraw();
       return;
     }
     this.pendingHover = null;
@@ -3228,7 +3169,9 @@ export class CanvasController {
     this.focusedDiskId = disk.id;
 
     if (Math.hypot(local.x, local.y) <= layout.centreRadius) {
-      const parent = model.get(disk.rootId)?.parent;
+      // At the floor (or the project root) the centre is not a button at all —
+      // it carries no `▲` hint, and clicking it does nothing.
+      const parent = this.upTarget(disk);
       if (parent) this.setDiskRoot(disk, parent);
       return;
     }
@@ -3292,9 +3235,7 @@ export class CanvasController {
     this.panX = position.x - before.x * scale - centre.x;
     this.panY = position.y - before.y * scale - centre.y;
     this.cameraMoved();
-    // Camera only, exactly like a pan: the blit scales the last frame about the
-    // point the gesture pinned, which is what (origin, scale) then vs now says.
-    this.requestCameraDraw();
+    this.requestDraw();
     this.emitSummary();
   };
 
@@ -3473,7 +3414,8 @@ function makeDisk(
   y: number,
   primary: boolean,
   source: string | null,
-  sourceDiskId: string | null = null
+  sourceDiskId: string | null = null,
+  floorId: string | null = null
 ): DiskState {
   return {
     id,
@@ -3483,6 +3425,7 @@ function makeDisk(
     primary,
     source,
     sourceDiskId,
+    floorId,
     layout: null,
     labelGeom: [],
     labelPlan: null,
@@ -3531,81 +3474,6 @@ function fontSpec(fontPx: number, k: number): string {
 
 /** Entries the text-metrics cache holds before it stops growing. */
 const TEXT_CACHE_MAX = 4000;
-
-// ------------------------------------------------------------------ scene ---
-
-/** The scene canvas's geometry — see {@link sceneMetrics}. */
-export interface SceneMetrics {
-  marginX: number;
-  marginY: number;
-  marginDeviceX: number;
-  marginDeviceY: number;
-  spanWidth: number;
-  spanHeight: number;
-  backingWidth: number;
-  backingHeight: number;
-}
-
-/**
- * The scene canvas's geometry for a visible backing store of
- * `backingWidth × backingHeight` device px at `ratio` device px per CSS px.
- *
- * The margin is half the VISIBLE backing store on each side, so the frame is
- * 2w × 2h with the viewport as its centre quadrant. It is rounded to a whole
- * DEVICE pixel, which is what lets the frame's base transform be an exact
- * integer translation — so the centre quadrant rasterises exactly as it would
- * have without a margin at all, and the composite is a straight copy. The CSS
- * span is taken back out of the backing size rather than from the viewport's
- * CSS size so that the two agree to the pixel at a fractional ratio.
- */
-export function sceneMetrics(
-  backingWidth: number,
-  backingHeight: number,
-  ratio: number
-): SceneMetrics {
-  const marginDeviceX = Math.round(backingWidth / 2);
-  const marginDeviceY = Math.round(backingHeight / 2);
-  const spanBackingWidth = backingWidth + marginDeviceX * 2;
-  const spanBackingHeight = backingHeight + marginDeviceY * 2;
-  return {
-    marginX: marginDeviceX / ratio,
-    marginY: marginDeviceY / ratio,
-    marginDeviceX,
-    marginDeviceY,
-    spanWidth: spanBackingWidth / ratio,
-    spanHeight: spanBackingHeight / ratio,
-    backingWidth: spanBackingWidth,
-    backingHeight: spanBackingHeight,
-  };
-}
-
-// ------------------------------------------------------------------- blit ---
-
-/**
- * Where the whole snapshot lands on screen under a new camera, in CSS px.
- *
- * `new = newOrigin + (old − oldOrigin) × factor`, applied to the snapshot's own
- * top-left. That corner is NOT the viewport's `(0, 0)` — the snapshot is the
- * viewport grown by its margin, so in the (viewport) coordinates the two
- * cameras are written in it sits at `(−marginX, −marginY)`.
- *
- * With the camera unmoved this is an identity: `factor` is 1 and the corner
- * lands back on `(−marginX, −marginY)`, i.e. the snapshot's centre quadrant
- * lands exactly on `(0, 0, width, height)` — the same pixels the composite of a
- * full redraw puts there.
- */
-export function blitPlacement(
-  snapshot: SnapshotCamera,
-  origin: Point,
-  factor: number
-): { x: number; y: number; width: number; height: number } {
-  return {
-    x: origin.x + (-snapshot.marginX - snapshot.originX) * factor,
-    y: origin.y + (-snapshot.marginY - snapshot.originY) * factor,
-    width: snapshot.spanWidth * factor,
-    height: snapshot.spanHeight * factor,
-  };
-}
 
 // ---------------------------------------------------------------- culling ---
 

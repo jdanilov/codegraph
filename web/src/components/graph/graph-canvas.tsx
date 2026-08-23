@@ -27,6 +27,7 @@ import { ArcTooltip } from './arc-tooltip';
 import {
   CanvasController,
   type ArcTooltip as ArcTooltipData,
+  type StoredWorkspace,
   type ViewSummary,
 } from '@/graph/canvas-controller';
 import type { GraphModel, ModelNode } from '@/graph/model';
@@ -51,6 +52,12 @@ export interface GraphCanvasProps {
   sortMode?: SortMode;
   /** Mirror of the view summary — the shell re-encodes the URL from it. */
   onViewChange?(summary: ViewSummary): void;
+  /**
+   * Which disks are open and where they sit, whenever that changes. The shell
+   * persists it per project; it is deliberately NOT part of the URL (see
+   * `canvas-controller.ts`'s `StoredWorkspace`).
+   */
+  onWorkspaceChange?(workspace: StoredWorkspace): void;
 }
 
 export function GraphCanvas({
@@ -61,6 +68,7 @@ export function GraphCanvas({
   onColorModeChange,
   sortMode,
   onViewChange,
+  onWorkspaceChange,
 }: GraphCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const controllerRef = useRef<CanvasController | null>(null);
@@ -75,6 +83,8 @@ export function GraphCanvas({
   onColorModeChangeRef.current = onColorModeChange;
   const onViewChangeRef = useRef(onViewChange);
   onViewChangeRef.current = onViewChange;
+  const onWorkspaceChangeRef = useRef(onWorkspaceChange);
+  onWorkspaceChangeRef.current = onWorkspaceChange;
 
   // Controlled when the shell supplies a mode (URL state), self-owned otherwise.
   const colorMode = controlledColorMode ?? ownColorMode;
@@ -96,6 +106,9 @@ export function GraphCanvas({
         onViewChangeRef.current?.(next);
       },
       onArcTooltip: setArcTooltip,
+      onWorkspaceChange: (workspace) => {
+        onWorkspaceChangeRef.current?.(workspace);
+      },
     });
     controllerRef.current = controller;
     onControllerRef.current?.(controller);

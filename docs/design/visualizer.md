@@ -1345,6 +1345,127 @@ invalidation rule above are untouched.
   sharpness or complexity for a budget nobody has complained about, and the
   round's whole point is that the gesture reads pixels that are already there.
 
+### Performance round (G5.2) — direct culled redraw replaces the blit
+
+G5 and G5.1 above are **reverted in their entirety**; everything else from both
+rounds stays. The blit was the wrong trade on the machine it was supposed to
+help, and it was measured being wrong.
+
+- **What was measured.** On a large display at device pixel ratio 2, a pan drag
+  spent **84ms inside `composite()`'s single `drawImage`** — a copy that is
+  supposed to be the cheap part of the frame, and by itself a five-frame stall.
+  The cause is the scene canvas's own size: G5.1 made it 2w × 2h, which at
+  ratio 2 is **four times the backing store of an already 4× viewport**, past
+  the GPU's maximum texture dimension on that display. A canvas over the cap
+  falls out of the accelerated path, so the "one `drawImage`" ran in **software**
+  — the fast path had quietly become the slowest thing in the frame. Making the
+  margin smaller only moves the cliff; the whole structure is what buys the
+  problem.
+- **Removed:** the offscreen scene canvas and its context, `composite()`, the
+  half-viewport margin (`sceneMetrics`, `SceneFrame`, `marginDeviceX/Y`), the
+  snapshot camera and `blitPlacement`, `blitFrame`, `captureSnapshot`, the
+  `BLIT_GESTURE_MS` window, and the `sceneDirty` / `requestCameraDraw` split
+  that existed only to decide whether a frame *could* be blitted. `requestDraw`
+  is once again the single entry point every path calls, and `draw()` paints
+  straight onto the visible canvas, as it did before G5.
+- **Kept, and it is what makes the removal affordable:** the **viewport
+  culling** (`makeCull` / `arcVisible`, the per-disk bounding-circle reject, the
+  rope and tether box culls), the **colour memos** (`withAlpha`, `readableOn`,
+  the per-arc fill cache), and the **label-plan replay** while
+  `cameraSettling()` — which is the thing that actually keeps a gesture frame
+  cheap, since it is what stops the painter re-measuring text 60 times a second.
+  The deferred hover is kept too: the hit test it skips is genuinely per-tick
+  work a wheel gesture cannot afford, and it never depended on the blit.
+- **The cull rect is the viewport again**, plus the unchanged 24px
+  `CULL_MARGIN_PX`. The margin existed only so a blit had painted pixels to
+  stamp into; with no blit there is nothing off screen that a later frame has to
+  reuse, so painting it is pure waste. Every frame is now painted for exactly
+  the pixels the screen shows.
+- **Black edges are impossible by construction, not by budget.** The G5.1
+  margin bought "a pan of up to half a viewport before the background shows
+  through" — a bound, with a failure mode past it. A frame that is always the
+  real scene has no bound to exceed and nothing that can be stale: there is no
+  second copy of the picture, so there is no way for what is on screen to
+  disagree with what the camera says. Pan as far and as fast as you like.
+- **The trade this accepts:** a pan/zoom frame re-executes the (culled) scene
+  instead of transforming a bitmap. That is the design — culling plus the caches
+  is what made the full pass cheap in the first place, and a cheap-but-real
+  frame beats a nominally-free one that falls off the GPU.
+- Probed after the surgery (throwaway numeric probe over the real modules,
+  bundled with esbuild): **6,000** (camera, viewport, arc) cases against real
+  `computeSunburst` layouts plus the adversarial trio (full circle, ±π seam,
+  viewport containing the centre) — **4,688 rejects, 0 false culls** against the
+  same dense-sampling oracle G5 used; the mutation control (windows shrunk 4%)
+  is caught on 51 of them, so "0" is still a result.
+
+### Workspace rules (G5.2) — a spawned disk's floor, the palette, and a workspace that survives a refresh
+
+Three rules that all answer the same complaint: the workspace forgets, or goes
+somewhere you did not ask it to go.
+
+- **A spawned disk can never navigate above the node it came out of.** The node
+  a drag-away was rooted at becomes that disk's **floor** (`DiskState.floorId`),
+  fixed for the disk's whole life — it survives drilling in and re-rooting back
+  out anywhere inside the subtree, because it is a property of the DISK, not of
+  its current root. Without it a secondary disk walks up to the project root and
+  becomes a second copy of the primary, or two disks end up pointing at the same
+  root, while the tether still claims it came out of a wedge that is now above
+  it. The floor is enforced in `setDiskRoot` — the one funnel every re-root goes
+  through (the centre circle, Backspace, Enter, a card, ⌘P's drill-down) — as a
+  containment test (`canRootAt`) rather than an equality one, so a root that
+  somehow landed outside the subtree is refused rather than allowed to keep
+  climbing. **At the floor there is simply nothing up:** the centre circle's
+  `▲ <parent>` hint is absent, exactly as it is for the primary disk at the
+  project root (both read the same `upTarget`), clicking the centre does
+  nothing, and Backspace is a no-op — deliberately not "close the disk", since a
+  key that navigates four times and then destroys what you were navigating is a
+  key nobody can hold down. The primary disk has no floor; the project root
+  already stops it.
+- **⌘P matches on the NAME.** The `/api/search` index covers a node's qualified
+  name and its file path as well, which is right for the `codegraph_explore`
+  tool it also feeds and wrong for a palette: in a project with a `canvas/`
+  directory, typing `canvas` returned every symbol under it and buried the thing
+  actually called `canvas`. The list is filtered to `hit.name` matches, keeping
+  the server's own flavour (case-insensitive substring, so the camel infix
+  `profileInfo` still reaches `getProfileInfoV2`; a multi-word query needs every
+  word somewhere in the name). Results are then **ordered by name**, not by
+  relevance — a list you scan for a name you already know is easier to scan
+  alphabetically than by a score you cannot see — and each row carries the
+  node's **LoC** beside its kind, from the same `sizesOf` weights the centre
+  circle's `N loc` reads.
+- **Picking a result goes to the wedge that is already there.** If any disk
+  renders the node — an arc that exists and is not switched off in the legend;
+  the disk's own root always counts, since the centre is drawn whatever the
+  filters say — that disk answers: select, pulse, and **pan the minimum
+  distance** that brings the wedge on screen (`panIntoView`: a pure translation
+  against the free viewport inset by `REVEAL_PAD_PX`, no zoom, no re-framing,
+  and a no-op when it is already visible). Only when nothing renders it does ⌘P
+  drill, and the disk that drills is the one whose root is the **deepest
+  ancestor** of the target — the shortest way down, focused disk first on a tie.
+  Because a disk only ever qualifies for a target inside its own subtree, that
+  choice can never take a secondary disk above its floor.
+- **The workspace is stored per project.** Which disks are open, each one's root
+  and floor, and every disk's position (the primary's included) go to
+  `localStorage` under `codegraph.ui.workspace.<hash of the project root path>`,
+  debounced 300ms because dragging a disk moves it on every pointer frame. It is
+  `localStorage` and not the URL for the same reason the panel widths are: it
+  describes THIS browser's arrangement, not the view a link shares. **The hash
+  still owns the primary disk's root, selection and camera, and on any conflict
+  the hash wins** — only the primary's position is stored here. Restore happens
+  once the model has arrived, with no animation and no camera move; a stored
+  disk whose root no longer exists (a re-index can remove nodes) is dropped
+  silently and the store is rewritten without it, and closing a disk updates it
+  the same way. There is no "reset" affordance this round.
+- Probed alongside the cull check: **400** spawned disks × 24 interleaved
+  up-navigations each (`rootUp`, a direct re-root at the parent, a ⌘P reveal of
+  a node outside the subtree, a drill-down) — **7,221 up-attempts, 0 escapes**
+  from the floor's subtree and 0 disks offering a `▲` hint they should not,
+  while the floorless primary still walks all the way back to the project root
+  every time. Palette: **273** rows that match a query only through their path
+  and **0** of them leak into the list, 120 name queries (whole name and a
+  seven-character infix) with 0 misses, and 300 rows sorted with 0 out of order
+  plus equal names keeping their input order.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all
