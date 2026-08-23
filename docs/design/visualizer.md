@@ -739,6 +739,124 @@ and **Changes** (`/api/changes`, refreshed on `dataVersion` change).
 **Feedback export**: from a card + selected nodes, generate markdown (file
 paths, line spans, user note) to paste into an agent prompt. Client-side only.
 
+### Phase G — multi-disk workspace (1) (additive; no contract item changed)
+
+The canvas becomes a **workspace holding N disks** rather than a single disk.
+The question that motivates it is task-anchored and cannot be answered by one
+sunburst: *a chain of calls between different levels of the system* is not one
+subtree, so it is not one disk. Phase G1 is the geometry and the gesture; the
+AI-composed flow views and the named saved views that build on it are phases
+G2/G3 and are **deliberately not built here** (see the deferrals at the end).
+
+- **The workspace model.** A disk is `{ id, rootId, position (workspace coords),
+  its own root / expansion state }`. One **shared camera** (pan + zoom) over the
+  whole workspace; disks carry positions, never individual scales — two disks on
+  screen are always the same size, which is what makes a wedge in one comparable
+  with a wedge in the other. Each disk renders the EXISTING sunburst via
+  `computeSunburst(model, disk.rootId, options)` under its own translate:
+  **`sunburst.ts` is untouched and never learns that a second disk exists**, and
+  `bundling.ts` likewise. The new layer is `web/src/graph/workspace.ts`, and it
+  is **pure** — workspace bounds, the fit camera, "which disk owns this point",
+  spawn placement, the cross-disk curve — so all of it is numerically probeable
+  without a browser. `canvas-controller.ts` orchestrates; it is a layer ABOVE the
+  single-disk pipeline, not a fork of it.
+- **A one-disk workspace is numerically identical to phase F.** The primary disk
+  sits at workspace `(0, 0)` and the camera is anchored there (not to the
+  workspace bounding box), so spawning a disk never shoves the picture the user
+  is reading sideways — re-framing is an explicit gesture. `fitCamera` returns
+  exactly `{ zoom: 1, pan: 0, 0 }` for a single disk at the origin, which is the
+  phase F reset. `ZOOM_MIN` drops from 0.5 to **0.12**: `fit` now has to frame a
+  whole workspace, and a fit that cannot reach the scale it needs is a fit that
+  lies.
+- **Hit testing is workspace → disk → the existing angle-first test.** The
+  pointer is transformed into workspace space, `diskAt` picks the disk
+  (containment, **nearest centre wins** on overlap), the point is translated into
+  that disk's local space, and `arcAt` — unchanged, per-ring binary search —
+  answers. A disk's radius is its layout's own `maxRadius`, i.e. its real painted
+  extent, so a two-ring disk packs tighter than a six-ring one.
+- **Spawn by drag-away.** A drag that STARTS on a wedge and crosses that disk's
+  **outer radius** spawns a ghost (a dashed circle outline plus the node's name,
+  following the cursor); the drop spawns a disk rooted at that node, showing its
+  subtree. Crossing the rim is the threshold rather than a pixel distance: "I
+  pulled this out of there" is a spatial claim, and the rim is where the user
+  sees the disk end. The gesture is reversible right up to the release — coming
+  back inside cancels it. The ghost's radius is the prospective disk's real
+  radius: the layout is computed once, the moment the ghost appears, and cached,
+  so the drop itself is free. Dragging a leaf symbol works; the disk shows that
+  node as its root with whatever the layout gives it (a lone centre circle for a
+  childless symbol).
+- **Gesture disambiguation is decided by WHAT IS UNDER THE POINTER AT PRESS
+  TIME**, once, and never re-decided mid-gesture:
+  1. **a wedge that renders a node** → a spawn candidate. It becomes a spawn only
+     if the pointer leaves the disk's outer radius before release; otherwise the
+     drag is a **no-op** and the click underneath does the selecting, exactly as
+     if the pointer had never moved.
+  2. **anywhere else inside a disk** — the centre circle, the gaps between
+     wedges, a `+N` fold arc, a wedge whose category the legend switched off →
+     **move that disk**. Everything that is not a wedge is grab-able; the
+     alternative (a dedicated drag handle) is a target the user has to find.
+     A press on the centre circle that does NOT move is still the up-navigation
+     click, unchanged.
+  3. **empty canvas** → pan the shared camera, unchanged from phase F.
+  4. **a secondary disk's `×`** → close it on release.
+  Pressing anywhere inside a disk also FOCUSES it, so the keyboard follows the
+  pointer without a second gesture.
+- **Disk management.** Every non-primary disk gets a small `×` on its rim while
+  it is hovered (drawn in SCREEN space so it keeps its size at any zoom; no
+  transitions). **The primary disk cannot be closed** — it is the URL-backed
+  view. The **focused disk** is the last one interacted with, and it routes
+  keyboard navigation, `Enter` re-root and the centre-circle up-navigation; it
+  wears a quiet ring on its centre circle, and only once there is more than one
+  disk. `fit` (legend panel) frames **all** disks.
+- **Selection is global.** One node is selected at a time and its wedge lights in
+  EVERY disk that renders it — the node and code panels are unchanged, because
+  there is still exactly one selection. The same is true of every other
+  channel: a question card's highlight, hover-connectivity dimming, impact mode,
+  the legend's invisible categories and the change markers are all held at NODE
+  level on the controller and **projected per disk**, so they apply uniformly
+  across the workspace by construction rather than by repetition.
+- **Cross-disk edges.** Each relation is routed **once**: both endpoints are
+  matched against every disk on a ladder (own arc > folded into a `+N` > the
+  disk's own root > an ancestor arc > not in this disk at all), the best match
+  wins, ties go to the disk the hover/focus came from and then to creation
+  order. Two endpoints in the same disk → the **existing Holten bundling**,
+  untouched. Two endpoints in different disks → **one gentle quadratic** between
+  the two wedge centroids in workspace space, **no bundling**: bundling routes
+  along the hierarchy, and two disks share no hierarchy, so a rope between them
+  would read as a detour rather than as a relation. Same green-incoming /
+  amber-outgoing direction colours, same dashed-for-`heuristic` rule. **At rest
+  nothing is drawn**, unchanged.
+- **The source wedge is marked.** A wedge a disk was dragged out of wears a short
+  tick on its outer edge for as long as that disk exists. A workspace of four
+  disks otherwise gives no answer to "which of these came from where", and the
+  only honest place for that answer is the wedge itself.
+- **⌘P reveal.** If ANY disk already renders the node, that disk answers —
+  reveal and pulse there, and take the focus with it. Nothing moves, because what
+  the user asked for is already on screen. Otherwise it is the phase E/F
+  behaviour on the primary disk (re-root to the parent, or onto the node itself
+  when it was folded away).
+- **State scope.** The URL hash is **exactly as today** — `{ r, c, m, k, s }` —
+  and describes the **PRIMARY disk only**. An old link therefore opens as a
+  single-disk workspace, unchanged, and `getRoot()`/`setRoot()`/`focusNodes()`/
+  `setExpanded()` deliberately keep speaking for the primary disk no matter where
+  the focus is. Secondary disks are **session-only** in phase G1 (in memory; a
+  refresh drops them — named views are phase G3). Spawning, moving and closing a
+  secondary disk **never pushes history**; the primary disk's pushState rules are
+  untouched. A re-index keeps the whole workspace, dropping only disks whose root
+  no longer exists.
+- **Performance.** Layouts are cached per `(rootId, sortMode)` and shared between
+  disks on the same root, so closing a disk and dragging it out again costs
+  nothing; the cache is dropped wholesale when the model or the sort mode
+  changes. The round-4 camera-settle label machinery is **per disk** (each keeps
+  its own plan) over ONE shared settle window and ONE shared text-metrics cache,
+  so a second disk pays nothing for names the first already measured. The
+  single-disk frame does the same work it did in phase F.
+- **Deferred to later phases, deliberately not built here**: AI-composed flow
+  views (a question that lays out its own set of disks), and **named saved
+  views** (which is what will make a multi-disk workspace survive a refresh and
+  become shareable — and therefore what will decide whether the URL grows beyond
+  the primary disk).
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all
@@ -778,6 +896,14 @@ paths, line spans, user note) to paste into an agent prompt. Client-side only.
    per-node impact mode, keyboard navigation with a shortcut overlay, and the
    EDGES treatment moved to the legend with the node panel's lists stacked
    again.
+7. **G — multi-disk workspace**: the canvas becomes a workspace of N disks over
+   one shared camera. **G1** (built) is the geometry and the gesture — the pure
+   `workspace.ts` layer, drag-away spawning with a ghost, disk move/close/focus,
+   a global selection projected onto every disk, cross-disk relations drawn as
+   single bowed curves while intra-disk ones keep their bundling, and a URL that
+   still describes the primary disk only. **G2** (AI-composed flow views) and
+   **G3** (named saved views, which is what makes a workspace survive a refresh)
+   follow.
 
 ## House rules for every phase
 

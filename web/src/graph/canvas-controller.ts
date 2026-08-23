@@ -2,24 +2,36 @@
  * The sunburst canvas: everything imperative about the graph view.
  *
  * React owns the floating panels; this class owns one `<canvas>` and draws the
- * whole disk into it with the 2D context. There is **no simulation** — the
- * layout is a pure function of (model, current root), so a redraw is a redraw
+ * whole workspace into it with the 2D context. There is **no simulation** — each
+ * disk's layout is a pure function of (model, its root), so a redraw is a redraw
  * and nothing on screen ever drifts. That is the point: the force layout this
  * replaced was spatially unstable, which made a 13k-node project unreadable.
  *
+ * PHASE G: the canvas is a **workspace** holding N disks, not a single disk.
+ * Dragging a wedge past its disk's outer radius spawns a second disk rooted at
+ * that node, and a relation whose two ends are visible in two different disks is
+ * drawn straight across the gap. The single-disk pipeline underneath is
+ * untouched: `sunburst.ts` still lays out one disk at a time and never learns
+ * that a second one exists, `workspace.ts` owns the (pure) geometry above it,
+ * and this class is the orchestrator between them. A workspace with one disk is
+ * numerically identical to the pre-phase-G canvas.
+ *
  * What lives here:
  *
- *  - the current **root** (the centre of the disk) and the layout computed from
- *    it (`sunburst.ts`);
- *  - painting: arcs, rims, curved labels, the centre disk, bundled edges;
- *  - hit testing (ring-indexed for arcs, polyline distance for edges);
+ *  - the **disks** — each with its own root, position and layout;
+ *  - painting: arcs, rims, curved labels, the centre disk, bundled intra-disk
+ *    edges, gentle cross-disk curves, the drag ghost and the close affordance;
+ *  - hit testing (workspace → disk → angle-first ring search, per disk);
  *  - navigation: click a directory to re-root, click the centre to go up,
  *    double-click anything to drill into it, `reveal(id)` for ⌘P;
- *  - the persistent highlight a card / the Changes view drives.
+ *  - the persistent highlight a card / the Changes view drives, applied
+ *    uniformly to every disk.
  *
  * Edges are **hidden at rest**. They appear for the hovered arc's subtree, the
  * current selection, or the active card's `edgeRefs` — bundled along the
- * hierarchy so a hundred relations read as one rope (`bundling.ts`).
+ * hierarchy so a hundred relations read as one rope (`bundling.ts`) when both
+ * ends live in the same disk, and as one bowed curve (`workspace.ts`) when they
+ * do not.
  */
 import { formatNumber } from '@/lib/utils';
 
@@ -42,6 +54,7 @@ import {
   MAX_ARCS,
   MAX_RADIUS,
   arcAt,
+  arcCentroid,
   computeSunburst,
   deepestCommonAncestor,
   initialRoot,
@@ -50,6 +63,16 @@ import {
   type SunburstArc,
   type SunburstLayout,
 } from './sunburst';
+import {
+  closeAnchor,
+  crossDiskCurve,
+  diskAt,
+  fitCamera,
+  placeSpawnedDisk,
+  toDiskLocal,
+  workspaceBounds,
+  type DiskPlacement,
+} from './workspace';
 
 export interface BreadcrumbEntry {
   id: string;
@@ -57,23 +80,25 @@ export interface BreadcrumbEntry {
 }
 
 export interface ViewSummary {
-  /** Arcs currently rendered. */
+  /** Arcs currently rendered, across every disk. */
   arcs: number;
-  /** Rings rendered outward from the current root. */
+  /** Deepest ring count any disk reached. */
   rings: number;
   /** True when depth, budget or the sliver floor folded something away. */
   truncated: boolean;
   /** Bundled relations currently drawn (0 at rest — edges are on demand). */
   visibleEdges: number;
-  /** Kinds (or layers) present in the disk — drives the legend. */
+  /** Kinds (or layers) present in the workspace — drives the legend. */
   presentColorKeys: string[];
   /** Every non-`contains` kind in the graph, contract kinds first. */
   edgeKinds: string[];
   /** The subset currently drawable — the controller owns this, not React. */
   enabledKinds: string[];
-  /** Project root → … → current root. */
+  /** Project root → … → the FOCUSED disk's root. */
   breadcrumb: BreadcrumbEntry[];
   zoom: number;
+  /** Disks on the canvas (1 until the user drags one out). */
+  disks: number;
 }
 
 /** Hover readout for an arc: what it is, how big, and what it hides. */
@@ -127,7 +152,12 @@ const VIEW_PADDING = 36;
 const PANEL_GUTTER = 372;
 const GUTTER_MIN_WIDTH = 900;
 
-const ZOOM_MIN = 0.5;
+/**
+ * Zoom range. The floor is well below 1 because `fit` now has to frame a whole
+ * WORKSPACE: three or four disks side by side need a third of the scale a single
+ * disk does, and a fit that cannot reach it is a fit that lies.
+ */
+const ZOOM_MIN = 0.12;
 const ZOOM_MAX = 8;
 
 /** Re-root transition. Short on purpose: navigation, not decoration. */
@@ -181,7 +211,8 @@ const RLABEL_MAX_FONT_PX = 12;
  * a zoom gesture judder the moment labels came into range. While the camera is
  * moving the painter now replays the LAST plan through cheap arithmetic gates
  * only (no `measureText`, no font assignment), and the real pass runs once the
- * gesture stops. At rest the output is byte-identical to the old path.
+ * gesture stops. At rest the output is byte-identical to the old path. Every
+ * disk keeps its own plan; the settle window is the camera's, so it is shared.
  */
 const LABEL_SETTLE_MS = 100;
 
@@ -217,11 +248,27 @@ const GLOW_RESULT = '#67e8f9';
 const CENTRE_FILL = 'rgba(24, 33, 52, 0.92)';
 const CENTRE_STROKE = 'rgba(140, 165, 205, 0.45)';
 
+/** Phase G chrome: the drag ghost, the close `×`, the "expanded away" tick. */
+const GHOST_RADIUS_PX = 44;
+const GHOST_STROKE = 'rgba(140, 200, 255, 0.75)';
+const GHOST_FILL = 'rgba(24, 40, 66, 0.55)';
+const CLOSE_RADIUS_PX = 9;
+const CLOSE_HIT_PX = 13;
+const SPAWN_TICK_PX = 5;
+const SPAWN_TICK_COLOR = '#7dd3fc';
+/** Ring around the focused disk's centre, drawn only once there are several. */
+const FOCUS_RING = 'rgba(125, 211, 252, 0.55)';
+
 interface DrawnEdge {
   edge: ModelEdge;
   points: Point[];
   /** Relative to the hovered / selected wedge — green in, amber out. */
   direction: EdgeDirection;
+  /**
+   * Disk whose LOCAL space the polyline is expressed in — `null` for a
+   * cross-disk curve, which lives in workspace space.
+   */
+  diskId: string | null;
 }
 
 /**
@@ -261,6 +308,70 @@ export interface ChangeMarker {
   removed: number;
 }
 
+/**
+ * One disk in the workspace.
+ *
+ * Everything that used to be a scalar field on the controller and is genuinely
+ * *per disk* lives here: the root, the layout computed from it, the label
+ * geometry and plan, the projected highlight sets and the re-root transition.
+ * Everything that is per WORKSPACE — the camera, the selection, the model, the
+ * legend filters — stays on the controller, because that is what makes a
+ * highlight or a filter apply uniformly to every disk for free.
+ */
+interface DiskState {
+  id: string;
+  rootId: string;
+  /** Workspace coordinates of the disk's centre; the primary sits at (0, 0). */
+  x: number;
+  y: number;
+  /** The URL-backed disk. There is exactly one and it cannot be closed. */
+  primary: boolean;
+  /** Node the drag-away spawned this disk from — `null` for the primary. */
+  source: string | null;
+
+  layout: SunburstLayout | null;
+  labelGeom: ArcLabelGeom[];
+  labelPlan: PlannedLabel[] | null;
+
+  /** Arc keys the result/changed sets resolve to IN THIS DISK. */
+  resultArcs: Set<string>;
+  changedArcs: Set<string>;
+  impactedArcs: Set<string>;
+  impactModeArcs: Set<string>;
+  /** Arcs the current hover reaches here — `null` when nothing is hovered. */
+  hoverArcs: Set<string> | null;
+
+  transitionStart: number;
+  transitionFrom: number;
+  /** When this disk's root last changed — guards the double-click drill-in. */
+  rootChangedAt: number;
+}
+
+/** What a pointer gesture turned out to be. See {@link CanvasController}. */
+type DragMode = 'pan' | 'move-disk' | 'wedge' | 'close';
+
+interface DragState {
+  mode: DragMode;
+  moved: boolean;
+  /** Screen coordinates of the previous move, for incremental deltas. */
+  lastX: number;
+  lastY: number;
+  /** Screen coordinates the gesture started at. */
+  startX: number;
+  startY: number;
+  /** Current pointer position, in screen coordinates (the ghost follows it). */
+  x: number;
+  y: number;
+  diskId: string | null;
+  /** Wedge drag: the node the ghost carries. */
+  nodeId: string | null;
+  label: string;
+  /** Wedge drag: has the pointer crossed the source disk's outer radius? */
+  outside: boolean;
+  /** Layout the ghost previews, computed once when it first appears. */
+  preview: SunburstLayout | null;
+}
+
 export class CanvasController {
   private readonly container: HTMLElement;
   private readonly canvas: HTMLCanvasElement;
@@ -269,16 +380,32 @@ export class CanvasController {
   private readonly resizeObserver: ResizeObserver;
 
   private model: GraphModel | null = null;
-  private rootId = ROOT_ID;
-  private layout: SunburstLayout | null = null;
+
+  /** The workspace: creation order, primary first. Never empty. */
+  private disks: DiskState[] = [];
+  /** Last interacted disk — keyboard nav, Enter and the up-nav route here. */
+  private focusedDiskId = PRIMARY_DISK_ID;
+  private diskSeq = 0;
+
+  /**
+   * Layouts, keyed by `(rootId, sortMode)`. A layout is a pure function of
+   * (model, root, sort), so two disks on the same root share one — and closing
+   * a disk and dragging it out again costs nothing. Dropped wholesale whenever
+   * the model or the sort mode changes.
+   */
+  private layoutCache = new Map<string, SunburstLayout>();
 
   private colorMode: ColorMode = 'kind';
   private sortMode: SortMode = DEFAULT_SORT_MODE;
   private enabledKinds = new Set<string>();
 
+  /** Selection is GLOBAL: one node, lit in every disk that renders it. */
   private selected: string | null = null;
+  private hoveredDiskId: string | null = null;
   private hoveredKey: string | null = null;
   private hoveredEdgeKey: string | null = null;
+  /** Secondary disk whose `×` the pointer is on, if any. */
+  private closeHoverDiskId: string | null = null;
 
   private resultNodes = new Set<string>();
   private changedNodes = new Set<string>();
@@ -292,11 +419,15 @@ export class CanvasController {
    */
   private impactModeNodes = new Set<string>();
 
-  /** Arc keys the result/changed sets resolve to — recomputed per layout. */
-  private resultArcs = new Set<string>();
-  private changedArcs = new Set<string>();
-  private impactedArcs = new Set<string>();
-  private impactModeArcs = new Set<string>();
+  /**
+   * Nodes the hovered wedge reaches by an edge — `null` when nothing is hovered.
+   * Kept at NODE level rather than at arc level so it projects onto every disk:
+   * connectivity dimming is a property of the graph, not of one disk.
+   */
+  private hoverNodes: Set<string> | null = null;
+
+  /** True when any disk actually projected a result / impact arc. */
+  private focusArcsPresent = false;
 
   /**
    * Legend categories the user switched OFF (round 4). A wedge whose colour key
@@ -308,24 +439,18 @@ export class CanvasController {
   /** File node id → what changed in it, for the outer-rim change markers. */
   private changeMarkers = new Map<string, ChangeMarker>();
 
-  /** Per-layout label geometry, and the last full label pass's decisions. */
-  private labelGeom: ArcLabelGeom[] = [];
-  private labelPlan: PlannedLabel[] | null = null;
+  /** Node id → how many open disks were dragged out of it (the "away" tick). */
+  private expandedAway = new Map<string, number>();
+
   /** `(font bucket, text)` → measured width in SCREEN px. */
   private readonly textWidths = new Map<string, number>();
   /** When the camera last moved — the label pass waits for this to go stale. */
   private cameraMovedAt = -Infinity;
 
-  /** ⌘P landing pulse: which node, and when the pulse starts. */
+  /** ⌘P landing pulse: which node, in which disk, and when it starts. */
   private pulseNodeId: string | null = null;
+  private pulseDiskId: string | null = null;
   private pulseStart = 0;
-
-  /**
-   * Arcs the hovered wedge is related to by an edge — `null` when nothing is
-   * hovered. Non-null means the disk is dimmed down to this set, instantly:
-   * connectivity is the question a hover asks, and a fade would answer it late.
-   */
-  private hoverConnectedArcs: Set<string> | null = null;
 
   private drawnEdges: DrawnEdge[] = [];
   private edgesDirty = true;
@@ -338,17 +463,10 @@ export class CanvasController {
   private panX = 0;
   private panY = 0;
 
-  private transitionStart = 0;
-  private transitionFrom = 1;
-  /** When the root last changed — guards the double-click drill-in. */
-  private rootChangedAt = -Infinity;
   private frame: number | null = null;
   private disposed = false;
 
-  private dragging = false;
-  private dragMoved = false;
-  private dragX = 0;
-  private dragY = 0;
+  private drag: DragState | null = null;
   private suppressClick = false;
 
   constructor(container: HTMLElement, callbacks: CanvasCallbacks) {
@@ -367,6 +485,8 @@ export class CanvasController {
     if (!ctx) throw new Error('2D canvas context unavailable');
     this.ctx = ctx;
 
+    this.disks = [makeDisk(PRIMARY_DISK_ID, ROOT_ID, 0, 0, true, null)];
+
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(container);
     this.resize();
@@ -377,21 +497,34 @@ export class CanvasController {
 
   /**
    * Install a model. On a re-index (`sameProject`) the current root, selection
-   * and zoom are preserved — liveness must not cost the user their place.
+   * and zoom are preserved — liveness must not cost the user their place — and
+   * so is the workspace: a spawned disk whose root survived the re-index stays
+   * exactly where the user put it.
    */
   setModel(model: GraphModel, sameProject: boolean): void {
     const previous = this.model;
     this.model = model;
+    this.layoutCache.clear();
 
     if (!previous || !sameProject) {
-      this.rootId = initialRoot(model);
+      this.disks = [makeDisk(PRIMARY_DISK_ID, initialRoot(model), 0, 0, true, null)];
+      this.focusedDiskId = PRIMARY_DISK_ID;
+      this.expandedAway.clear();
       this.enabledKinds = new Set(model.edgeKinds);
       this.selected = null;
       this.zoom = 1;
       this.panX = 0;
       this.panY = 0;
     } else {
-      if (!model.nodes.has(this.rootId)) this.rootId = initialRoot(model);
+      // A disk whose root no longer exists has nothing to draw. The primary
+      // falls back to the project root; a secondary simply goes away.
+      this.disks = this.disks.filter((disk) => disk.primary || model.nodes.has(disk.rootId));
+      const primary = this.primary();
+      if (!model.nodes.has(primary.rootId)) primary.rootId = initialRoot(model);
+      this.rebuildExpandedAway();
+      if (!this.disks.some((disk) => disk.id === this.focusedDiskId)) {
+        this.focusedDiskId = PRIMARY_DISK_ID;
+      }
       // A brand-new edge kind arriving mid-session should be visible, not
       // silently off; kinds that vanished are simply dropped.
       const known = new Set(previous.edgeKinds);
@@ -399,7 +532,7 @@ export class CanvasController {
       this.enabledKinds = new Set([...this.enabledKinds].filter((k) => model.edgeKinds.includes(k)));
       if (this.selected && !model.nodes.has(this.selected)) this.selected = null;
     }
-    this.rebuildLayout();
+    this.rebuildAllLayouts();
   }
 
   setColorMode(mode: ColorMode): void {
@@ -416,7 +549,8 @@ export class CanvasController {
   setSortMode(mode: SortMode): void {
     if (this.sortMode === mode) return;
     this.sortMode = mode;
-    if (this.model) this.rebuildLayout();
+    this.layoutCache.clear();
+    if (this.model) this.rebuildAllLayouts();
   }
 
   sortModeValue(): SortMode {
@@ -455,7 +589,7 @@ export class CanvasController {
       return;
     }
     this.hiddenColorKeys = next;
-    this.labelPlan = null;
+    for (const disk of this.disks) disk.labelPlan = null;
     this.requestDraw();
   }
 
@@ -485,45 +619,143 @@ export class CanvasController {
     this.requestDraw();
   }
 
-  // ---------------------------------------------------------- navigation ---
+  // ------------------------------------------------------------ workspace ---
 
-  getRoot(): string {
-    return this.rootId;
+  /** The URL-backed disk. Always `disks[0]`, always present. */
+  private primary(): DiskState {
+    return this.disks[0]!;
+  }
+
+  /** Last interacted disk — what the keyboard and Enter drive. */
+  private focused(): DiskState {
+    return this.disks.find((disk) => disk.id === this.focusedDiskId) ?? this.primary();
+  }
+
+  private diskById(id: string | null): DiskState | null {
+    if (!id) return null;
+    return this.disks.find((disk) => disk.id === id) ?? null;
+  }
+
+  /** The workspace geometry's view of the disks — position plus real radius. */
+  private placements(): DiskPlacement[] {
+    return this.disks.map((disk) => ({
+      id: disk.id,
+      x: disk.x,
+      y: disk.y,
+      radius: disk.layout?.maxRadius ?? MAX_RADIUS,
+    }));
+  }
+
+  /** How many disks are on the canvas — 1 until the user drags one out. */
+  diskCount(): number {
+    return this.disks.length;
   }
 
   /**
-   * Re-root the disk. The centre becomes `id`, rings grow outward from it.
+   * Spawn a disk rooted at `nodeId` near a workspace point — the drop half of
+   * the drag-away gesture. Placement is nudged clear of every existing disk, so
+   * two disks never overlap at birth.
+   */
+  private spawnDisk(nodeId: string, at: Point, layout: SunburstLayout | null): DiskState | null {
+    const model = this.model;
+    if (!model || !model.nodes.has(nodeId)) return null;
+    const resolved = layout ?? this.layoutFor(nodeId);
+    const placed = placeSpawnedDisk(this.placements(), at, resolved.maxRadius);
+    this.diskSeq += 1;
+    const disk = makeDisk(`disk:${this.diskSeq}`, resolved.rootId, placed.x, placed.y, false, nodeId);
+    disk.layout = resolved;
+    this.disks.push(disk);
+    this.buildLabelGeometry(disk);
+    this.expandedAway.set(nodeId, (this.expandedAway.get(nodeId) ?? 0) + 1);
+    this.focusedDiskId = disk.id;
+    this.projectHighlight();
+    this.edgesDirty = true;
+    this.requestDraw();
+    this.emitSummary();
+    return disk;
+  }
+
+  /** Close a secondary disk. The primary is the URL's view and cannot go. */
+  private closeDisk(id: string): void {
+    const disk = this.diskById(id);
+    if (!disk || disk.primary) return;
+    this.disks = this.disks.filter((entry) => entry.id !== id);
+    this.rebuildExpandedAway();
+    if (this.focusedDiskId === id) this.focusedDiskId = PRIMARY_DISK_ID;
+    if (this.hoveredDiskId === id) {
+      this.hoveredDiskId = null;
+      this.hoveredKey = null;
+      this.callbacks.onArcTooltip(null);
+    }
+    if (this.closeHoverDiskId === id) this.closeHoverDiskId = null;
+    if (this.pulseDiskId === id) this.pulseNodeId = null;
+    this.edgesDirty = true;
+    this.requestDraw();
+    this.emitSummary();
+  }
+
+  /** Recount the "expanded elsewhere" ticks from the disks that exist now. */
+  private rebuildExpandedAway(): void {
+    this.expandedAway = new Map();
+    for (const disk of this.disks) {
+      if (!disk.source) continue;
+      this.expandedAway.set(disk.source, (this.expandedAway.get(disk.source) ?? 0) + 1);
+    }
+  }
+
+  // ---------------------------------------------------------- navigation ---
+
+  /**
+   * The PRIMARY disk's root — the URL speaks for the primary disk only, so this
+   * deliberately ignores where the focus happens to be (phase G state scope).
+   */
+  getRoot(): string {
+    return this.primary().rootId;
+  }
+
+  /**
+   * Re-root the PRIMARY disk. The centre becomes `id`, rings grow outward.
    *
    * A node with no children can still be the root — the centre disk names it —
    * which is what makes `reveal` able to land on any node in the graph.
    */
   setRoot(id: string, animate = true): void {
+    this.setDiskRoot(this.primary(), id, animate);
+  }
+
+  /** Re-root one disk. Secondary disks never touch the URL or the history. */
+  private setDiskRoot(disk: DiskState, id: string, animate = true): void {
     const model = this.model;
-    if (!model || !model.nodes.has(id) || id === this.rootId) return;
-    const previousDepth = model.get(this.rootId)?.depth ?? 0;
+    if (!model || !model.nodes.has(id) || id === disk.rootId) return;
+    const previousDepth = model.get(disk.rootId)?.depth ?? 0;
     const nextDepth = model.get(id)?.depth ?? 0;
-    this.rootId = id;
-    this.rootChangedAt = performance.now();
-    this.zoom = 1;
-    this.panX = 0;
-    this.panY = 0;
+    disk.rootId = id;
+    disk.rootChangedAt = performance.now();
+    if (disk.primary) {
+      this.zoom = 1;
+      this.panX = 0;
+      this.panY = 0;
+    }
+    this.hoveredDiskId = null;
     this.hoveredKey = null;
     this.hoveredEdgeKey = null;
-    this.hoverConnectedArcs = null;
+    this.hoverNodes = null;
+    for (const entry of this.disks) entry.hoverArcs = null;
     this.callbacks.onArcTooltip(null);
     if (animate) {
       // Drilling in starts wide and settles; stepping out starts small and
       // grows. Both are pure opacity + scale on a layout that never moves.
-      this.transitionFrom = nextDepth > previousDepth ? 1.28 : 0.78;
-      this.transitionStart = performance.now();
+      disk.transitionFrom = nextDepth > previousDepth ? 1.28 : 0.78;
+      disk.transitionStart = performance.now();
     }
-    this.rebuildLayout();
+    this.rebuildLayout(disk);
   }
 
   /** Step one level out — the centre circle and the breadcrumb both do this. */
   rootUp(): void {
-    const parent = this.model?.get(this.rootId)?.parent;
-    if (parent) this.setRoot(parent);
+    const disk = this.focused();
+    const parent = this.model?.get(disk.rootId)?.parent;
+    if (parent) this.setDiskRoot(disk, parent);
   }
 
   /**
@@ -531,7 +763,8 @@ export class CanvasController {
    *
    * The disk lands on the deepest node that contains every result, so a card
    * answering inside one file opens that file's symbol ring and a card spread
-   * across the project stays at the project root.
+   * across the project stays at the project root. Cards drive the PRIMARY disk;
+   * a spawned disk is the user's own framing and is left alone.
    */
   focusNodes(ids: Iterable<string>): void {
     const model = this.model;
@@ -539,21 +772,27 @@ export class CanvasController {
     const wanted = [...ids].filter((id) => model.nodes.has(id));
     if (wanted.length === 0) return;
     const target = deepestCommonAncestor(model, wanted);
-    if (target === this.rootId) {
-      this.rebuildLayout();
+    const primary = this.primary();
+    if (target === primary.rootId) {
+      this.rebuildLayout(primary);
       return;
     }
-    this.setRoot(target);
+    this.setDiskRoot(primary, target);
   }
 
   /**
    * Select a node and bring its arc on screen — the ⌘P landing.
    *
-   * "Visible" means an arc actually exists for it. Re-rooting to its parent is
-   * the normal answer, but a node can still be swallowed by its parent's
-   * `+N` fold arc (a directory of 900 files), so the fallback re-roots onto
-   * the node ITSELF: the centre disk always renders the root, so ⌘P can reach
-   * anything in the graph.
+   * Phase G: if ANY disk already renders the node, that disk answers — reveal
+   * and pulse there, and take the focus with it. Nothing moves, because the
+   * thing the user asked for is already on screen; re-rooting the primary disk
+   * to show a second copy of it would be strictly worse.
+   *
+   * Otherwise this is the pre-phase-G behaviour on the primary disk. "Visible"
+   * means an arc actually exists for it: re-rooting to its parent is the normal
+   * answer, but a node can still be swallowed by its parent's `+N` fold arc (a
+   * directory of 900 files), so the fallback re-roots onto the node ITSELF —
+   * the centre disk always renders the root, so ⌘P can reach anything.
    */
   reveal(id: string, pulse = false): boolean {
     const model = this.model;
@@ -561,10 +800,17 @@ export class CanvasController {
     const node = model.get(id);
     if (!node) return false;
 
-    const parent = node.parent;
-    if (parent && parent !== this.rootId) this.setRoot(parent);
-    if (!this.layout || (!this.layout.byNode.has(id) && this.rootId !== id)) {
-      this.setRoot(id);
+    const showing = this.diskShowing(id);
+    const disk = showing ?? this.primary();
+    if (showing) {
+      this.focusedDiskId = showing.id;
+    } else {
+      const parent = node.parent;
+      if (parent && parent !== disk.rootId) this.setDiskRoot(disk, parent);
+      if (!disk.layout || (!disk.layout.byNode.has(id) && disk.rootId !== id)) {
+        this.setDiskRoot(disk, id);
+      }
+      this.focusedDiskId = disk.id;
     }
 
     this.selected = id;
@@ -573,8 +819,9 @@ export class CanvasController {
       // stay, so it starts when the re-root transition ENDS (immediately when
       // there was no re-root to make).
       this.pulseNodeId = id;
+      this.pulseDiskId = disk.id;
       this.pulseStart =
-        this.transitionStart > 0 ? this.transitionStart + TRANSITION_MS : performance.now();
+        disk.transitionStart > 0 ? disk.transitionStart + TRANSITION_MS : performance.now();
     }
     this.edgesDirty = true;
     this.requestDraw();
@@ -583,7 +830,20 @@ export class CanvasController {
   }
 
   /**
-   * Arrow-key navigation over the disk (round 4).
+   * A disk that already renders `id` — the focused one first, then creation
+   * order, so a ⌘P repeat keeps landing in the same place.
+   */
+  private diskShowing(id: string): DiskState | null {
+    const focused = this.focused();
+    if (focused.layout?.byNode.has(id) || focused.rootId === id) return focused;
+    for (const disk of this.disks) {
+      if (disk.layout?.byNode.has(id) || disk.rootId === id) return disk;
+    }
+    return null;
+  }
+
+  /**
+   * Arrow-key navigation over the disk (round 4), on the FOCUSED disk.
    *
    * The disk is a tree drawn as rings, so the four directions read off the
    * geometry directly: left/right walk the SIBLINGS in display order (the order
@@ -595,28 +855,29 @@ export class CanvasController {
    * the keyboard must have a way in that does not require a click first.
    */
   moveSelection(direction: 'prev' | 'next' | 'up' | 'down'): boolean {
-    const layout = this.layout;
+    const disk = this.focused();
+    const layout = disk.layout;
     const model = this.model;
     if (!layout || !model) return false;
 
     const current = this.selected ? layout.byNode.get(this.selected) : undefined;
     if (!current) {
-      const first = this.visibleRing(1)[0];
-      return first ? this.selectArc(first) : false;
+      const first = this.visibleRing(disk, 1)[0];
+      return first ? this.selectArc(disk, first) : false;
     }
 
     if (direction === 'up') {
       const parent = current.parentKey ? layout.byKey.get(current.parentKey) : undefined;
-      return parent && !this.isHiddenArc(parent) ? this.selectArc(parent) : false;
+      return parent && !this.isHiddenArc(parent) ? this.selectArc(disk, parent) : false;
     }
     if (direction === 'down') {
-      const child = this.visibleRing(current.ring + 1).find(
+      const child = this.visibleRing(disk, current.ring + 1).find(
         (arc) => arc.parentKey === current.key
       );
-      return child ? this.selectArc(child) : false;
+      return child ? this.selectArc(disk, child) : false;
     }
 
-    const siblings = this.visibleRing(current.ring).filter(
+    const siblings = this.visibleRing(disk, current.ring).filter(
       (arc) => arc.parentKey === current.parentKey && arc.parentNodeId === current.parentNodeId
     );
     if (siblings.length === 0) return false;
@@ -624,27 +885,29 @@ export class CanvasController {
     if (index < 0) return false;
     const step = direction === 'next' ? 1 : -1;
     const next = siblings[(index + step + siblings.length) % siblings.length]!;
-    return next === current ? false : this.selectArc(next);
+    return next === current ? false : this.selectArc(disk, next);
   }
 
-  /** Enter: re-root onto the selected wedge, which is the drill-in gesture. */
+  /** Enter: re-root the FOCUSED disk onto the selection — the drill-in. */
   enterSelected(): boolean {
     const id = this.selected;
-    if (!id || !this.model?.nodes.has(id) || id === this.rootId) return false;
-    this.setRoot(id);
+    const disk = this.focused();
+    if (!id || !this.model?.nodes.has(id) || id === disk.rootId) return false;
+    this.setDiskRoot(disk, id);
     return true;
   }
 
   /** Arcs of one ring in display order, minus the categories switched off. */
-  private visibleRing(ring: number): SunburstArc[] {
-    const arcs = this.layout?.byRing[ring] ?? [];
+  private visibleRing(disk: DiskState, ring: number): SunburstArc[] {
+    const arcs = disk.layout?.byRing[ring] ?? [];
     return arcs.filter((arc) => !this.isHiddenArc(arc));
   }
 
   /** Select the node an arc renders (a `+N` arc has none) and publish it. */
-  private selectArc(arc: SunburstArc): boolean {
+  private selectArc(disk: DiskState, arc: SunburstArc): boolean {
     const node = arc.nodeId ? this.model?.get(arc.nodeId) : undefined;
     if (!node) return false;
+    this.focusedDiskId = disk.id;
     this.selected = node.id;
     this.edgesDirty = true;
     this.requestDraw();
@@ -659,7 +922,7 @@ export class CanvasController {
    * (an old URL, a card's ancestor list) re-roots to what it all has in common.
    */
   getExpanded(): Set<string> {
-    return new Set([this.rootId]);
+    return new Set([this.primary().rootId]);
   }
 
   setExpanded(ids: Iterable<string>): void {
@@ -681,7 +944,8 @@ export class CanvasController {
    *
    * Ids the model doesn't know are dropped silently: a card saved before a
    * re-index can name a symbol that no longer exists, and that must degrade to
-   * "fewer glows", never to an error.
+   * "fewer glows", never to an error. The sets are NODE-level, so every disk
+   * projects them for itself and a card lights its answer wherever it is shown.
    */
   setHighlight(highlight: CanvasHighlight | null): void {
     const model = this.model;
@@ -709,11 +973,27 @@ export class CanvasController {
     this.requestDraw();
   }
 
-  /** Re-fit: reset zoom and pan so the whole disk is on screen. */
+  /**
+   * Re-fit: frame the WHOLE workspace, every disk included.
+   *
+   * With one disk this is the old "reset zoom and pan" exactly — the camera is
+   * anchored to the primary disk's centre, so a single disk at the origin needs
+   * `zoom = 1, pan = 0` to fill the free viewport, which is what `fitCamera`
+   * returns for it.
+   */
   fitView(): void {
-    this.zoom = 1;
-    this.panX = 0;
-    this.panY = 0;
+    const bounds = workspaceBounds(this.placements());
+    const camera = fitCamera(bounds, {
+      width: this.availableWidth(),
+      height: this.height,
+      padding: VIEW_PADDING,
+      baseScale: this.baseScale(),
+      zoomMin: ZOOM_MIN,
+      zoomMax: ZOOM_MAX,
+    });
+    this.zoom = camera.zoom;
+    this.panX = camera.panX;
+    this.panY = camera.panY;
     this.cameraMoved();
     this.requestDraw();
     this.emitSummary();
@@ -728,12 +1008,37 @@ export class CanvasController {
 
   // --------------------------------------------------------------- layout ---
 
-  private rebuildLayout(): void {
-    const model = this.model;
-    if (!model) return;
-    this.layout = computeSunburst(model, this.rootId, { sort: this.sortMode });
-    this.rootId = this.layout.rootId;
-    this.buildLabelGeometry();
+  /** The (cached) layout for a root under the current model and sort mode. */
+  private layoutFor(rootId: string): SunburstLayout {
+    const key = `${rootId}|${this.sortMode}`;
+    const cached = this.layoutCache.get(key);
+    if (cached) return cached;
+    const layout = computeSunburst(this.model!, rootId, { sort: this.sortMode });
+    this.layoutCache.set(key, layout);
+    // `computeSunburst` may fall back to the project root for an unknown id;
+    // cache the answer under the root it actually produced too.
+    this.layoutCache.set(`${layout.rootId}|${this.sortMode}`, layout);
+    return layout;
+  }
+
+  private rebuildAllLayouts(): void {
+    if (!this.model) return;
+    for (const disk of this.disks) {
+      disk.layout = this.layoutFor(disk.rootId);
+      disk.rootId = disk.layout.rootId;
+      this.buildLabelGeometry(disk);
+    }
+    this.projectHighlight();
+    this.edgesDirty = true;
+    this.requestDraw();
+    this.emitSummary();
+  }
+
+  private rebuildLayout(disk: DiskState): void {
+    if (!this.model) return;
+    disk.layout = this.layoutFor(disk.rootId);
+    disk.rootId = disk.layout.rootId;
+    this.buildLabelGeometry(disk);
     this.projectHighlight();
     this.edgesDirty = true;
     this.requestDraw();
@@ -748,16 +1053,16 @@ export class CanvasController {
    * half of the zoom fix — the other half is {@link drawLabels} not re-running
    * the fit while the camera is in motion.
    */
-  private buildLabelGeometry(): void {
-    this.labelGeom = [];
-    this.labelPlan = null;
-    const layout = this.layout;
+  private buildLabelGeometry(disk: DiskState): void {
+    disk.labelGeom = [];
+    disk.labelPlan = null;
+    const layout = disk.layout;
     if (!layout) return;
     for (const arc of layout.arcs) {
       const mid = (arc.a0 + arc.a1) / 2;
       const midRadius = (arc.r0 + arc.r1) / 2;
       const span = arc.a1 - arc.a0;
-      this.labelGeom.push({
+      disk.labelGeom.push({
         arc,
         mid,
         cos: Math.cos(mid),
@@ -786,39 +1091,65 @@ export class CanvasController {
   }
 
   /**
-   * Map highlighted NODE ids onto the arcs that actually render them.
+   * Map highlighted NODE ids onto the arcs that actually render them, in EVERY
+   * disk.
    *
    * A changed symbol inside a collapsed directory has no arc of its own, so its
    * rim is drawn on the deepest ancestor arc that IS on screen — otherwise a
-   * whole edit would silently vanish when the user zooms out.
+   * whole edit would silently vanish when the user zooms out. Running this per
+   * disk is what makes a card's highlight, the change rims and impact mode apply
+   * uniformly across the workspace for free.
    */
   private projectHighlight(): void {
-    this.resultArcs = new Set();
-    this.changedArcs = new Set();
-    this.impactedArcs = new Set();
-    this.impactModeArcs = new Set();
-    if (!this.layout) return;
-    const project = (ids: Set<string>, into: Set<string>): void => {
-      for (const id of ids) {
-        const arc = this.resolveArc(id);
+    this.focusArcsPresent = false;
+    for (const disk of this.disks) {
+      disk.resultArcs = new Set();
+      disk.changedArcs = new Set();
+      disk.impactedArcs = new Set();
+      disk.impactModeArcs = new Set();
+      if (!disk.layout) continue;
+      const project = (ids: Set<string>, into: Set<string>): void => {
+        for (const id of ids) {
+          const arc = this.resolveArc(disk, id);
+          if (arc) into.add(arc.key);
+        }
+      };
+      project(this.resultNodes, disk.resultArcs);
+      project(this.changedNodes, disk.changedArcs);
+      project(this.impactedNodes, disk.impactedArcs);
+      project(this.impactModeNodes, disk.impactModeArcs);
+      if (disk.resultArcs.size > 0 || disk.impactModeArcs.size > 0) this.focusArcsPresent = true;
+    }
+  }
+
+  /** Project the hover's connectivity onto every disk's own arcs. */
+  private projectHover(): void {
+    for (const disk of this.disks) {
+      if (!this.hoverNodes) {
+        disk.hoverArcs = null;
+        continue;
+      }
+      const into = new Set<string>();
+      for (const id of this.hoverNodes) {
+        const arc = this.resolveArc(disk, id);
         if (arc) into.add(arc.key);
       }
-    };
-    project(this.resultNodes, this.resultArcs);
-    project(this.changedNodes, this.changedArcs);
-    project(this.impactedNodes, this.impactedArcs);
-    project(this.impactModeNodes, this.impactModeArcs);
+      if (disk.id === this.hoveredDiskId && this.hoveredKey && this.hoveredKey !== CENTRE_KEY) {
+        into.add(this.hoveredKey);
+      }
+      disk.hoverArcs = into;
+    }
   }
 
   /**
-   * The deepest RENDERED arc standing in for a node.
+   * The deepest RENDERED arc of `disk` standing in for a node.
    *
-   * `null` means the centre — either the current root itself or something
+   * `null` means the centre — either that disk's root itself or something
    * outside its subtree entirely, which is exactly where such an edge should
    * appear to leave from.
    */
-  private resolveArc(id: string): SunburstArc | null {
-    const layout = this.layout;
+  private resolveArc(disk: DiskState, id: string): SunburstArc | null {
+    const layout = disk.layout;
     const model = this.model;
     if (!layout || !model) return null;
     const direct = layout.byNode.get(id);
@@ -847,28 +1178,39 @@ export class CanvasController {
 
   // ------------------------------------------------------------ transform ---
 
+  /** Free width, i.e. the viewport minus the floating card column. */
+  private availableWidth(): number {
+    const gutter = this.width > GUTTER_MIN_WIDTH ? PANEL_GUTTER : 0;
+    return Math.max(120, this.width - gutter);
+  }
+
   /**
-   * Where the disk sits with no pan applied.
+   * Where workspace `(0, 0)` sits with no pan applied.
    *
    * Biased right of centre: the cards / status column floats over the left of
    * the viewport, and a disk centred under it would be half-covered.
    */
   private centre(): Point {
     const gutter = this.width > GUTTER_MIN_WIDTH ? PANEL_GUTTER : 0;
-    const available = Math.max(120, this.width - gutter);
-    return { x: gutter + available / 2, y: this.height / 2 };
+    return { x: gutter + this.availableWidth() / 2, y: this.height / 2 };
   }
 
-  /** Scale that fits the disk in the space the floating panels leave free. */
-  private fitScale(): number {
-    const gutter = this.width > GUTTER_MIN_WIDTH ? PANEL_GUTTER : 0;
-    const available = Math.max(120, this.width - gutter);
-    const radius = Math.max(60, Math.min(available, this.height) / 2 - VIEW_PADDING);
-    return radius / (this.layout?.maxRadius ?? MAX_RADIUS);
+  /**
+   * Screen px per layout unit at zoom 1 — the scale that fits the PRIMARY disk
+   * in the space the floating panels leave free.
+   *
+   * Anchoring the base scale (and the origin) to the primary disk rather than to
+   * the workspace bounding box is deliberate: spawning a disk must not shove the
+   * picture the user is reading. Framing the whole workspace is what `fitView`
+   * is for, and it is an explicit gesture.
+   */
+  private baseScale(): number {
+    const radius = Math.max(60, Math.min(this.availableWidth(), this.height) / 2 - VIEW_PADDING);
+    return radius / (this.primary().layout?.maxRadius ?? MAX_RADIUS);
   }
 
   private scale(): number {
-    return this.fitScale() * this.zoom;
+    return this.baseScale() * this.zoom;
   }
 
   private origin(): Point {
@@ -876,10 +1218,18 @@ export class CanvasController {
     return { x: centre.x + this.panX, y: centre.y + this.panY };
   }
 
-  private toWorld(screenX: number, screenY: number): Point {
+  /** Screen → workspace. The disk-local step is `toDiskLocal` on top of this. */
+  private toWorkspace(screenX: number, screenY: number): Point {
     const origin = this.origin();
     const scale = this.scale();
     return { x: (screenX - origin.x) / scale, y: (screenY - origin.y) / scale };
+  }
+
+  /** Workspace → screen. */
+  private toScreen(point: Point): Point {
+    const origin = this.origin();
+    const scale = this.scale();
+    return { x: origin.x + point.x * scale, y: origin.y + point.y * scale };
   }
 
   // -------------------------------------------------------------- painting ---
@@ -890,7 +1240,7 @@ export class CanvasController {
       this.frame = null;
       if (this.disposed) return;
       this.draw();
-      if (this.transitionStart > 0) this.requestDraw();
+      if (this.disks.some((disk) => disk.transitionStart > 0)) this.requestDraw();
     });
   }
 
@@ -902,39 +1252,56 @@ export class CanvasController {
     ctx.fillStyle = BACKGROUND;
     ctx.fillRect(0, 0, this.width, this.height);
 
-    const layout = this.layout;
     const model = this.model;
-    if (!layout || !model) return;
-
-    // Re-root transition: pure scale + fade over a layout that never moves.
-    let progress = 1;
-    if (this.transitionStart > 0) {
-      progress = Math.min(1, (performance.now() - this.transitionStart) / TRANSITION_MS);
-      if (progress >= 1) this.transitionStart = 0;
-      // The re-root animation scales the whole disk frame by frame, which is a
-      // camera move by any other name — the labels ride the last plan through
-      // it and are re-planned once it lands.
-      this.cameraMoved();
-    }
-    const eased = 1 - Math.pow(1 - progress, 3);
-    const animationScale = this.transitionFrom + (1 - this.transitionFrom) * eased;
+    if (!model) return;
 
     if (this.edgesDirty) this.rebuildEdges();
 
     const origin = this.origin();
     const scale = this.scale();
+
+    for (const disk of this.disks) {
+      const layout = disk.layout;
+      if (!layout) continue;
+
+      // Re-root transition: pure scale + fade over a layout that never moves.
+      let progress = 1;
+      if (disk.transitionStart > 0) {
+        progress = Math.min(1, (performance.now() - disk.transitionStart) / TRANSITION_MS);
+        if (progress >= 1) disk.transitionStart = 0;
+        // The re-root animation scales the disk frame by frame, which is a
+        // camera move by any other name — the labels ride the last plan through
+        // it and are re-planned once it lands.
+        this.cameraMoved();
+      }
+      const eased = 1 - Math.pow(1 - progress, 3);
+      const animationScale = disk.transitionFrom + (1 - disk.transitionFrom) * eased;
+
+      ctx.save();
+      ctx.translate(origin.x + disk.x * scale, origin.y + disk.y * scale);
+      ctx.scale(scale * animationScale, scale * animationScale);
+      ctx.globalAlpha = progress < 1 ? 0.25 + 0.75 * eased : 1;
+
+      const k = scale * animationScale;
+      this.drawArcs(ctx, disk, layout, model, k);
+      this.drawCentre(ctx, disk, layout, k);
+      this.drawEdges(ctx, disk.id, k);
+      this.drawLabels(ctx, disk, model, k);
+
+      ctx.restore();
+    }
+
+    // Cross-disk relations live in workspace space and are drawn once, over the
+    // disks: a curve that vanished under an opaque wedge would claim a
+    // connection it never showed.
     ctx.save();
     ctx.translate(origin.x, origin.y);
-    ctx.scale(scale * animationScale, scale * animationScale);
-    ctx.globalAlpha = progress < 1 ? 0.25 + 0.75 * eased : 1;
-
-    const k = scale * animationScale;
-    this.drawArcs(ctx, layout, model, k);
-    this.drawCentre(ctx, layout, k);
-    this.drawEdges(ctx, k);
-    this.drawLabels(ctx, model, k);
-
+    ctx.scale(scale, scale);
+    this.drawEdges(ctx, null, scale);
     ctx.restore();
+
+    this.drawDiskChrome(ctx);
+    this.drawGhost(ctx);
 
     // Two things keep the frame loop alive on their own: the ⌘P pulse, and the
     // camera-settle window that owes the labels one more (full) pass.
@@ -956,11 +1323,13 @@ export class CanvasController {
 
   private drawArcs(
     ctx: CanvasRenderingContext2D,
+    disk: DiskState,
     layout: SunburstLayout,
     model: GraphModel,
     k: number
   ): void {
-    const pulseAlpha = this.pulseAlpha();
+    const pulseAlpha = disk.id === this.pulseDiskId ? this.pulseAlpha() : 0;
+    const focus = this.hasFocus();
     for (const arc of layout.arcs) {
       // A category switched off in the legend is not painted at all — it is not
       // dimmed, it is absent (its angular space stays, so nothing else moves).
@@ -970,10 +1339,10 @@ export class CanvasController {
       const a1 = arc.a1 - pad;
       if (a1 <= a0) continue;
 
-      const emphasised = this.isEmphasised(arc);
+      const emphasised = this.isEmphasised(disk, arc);
       let alpha = 0.94 - 0.055 * (arc.ring - 1);
       if (emphasised) alpha = 1;
-      else if (this.hasFocus()) alpha *= DIM_ALPHA;
+      else if (focus) alpha *= DIM_ALPHA;
 
       ctx.beginPath();
       ctx.arc(0, 0, arc.r0, a0, a1);
@@ -984,7 +1353,7 @@ export class CanvasController {
 
       // Outlines first, while the annulus is still the current path — the rim
       // below starts a path of its own and would otherwise be stroked twice.
-      if (this.resultArcs.has(arc.key)) {
+      if (disk.resultArcs.has(arc.key)) {
         ctx.strokeStyle = GLOW_RESULT;
         ctx.lineWidth = 1.6 / k;
         ctx.stroke();
@@ -993,7 +1362,7 @@ export class CanvasController {
         ctx.strokeStyle = '#ffffff';
         ctx.lineWidth = 2 / k;
         ctx.stroke();
-      } else if (arc.key === this.hoveredKey) {
+      } else if (disk.id === this.hoveredDiskId && arc.key === this.hoveredKey) {
         ctx.strokeStyle = 'rgba(255,255,255,0.75)';
         ctx.lineWidth = 1.4 / k;
         ctx.stroke();
@@ -1007,12 +1376,13 @@ export class CanvasController {
         ctx.stroke();
       }
 
-      if (this.changedArcs.has(arc.key)) this.strokeRim(ctx, arc, a0, a1, RIM_CHANGED, 2.8 / k);
-      else if (this.impactedArcs.has(arc.key)) {
+      if (disk.changedArcs.has(arc.key)) this.strokeRim(ctx, arc, a0, a1, RIM_CHANGED, 2.8 / k);
+      else if (disk.impactedArcs.has(arc.key)) {
         this.strokeRim(ctx, arc, a0, a1, RIM_IMPACTED, 2 / k);
       }
 
       this.drawChangeMarker(ctx, arc, a0, a1, alpha);
+      this.drawSpawnTick(ctx, arc, k);
     }
   }
 
@@ -1032,6 +1402,29 @@ export class CanvasController {
     }
     const phase = (elapsed / PULSE_MS) * PULSE_CYCLES * Math.PI;
     return Math.abs(Math.sin(phase)) * (1 - elapsed / PULSE_MS);
+  }
+
+  /**
+   * "Expanded elsewhere" — a short tick on the outer edge of a wedge the user
+   * dragged a disk out of, for as long as that disk exists.
+   *
+   * The source wedge is still a normal wedge; without the tick, a workspace of
+   * four disks gives no answer to "which of these came from where", and the only
+   * honest answer is on the wedge itself.
+   */
+  private drawSpawnTick(ctx: CanvasRenderingContext2D, arc: SunburstArc, k: number): void {
+    if (this.expandedAway.size === 0 || !arc.nodeId) return;
+    if (!this.expandedAway.has(arc.nodeId)) return;
+    const mid = (arc.a0 + arc.a1) / 2;
+    const length = Math.min(SPAWN_TICK_PX / k, (arc.r1 - arc.r0) * 0.7);
+    const cos = Math.cos(mid);
+    const sin = Math.sin(mid);
+    ctx.beginPath();
+    ctx.moveTo(cos * arc.r1, sin * arc.r1);
+    ctx.lineTo(cos * (arc.r1 - length), sin * (arc.r1 - length));
+    ctx.strokeStyle = SPAWN_TICK_COLOR;
+    ctx.lineWidth = 1.8 / k;
+    ctx.stroke();
   }
 
   /**
@@ -1075,14 +1468,16 @@ export class CanvasController {
    * Is this wedge part of what the user is currently looking AT?
    *
    * Three sources, all additive: a card's result, the hovered subtree (plus
-   * everything an edge connects it to), and the selection.
+   * everything an edge connects it to), and the selection. All three are keyed
+   * on the NODE, so a wedge lights in every disk that renders it — which is what
+   * "selection is global" means on screen.
    */
-  private isEmphasised(arc: SunburstArc): boolean {
-    if (this.resultArcs.has(arc.key)) return true;
-    if (this.impactModeArcs.has(arc.key)) return true;
+  private isEmphasised(disk: DiskState, arc: SunburstArc): boolean {
+    if (disk.resultArcs.has(arc.key)) return true;
+    if (disk.impactModeArcs.has(arc.key)) return true;
     if (this.selected !== null && arc.nodeId === this.selected) return true;
-    if (this.isUnderHover(arc)) return true;
-    return this.hoverConnectedArcs?.has(arc.key) ?? false;
+    if (this.isUnderHover(disk, arc)) return true;
+    return disk.hoverArcs?.has(arc.key) ?? false;
   }
 
   /**
@@ -1093,17 +1488,13 @@ export class CanvasController {
    * out at once, so "what does this touch" is answered by looking, not by
    * reading a list. Both use the same {@link DIM_ALPHA}, and neither animates.
    */
-  private isDimmed(arc: SunburstArc): boolean {
-    return this.hasFocus() && !this.isEmphasised(arc);
+  private isDimmed(disk: DiskState, arc: SunburstArc): boolean {
+    return this.hasFocus() && !this.isEmphasised(disk, arc);
   }
 
   /** Is anything focused right now — a card, an impact set, or a hover? */
   private hasFocus(): boolean {
-    return (
-      this.resultArcs.size > 0 ||
-      this.impactModeArcs.size > 0 ||
-      this.hoverConnectedArcs !== null
-    );
+    return this.focusArcsPresent || this.hoverNodes !== null;
   }
 
   /** Rim on the OUTER boundary: hot for changed, warm for impacted. */
@@ -1122,13 +1513,25 @@ export class CanvasController {
     ctx.stroke();
   }
 
-  private drawCentre(ctx: CanvasRenderingContext2D, layout: SunburstLayout, k: number): void {
+  private drawCentre(
+    ctx: CanvasRenderingContext2D,
+    disk: DiskState,
+    layout: SunburstLayout,
+    k: number
+  ): void {
+    const hoveredHere = disk.id === this.hoveredDiskId && this.hoveredKey === CENTRE_KEY;
     ctx.beginPath();
     ctx.arc(0, 0, layout.centreRadius - 3, 0, Math.PI * 2);
     ctx.fillStyle = CENTRE_FILL;
     ctx.fill();
-    ctx.strokeStyle = this.hoveredKey === CENTRE_KEY ? 'rgba(255,255,255,0.7)' : CENTRE_STROKE;
-    ctx.lineWidth = 1.4 / k;
+    // The focus ring only appears once there is more than one disk: with one
+    // disk "which disk has the keyboard" is not a question anyone is asking.
+    ctx.strokeStyle = hoveredHere
+      ? 'rgba(255,255,255,0.7)'
+      : this.disks.length > 1 && disk.id === this.focusedDiskId
+        ? FOCUS_RING
+        : CENTRE_STROKE;
+    ctx.lineWidth = (this.disks.length > 1 && disk.id === this.focusedDiskId ? 2 : 1.4) / k;
     ctx.stroke();
 
     // The centre names WHERE YOU ARE (round 2): the current root, prominent,
@@ -1159,10 +1562,12 @@ export class CanvasController {
     ctx.fillText(fitText(ctx, `${formatNumber(layout.rootLoc)} loc`, width), 0, (parent ? 14 : 10) / k);
   }
 
-  private drawEdges(ctx: CanvasRenderingContext2D, k: number): void {
+  /** Paint the relations belonging to one disk (`null` = the cross-disk set). */
+  private drawEdges(ctx: CanvasRenderingContext2D, diskId: string | null, k: number): void {
     if (this.drawnEdges.length === 0) return;
     ctx.lineCap = 'round';
     for (const drawn of this.drawnEdges) {
+      if (drawn.diskId !== diskId) continue;
       if (drawn.points.length < 2) continue;
       const hovered = drawn.edge.key === this.hoveredEdgeKey;
       ctx.beginPath();
@@ -1171,7 +1576,8 @@ export class CanvasController {
         ctx.lineTo(drawn.points[i]!.x, drawn.points[i]!.y);
       }
       // Colour is DIRECTION relative to the focused wedge (green in, amber
-      // out), never the edge kind — see `palette.ts`.
+      // out), never the edge kind — see `palette.ts`. A cross-disk curve obeys
+      // exactly the same rule; only the routing differs.
       const color = colorForEdgeDirection(drawn.direction);
       ctx.strokeStyle = withAlpha(color, hovered ? 0.98 : 0.68);
       ctx.lineWidth = (hovered ? 2.4 : 1.3) / k;
@@ -1190,21 +1596,26 @@ export class CanvasController {
    * when the user needs them: the dimmed ring is what they are navigating back
    * through. A dimmed label is drawn in quiet ink instead of hidden.
    */
-  private drawLabels(ctx: CanvasRenderingContext2D, model: GraphModel, k: number): void {
+  private drawLabels(
+    ctx: CanvasRenderingContext2D,
+    disk: DiskState,
+    model: GraphModel,
+    k: number
+  ): void {
     // While the camera is moving the last PLAN is replayed through arithmetic
     // gates only. Rebuilding it costs an orientation choice and a `measureText`
     // per candidate wedge, which at 60fps is exactly the judder the round-4
     // review reported; the gates below are a handful of multiplications and the
     // real pass runs the moment the gesture stops.
-    const reuse = this.cameraSettling() && this.labelPlan !== null;
-    const plan = reuse ? this.labelPlan! : this.buildLabelPlan(ctx, k);
-    if (!reuse) this.labelPlan = plan;
+    const reuse = this.cameraSettling() && disk.labelPlan !== null;
+    const plan = reuse ? disk.labelPlan! : this.buildLabelPlan(ctx, disk, k);
+    if (!reuse) disk.labelPlan = plan;
 
     for (const label of plan) {
       const arc = label.geom.arc;
       if (this.isHiddenArc(arc)) continue;
       if (reuse && !this.planStillFits(label, k)) continue;
-      const ink = this.isDimmed(arc) ? DIM_LABEL_COLOR : readableOn(this.fillFor(arc, model));
+      const ink = this.isDimmed(disk, arc) ? DIM_LABEL_COLOR : readableOn(this.fillFor(arc, model));
       // The plan's own font is kept while the camera moves: recomputing it would
       // miss the metrics cache on every bucket change, which is the cost this
       // whole path exists to avoid. The size only ever varies between 8 and
@@ -1216,9 +1627,13 @@ export class CanvasController {
   }
 
   /** The full label pass: one decision per wedge, at the current scale. */
-  private buildLabelPlan(ctx: CanvasRenderingContext2D, k: number): PlannedLabel[] {
+  private buildLabelPlan(
+    ctx: CanvasRenderingContext2D,
+    disk: DiskState,
+    k: number
+  ): PlannedLabel[] {
     const plan: PlannedLabel[] = [];
-    for (const geom of this.labelGeom) {
+    for (const geom of disk.labelGeom) {
       if (this.isHiddenArc(geom.arc)) continue;
       const label = this.planLabel(ctx, geom, k);
       if (label) plan.push(label);
@@ -1348,7 +1763,9 @@ export class CanvasController {
    * `measureText` answers in layout units; multiplying back by `k` gives a
    * number that depends only on the pair being cached. Font sizes are bucketed
    * to a half-pixel by the two `*FontPx` helpers, which is what keeps the cache
-   * from being a per-zoom-level miss on every entry.
+   * from being a per-zoom-level miss on every entry. The cache is per
+   * WORKSPACE, so a second disk pays nothing for names the first already
+   * measured.
    */
   private measurePx(
     ctx: CanvasRenderingContext2D,
@@ -1434,18 +1851,94 @@ export class CanvasController {
     return colorForNode(node, this.colorMode, model.layers);
   }
 
+  // ------------------------------------------------------- workspace chrome ---
+
+  /**
+   * The `×` on a hovered secondary disk, in SCREEN space so it keeps its size
+   * at every zoom. No transitions, like every other surface here.
+   */
+  private drawDiskChrome(ctx: CanvasRenderingContext2D): void {
+    if (this.disks.length < 2) return;
+    for (const disk of this.disks) {
+      if (disk.primary) continue;
+      const shown = this.hoveredDiskId === disk.id || this.closeHoverDiskId === disk.id;
+      if (!shown) continue;
+      const anchor = this.toScreen(
+        closeAnchor({
+          id: disk.id,
+          x: disk.x,
+          y: disk.y,
+          radius: disk.layout?.maxRadius ?? MAX_RADIUS,
+        })
+      );
+      const hot = this.closeHoverDiskId === disk.id;
+      ctx.beginPath();
+      ctx.arc(anchor.x, anchor.y, CLOSE_RADIUS_PX, 0, Math.PI * 2);
+      ctx.fillStyle = hot ? 'rgba(80, 30, 40, 0.95)' : 'rgba(20, 28, 44, 0.92)';
+      ctx.fill();
+      ctx.strokeStyle = hot ? '#f87171' : 'rgba(150, 175, 210, 0.7)';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+
+      const arm = CLOSE_RADIUS_PX * 0.42;
+      ctx.beginPath();
+      ctx.moveTo(anchor.x - arm, anchor.y - arm);
+      ctx.lineTo(anchor.x + arm, anchor.y + arm);
+      ctx.moveTo(anchor.x + arm, anchor.y - arm);
+      ctx.lineTo(anchor.x - arm, anchor.y + arm);
+      ctx.strokeStyle = hot ? '#fecaca' : 'rgba(215, 230, 250, 0.9)';
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+    }
+  }
+
+  /**
+   * The drag-away ghost: a circle outline and the node's name, following the
+   * cursor once the pointer has left the source disk.
+   *
+   * It appears exactly when the gesture becomes a spawn, which is the whole
+   * point — before the pointer crosses the rim the drag is still a no-op that
+   * falls back to a click, and showing a ghost then would promise a disk the
+   * release is not going to create.
+   */
+  private drawGhost(ctx: CanvasRenderingContext2D): void {
+    const drag = this.drag;
+    if (!drag || drag.mode !== 'wedge' || !drag.outside) return;
+    const radius = drag.preview
+      ? Math.max(24, Math.min(GHOST_RADIUS_PX * 3, drag.preview.maxRadius * this.scale()))
+      : GHOST_RADIUS_PX;
+    ctx.beginPath();
+    ctx.arc(drag.x, drag.y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = GHOST_FILL;
+    ctx.fill();
+    ctx.strokeStyle = GHOST_STROKE;
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([5, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#dbe4f2';
+    ctx.fillText(fitText(ctx, drag.label, radius * 1.9), drag.x, drag.y);
+  }
+
   // ---------------------------------------------------------------- edges ---
 
   /**
    * Is this arc the hovered one, or inside its subtree?
    *
    * Answered by walking the arc's own parent chain (at most `MAX_RINGS` steps)
-   * rather than expanding the hovered subtree, so it stays O(1) per arc.
+   * rather than expanding the hovered subtree, so it stays O(1) per arc. Only
+   * the hovered DISK answers by chain — the other disks light the same nodes
+   * through {@link projectHover}, which is a node-level question.
    */
-  private isUnderHover(arc: SunburstArc): boolean {
+  private isUnderHover(disk: DiskState, arc: SunburstArc): boolean {
     const hovered = this.hoveredKey;
     if (!hovered || hovered === CENTRE_KEY) return false;
-    const layout = this.layout;
+    if (disk.id !== this.hoveredDiskId) return false;
+    const layout = disk.layout;
     if (!layout) return false;
     let current: SunburstArc | undefined = arc;
     let guard = 0;
@@ -1464,13 +1957,16 @@ export class CanvasController {
    * hovered arc's subtree, the current selection, and the active card's
    * `edgeRefs` — and each is capped, because a hover over the project root
    * would otherwise ask for every edge in the graph.
+   *
+   * Phase G routes each relation ONCE: both endpoints are matched against every
+   * disk, the best match wins, and the edge is bundled inside a disk when the
+   * two agree or bowed across the gap when they do not.
    */
   private rebuildEdges(): void {
     this.edgesDirty = false;
     this.drawnEdges = [];
     const model = this.model;
-    const layout = this.layout;
-    if (!model || !layout) return;
+    if (!model) return;
 
     const wanted = new Map<string, ModelEdge>();
     // Direction is meaningful only against a FOCUS — the hovered wedge, else
@@ -1484,10 +1980,11 @@ export class CanvasController {
     }
     if (this.selected) this.collectEdges([this.selected], wanted, directions);
 
+    const hoverDisk = this.diskById(this.hoveredDiskId);
     const hoverEdges = new Map<string, ModelEdge>();
     const hoveredArc =
-      this.hoveredKey && this.hoveredKey !== CENTRE_KEY
-        ? (layout.byKey.get(this.hoveredKey) ?? null)
+      hoverDisk && this.hoveredKey && this.hoveredKey !== CENTRE_KEY
+        ? (hoverDisk.layout?.byKey.get(this.hoveredKey) ?? null)
         : null;
     if (hoveredArc) {
       this.collectEdges(
@@ -1501,25 +1998,106 @@ export class CanvasController {
       }
     }
 
-    // Everything the hover reaches — the dimming set. Both endpoints are mapped
-    // onto the arcs that actually render them, so a relation into a folded
-    // subtree still lights the arc standing in for it.
-    this.hoverConnectedArcs = hoveredArc ? new Set<string>([hoveredArc.key]) : null;
-
-    for (const [key, edge] of wanted) {
-      const from = this.resolveArc(edge.source);
-      const to = this.resolveArc(edge.target);
-      if (this.hoverConnectedArcs && hoverEdges.has(key)) {
-        if (from) this.hoverConnectedArcs.add(from.key);
-        if (to) this.hoverConnectedArcs.add(to.key);
+    // Everything the hover reaches — the dimming set, at NODE level so every
+    // disk can project it onto whatever arc stands in for the node there.
+    if (hoveredArc) {
+      const nodes = new Set<string>();
+      if (hoveredArc.nodeId) nodes.add(hoveredArc.nodeId);
+      for (const id of hoveredArc.aggregated) nodes.add(id);
+      for (const edge of hoverEdges.values()) {
+        nodes.add(edge.source);
+        nodes.add(edge.target);
       }
-      if (!from && !to) continue;
-      if (from && to && from.key === to.key) continue;
-      const points = bundleCurve(bundleControlPoints(from, to, layout));
-      if (points.length >= 2) {
-        this.drawnEdges.push({ edge, points, direction: directions.get(key) ?? 'neutral' });
-      }
+      this.hoverNodes = nodes;
+    } else {
+      this.hoverNodes = null;
     }
+
+    const preferred = this.hoveredDiskId ?? this.focusedDiskId;
+    for (const edge of wanted.values()) {
+      const from = this.pickEndpoint(edge.source, preferred);
+      const to = this.pickEndpoint(edge.target, preferred);
+      if (!from.disk && !to.disk) continue;
+      const fromDisk = from.disk ?? to.disk!;
+      const toDisk = to.disk ?? from.disk!;
+      const direction = directions.get(edge.key) ?? 'neutral';
+
+      if (fromDisk === toDisk) {
+        if (from.arc && to.arc && from.arc.key === to.arc.key) continue;
+        const layout = fromDisk.layout;
+        if (!layout) continue;
+        const points = bundleCurve(bundleControlPoints(from.arc, to.arc, layout));
+        if (points.length >= 2) {
+          this.drawnEdges.push({ edge, points, direction, diskId: fromDisk.id });
+        }
+        continue;
+      }
+
+      const points = crossDiskCurve(
+        anchorOf(fromDisk, from.arc),
+        anchorOf(toDisk, to.arc)
+      );
+      this.drawnEdges.push({ edge, points, direction, diskId: null });
+    }
+
+    this.projectHover();
+  }
+
+  /**
+   * How well one disk can show a node, so an edge can be routed to the disk
+   * that shows its endpoint BEST.
+   *
+   * The ladder matters: a node with an arc of its own beats one folded into a
+   * `+N`, which beats a disk that only renders an ancestor, which beats a disk
+   * that has nothing but its centre to attach to. Score 0 means the node is
+   * outside this disk's subtree altogether — the disk does not show it at all,
+   * so it cannot claim the edge.
+   */
+  private endpointIn(disk: DiskState, nodeId: string): { score: number; arc: SunburstArc | null } {
+    const layout = disk.layout;
+    const model = this.model;
+    if (!layout || !model) return { score: 0, arc: null };
+    const direct = layout.byNode.get(nodeId);
+    if (direct) return { score: 4, arc: direct };
+    const folded = layout.aggregatedInto.get(nodeId);
+    if (folded) return { score: 3, arc: folded };
+    // The disk's own root has no arc — the centre circle IS its wedge.
+    if (nodeId === disk.rootId) return { score: 3, arc: null };
+    for (const ancestor of model.ancestors(nodeId)) {
+      const arc = layout.byNode.get(ancestor);
+      if (arc) return { score: 2, arc };
+      const aggregate = layout.aggregatedInto.get(ancestor);
+      if (aggregate) return { score: 2, arc: aggregate };
+      if (ancestor === disk.rootId) return { score: 1, arc: null };
+    }
+    return { score: 0, arc: null };
+  }
+
+  /**
+   * The disk that shows a node best. Ties go to the disk the hover (else the
+   * focus) came from, then to creation order — so the routing is deterministic
+   * and an edge never flickers between two disks that show the same wedge.
+   */
+  private pickEndpoint(
+    nodeId: string,
+    preferredDiskId: string | null
+  ): { disk: DiskState | null; arc: SunburstArc | null; score: number } {
+    let best: { disk: DiskState | null; arc: SunburstArc | null; score: number } = {
+      disk: null,
+      arc: null,
+      score: 0,
+    };
+    for (const disk of this.disks) {
+      const found = this.endpointIn(disk, nodeId);
+      if (found.score === 0) continue;
+      const wins =
+        found.score > best.score ||
+        (found.score === best.score &&
+          disk.id === preferredDiskId &&
+          best.disk?.id !== preferredDiskId);
+      if (wins) best = { disk, arc: found.arc, score: found.score };
+    }
+    return best;
   }
 
   /**
@@ -1584,34 +2162,170 @@ export class CanvasController {
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   }
 
+  /** The disk under a SCREEN point, and that point in its local space. */
+  private diskUnder(screen: Point): { disk: DiskState; local: Point } | null {
+    const workspace = this.toWorkspace(screen.x, screen.y);
+    const placement = diskAt(this.placements(), workspace);
+    if (!placement) return null;
+    const disk = this.diskById(placement.id);
+    if (!disk) return null;
+    return { disk, local: toDiskLocal(workspace, placement) };
+  }
+
+  /** The secondary disk whose `×` a screen point is on, if any. */
+  private closeButtonUnder(screen: Point): DiskState | null {
+    if (this.disks.length < 2) return null;
+    for (const disk of this.disks) {
+      if (disk.primary) continue;
+      const anchor = this.toScreen(
+        closeAnchor({
+          id: disk.id,
+          x: disk.x,
+          y: disk.y,
+          radius: disk.layout?.maxRadius ?? MAX_RADIUS,
+        })
+      );
+      if (Math.hypot(screen.x - anchor.x, screen.y - anchor.y) <= CLOSE_HIT_PX) return disk;
+    }
+    return null;
+  }
+
   private readonly onPointerMove = (event: PointerEvent): void => {
     const position = this.pointerPosition(event);
-    if (this.dragging) {
-      const dx = position.x - this.dragX;
-      const dy = position.y - this.dragY;
-      if (!this.dragMoved && Math.hypot(dx, dy) < DRAG_SLOP) return;
-      this.dragMoved = true;
-      this.panX += dx;
-      this.panY += dy;
-      this.dragX = position.x;
-      this.dragY = position.y;
-      this.cameraMoved();
-      this.requestDraw();
+    const drag = this.drag;
+    if (drag) {
+      const dx = position.x - drag.lastX;
+      const dy = position.y - drag.lastY;
+      drag.x = position.x;
+      drag.y = position.y;
+      if (!drag.moved && Math.hypot(position.x - drag.startX, position.y - drag.startY) < DRAG_SLOP) {
+        return;
+      }
+      drag.moved = true;
+      drag.lastX = position.x;
+      drag.lastY = position.y;
+
+      if (drag.mode === 'pan') {
+        this.panX += dx;
+        this.panY += dy;
+        this.cameraMoved();
+        this.requestDraw();
+        return;
+      }
+      if (drag.mode === 'move-disk') {
+        const disk = this.diskById(drag.diskId);
+        if (disk) {
+          const scale = this.scale();
+          disk.x += dx / scale;
+          disk.y += dy / scale;
+          this.edgesDirty = true;
+          this.requestDraw();
+        }
+        return;
+      }
+      if (drag.mode === 'wedge') {
+        this.updateWedgeDrag(drag, position);
+        return;
+      }
       return;
     }
-    if (this.transitionStart > 0) return;
-    this.updateHover(position.x, position.y);
+    if (this.disks.some((disk) => disk.transitionStart > 0)) return;
+    this.updateHover(position);
   };
 
+  /**
+   * The spawn threshold: has the pointer left the source disk?
+   *
+   * Crossing the disk's own outer radius is the gesture, not a pixel distance —
+   * "I pulled this out of there" is a spatial claim, and the rim is where the
+   * user sees the disk end. Coming back inside cancels it again, so the gesture
+   * is reversible right up to the release.
+   */
+  private updateWedgeDrag(drag: DragState, position: Point): void {
+    const disk = this.diskById(drag.diskId);
+    if (!disk) return;
+    const workspace = this.toWorkspace(position.x, position.y);
+    const radius = disk.layout?.maxRadius ?? MAX_RADIUS;
+    const distance = Math.hypot(workspace.x - disk.x, workspace.y - disk.y);
+    const outside = distance > radius;
+    if (outside && !drag.preview && drag.nodeId && this.model) {
+      // One layout, computed the moment the ghost appears (and cached, so the
+      // drop itself is free) — the preview circle is then the disk's real size.
+      drag.preview = this.layoutFor(drag.nodeId);
+    }
+    drag.outside = outside;
+    this.canvas.style.cursor = outside ? 'copy' : 'grabbing';
+    this.requestDraw();
+  }
+
+  /**
+   * Where a gesture is decided. Three of them share the canvas, and the
+   * ambiguity is resolved entirely by WHAT IS UNDER THE POINTER AT PRESS TIME:
+   *
+   *  - a wedge that renders a node → a **spawn** candidate. It becomes a spawn
+   *    only if the pointer crosses the disk's outer radius before release;
+   *    otherwise it is a no-op and the click underneath does the selecting.
+   *  - anywhere else inside a disk — the centre circle, the gaps between
+   *    wedges, a `+N` fold arc, a wedge whose category the legend switched off
+   *    → **move that disk**. Anything that is not a wedge is grab-able, which
+   *    is the robust reading: the alternative (a dedicated handle) is a target
+   *    the user has to find.
+   *  - empty canvas → **pan** the workspace camera, unchanged from phase F.
+   *  - a secondary disk's `×` → close it on release.
+   *
+   * Pressing anywhere inside a disk also FOCUSES it, so the keyboard follows
+   * the pointer without a second gesture.
+   */
   private readonly onPointerDown = (event: PointerEvent): void => {
     if (event.button !== 0) return;
     const position = this.pointerPosition(event);
-    this.dragging = true;
-    this.dragMoved = false;
-    this.dragX = position.x;
-    this.dragY = position.y;
-    // Capture so a pan that leaves the canvas keeps tracking. Both calls are
-    // guarded: releasing a pointer the browser already released throws.
+
+    const base: DragState = {
+      mode: 'pan',
+      moved: false,
+      lastX: position.x,
+      lastY: position.y,
+      startX: position.x,
+      startY: position.y,
+      x: position.x,
+      y: position.y,
+      diskId: null,
+      nodeId: null,
+      label: '',
+      outside: false,
+      preview: null,
+    };
+
+    const closing = this.closeButtonUnder(position);
+    if (closing) {
+      this.drag = { ...base, mode: 'close', diskId: closing.id };
+    } else {
+      const hit = this.diskUnder(position);
+      if (!hit) {
+        this.drag = base;
+      } else {
+        const refocused = this.focusedDiskId !== hit.disk.id;
+        this.focusedDiskId = hit.disk.id;
+        if (refocused) this.emitSummary();
+        const layout = hit.disk.layout;
+        const arc = layout ? this.hitArc(layout, hit.local.x, hit.local.y) : null;
+        if (arc?.nodeId) {
+          this.drag = {
+            ...base,
+            mode: 'wedge',
+            diskId: hit.disk.id,
+            nodeId: arc.nodeId,
+            label: this.model?.get(arc.nodeId)?.name ?? arc.label,
+          };
+        } else {
+          this.drag = { ...base, mode: 'move-disk', diskId: hit.disk.id };
+        }
+        this.requestDraw();
+      }
+    }
+
+    // Capture so a gesture that leaves the canvas keeps tracking. Both calls
+    // are guarded: releasing a pointer the browser already released throws.
     try {
       this.canvas.setPointerCapture(event.pointerId);
     } catch {
@@ -1620,19 +2334,44 @@ export class CanvasController {
   };
 
   private readonly onPointerUp = (event: PointerEvent): void => {
-    if (!this.dragging) return;
-    this.dragging = false;
-    this.suppressClick = this.dragMoved;
+    const drag = this.drag;
+    this.drag = null;
     try {
       this.canvas.releasePointerCapture(event.pointerId);
     } catch {
       /* already released (pointercancel) */
     }
+    if (!drag) return;
+    const position = this.pointerPosition(event);
+    this.canvas.style.cursor = 'default';
+
+    if (drag.mode === 'close') {
+      const still = this.closeButtonUnder(position);
+      this.suppressClick = true;
+      if (still && still.id === drag.diskId) this.closeDisk(drag.diskId);
+      return;
+    }
+
+    if (drag.mode === 'wedge') {
+      if (drag.moved && drag.outside && drag.nodeId) {
+        this.spawnDisk(drag.nodeId, this.toWorkspace(position.x, position.y), drag.preview);
+        this.suppressClick = true;
+        return;
+      }
+      // A drag that never left the disk is a no-op: the click that follows does
+      // the selecting, exactly as if the pointer had never moved.
+      this.suppressClick = false;
+      this.requestDraw();
+      return;
+    }
+
+    this.suppressClick = drag.moved;
   };
 
   private readonly onPointerLeave = (): void => {
-    this.dragging = false;
-    this.setHover(null, null);
+    this.drag = null;
+    this.closeHoverDiskId = null;
+    this.setHover(null, null, null);
   };
 
   private readonly onClick = (event: MouseEvent): void => {
@@ -1640,22 +2379,33 @@ export class CanvasController {
       this.suppressClick = false;
       return;
     }
+    const model = this.model;
+    if (!model) return;
+    const position = this.pointerPosition(event);
+    const hit = this.diskUnder(position);
+    if (!hit) {
+      this.selected = null;
+      this.edgesDirty = true;
+      this.requestDraw();
+      this.callbacks.onSelect(null);
+      return;
+    }
+    const { disk, local } = hit;
     // A click landing mid-transition would be hit-tested against the settled
     // geometry while the user is looking at the animating one. It also makes
     // the second click of a double-click on a directory re-root twice.
-    if (this.transitionStart > 0) return;
-    const model = this.model;
-    const layout = this.layout;
-    if (!model || !layout) return;
-    const position = this.pointerPosition(event);
-    const world = this.toWorld(position.x, position.y);
+    if (disk.transitionStart > 0) return;
+    const layout = disk.layout;
+    if (!layout) return;
+    this.focusedDiskId = disk.id;
 
-    if (Math.hypot(world.x, world.y) <= layout.centreRadius) {
-      this.rootUp();
+    if (Math.hypot(local.x, local.y) <= layout.centreRadius) {
+      const parent = model.get(disk.rootId)?.parent;
+      if (parent) this.setDiskRoot(disk, parent);
       return;
     }
 
-    const arc = this.hitArc(layout, world.x, world.y);
+    const arc = this.hitArc(layout, local.x, local.y);
     if (!arc) {
       this.selected = null;
       this.edgesDirty = true;
@@ -1668,14 +2418,14 @@ export class CanvasController {
       // A `+N` fold arc: re-rooting onto its parent gives the folded
       // children the full circle. At ring 1 the parent IS the root, so there is
       // nowhere further to go — ⌘P is the way in, and the tooltip says so.
-      if (arc.parentNodeId !== this.rootId) this.setRoot(arc.parentNodeId);
+      if (arc.parentNodeId !== disk.rootId) this.setDiskRoot(disk, arc.parentNodeId);
       return;
     }
 
     const node = model.get(arc.nodeId);
     if (!node) return;
     if (node.kind === DIRECTORY_KIND) {
-      this.setRoot(node.id);
+      this.setDiskRoot(disk, node.id);
       return;
     }
     this.selected = node.id;
@@ -1686,29 +2436,29 @@ export class CanvasController {
 
   /** Double-click drills into anything with children — files included. */
   private readonly onDoubleClick = (event: MouseEvent): void => {
-    const layout = this.layout;
     const model = this.model;
-    if (!layout || !model) return;
+    if (!model) return;
+    const position = this.pointerPosition(event);
+    const hit = this.diskUnder(position);
+    if (!hit?.disk.layout) return;
     // Double-clicking a DIRECTORY already re-rooted on the first click; the
     // arc now under the cursor belongs to a different level entirely.
-    if (performance.now() - this.rootChangedAt < 450) return;
-    const position = this.pointerPosition(event);
-    const world = this.toWorld(position.x, position.y);
-    const arc = this.hitArc(layout, world.x, world.y);
+    if (performance.now() - hit.disk.rootChangedAt < 450) return;
+    const arc = this.hitArc(hit.disk.layout, hit.local.x, hit.local.y);
     if (!arc?.nodeId) return;
     if (model.childrenOf(arc.nodeId).length === 0) return;
-    this.setRoot(arc.nodeId);
+    this.setDiskRoot(hit.disk, arc.nodeId);
   };
 
   private readonly onWheel = (event: WheelEvent): void => {
     event.preventDefault();
     const position = this.pointerPosition(event);
-    const before = this.toWorld(position.x, position.y);
+    const before = this.toWorkspace(position.x, position.y);
     const factor = Math.exp(-event.deltaY * 0.0015);
     const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, this.zoom * factor));
     if (next === this.zoom) return;
     this.zoom = next;
-    // Keep the world point under the cursor pinned to the cursor.
+    // Keep the workspace point under the cursor pinned to the cursor.
     const centre = this.centre();
     const scale = this.scale();
     this.panX = position.x - before.x * scale - centre.x;
@@ -1718,10 +2468,22 @@ export class CanvasController {
     this.emitSummary();
   };
 
-  private updateHover(screenX: number, screenY: number): void {
-    const layout = this.layout;
-    if (!layout) return;
-    const world = this.toWorld(screenX, screenY);
+  private updateHover(position: Point): void {
+    const closeHover = this.closeButtonUnder(position);
+    if (closeHover?.id !== this.closeHoverDiskId) {
+      this.closeHoverDiskId = closeHover?.id ?? null;
+      this.requestDraw();
+    }
+    if (closeHover) {
+      // The `×` sits ON its disk's rim, so the disk stays hovered (that is what
+      // keeps the button on screen) but the WEDGE hover goes: the pointer is on
+      // a button now, and a tooltip about the arc underneath is a lie.
+      this.setHover(closeHover.id, null, null);
+      this.canvas.style.cursor = 'pointer';
+      return;
+    }
+
+    const workspace = this.toWorkspace(position.x, position.y);
 
     // Edges are only hit-tested among the ones already on screen, and they do
     // NOT steal the arc hover — otherwise hovering an arc would reveal an edge
@@ -1731,7 +2493,10 @@ export class CanvasController {
       const tolerance = 5 / this.scale();
       let best = tolerance;
       for (const drawn of this.drawnEdges) {
-        const distance = distanceToPolyline(drawn.points, world.x, world.y);
+        const owner = drawn.diskId ? this.diskById(drawn.diskId) : null;
+        const x = owner ? workspace.x - owner.x : workspace.x;
+        const y = owner ? workspace.y - owner.y : workspace.y;
+        const distance = distanceToPolyline(drawn.points, x, y);
         if (distance < best) {
           best = distance;
           edgeKey = drawn.edge.key;
@@ -1739,12 +2504,17 @@ export class CanvasController {
       }
     }
 
-    const radius = Math.hypot(world.x, world.y);
+    const hit = this.diskUnder(position);
+    if (!hit?.disk.layout) {
+      this.setHover(null, null, edgeKey);
+      return;
+    }
+    const radius = Math.hypot(hit.local.x, hit.local.y);
     const arcKey =
-      radius <= layout.centreRadius
+      radius <= hit.disk.layout.centreRadius
         ? CENTRE_KEY
-        : (this.hitArc(layout, world.x, world.y)?.key ?? null);
-    this.setHover(arcKey, edgeKey, screenX, screenY);
+        : (this.hitArc(hit.disk.layout, hit.local.x, hit.local.y)?.key ?? null);
+    this.setHover(hit.disk.id, arcKey, edgeKey, position.x, position.y);
   }
 
   /**
@@ -1752,13 +2522,20 @@ export class CanvasController {
    * move: a tooltip that re-renders the React chrome 60 times a second is how
    * a canvas app ends up feeling slower than the canvas is.
    */
-  private setHover(arcKey: string | null, edgeKey: string | null, x = 0, y = 0): void {
-    const arcChanged = arcKey !== this.hoveredKey;
+  private setHover(
+    diskId: string | null,
+    arcKey: string | null,
+    edgeKey: string | null,
+    x = 0,
+    y = 0
+  ): void {
+    const arcChanged = arcKey !== this.hoveredKey || diskId !== this.hoveredDiskId;
     const edgeChanged = edgeKey !== this.hoveredEdgeKey;
     if (!arcChanged && !edgeChanged) return;
+    this.hoveredDiskId = diskId;
     this.hoveredKey = arcKey;
     this.hoveredEdgeKey = edgeKey;
-    this.canvas.style.cursor = arcKey ? 'pointer' : 'default';
+    this.canvas.style.cursor = arcKey ? 'pointer' : diskId ? 'grab' : 'default';
     if (arcChanged) this.edgesDirty = true;
     this.emitTooltips(x, y);
     this.requestDraw();
@@ -1766,8 +2543,11 @@ export class CanvasController {
 
   private emitTooltips(x: number, y: number): void {
     const model = this.model;
-    const layout = this.layout;
-    if (!model || !layout) return;
+    const disk = this.diskById(this.hoveredDiskId);
+    if (!model || !disk?.layout) {
+      this.callbacks.onArcTooltip(null);
+      return;
+    }
 
     // An edge under the pointer highlights its rope and NOTHING else — phase F
     // removed the edge tooltip outright (see `CanvasCallbacks.onArcTooltip`).
@@ -1775,7 +2555,7 @@ export class CanvasController {
       this.callbacks.onArcTooltip(null);
       return;
     }
-    const arc = layout.byKey.get(this.hoveredKey);
+    const arc = disk.layout.byKey.get(this.hoveredKey);
     if (!arc) {
       this.callbacks.onArcTooltip(null);
       return;
@@ -1799,32 +2579,44 @@ export class CanvasController {
 
   private emitSummary(): void {
     const model = this.model;
-    const layout = this.layout;
-    if (!model || !layout) return;
+    if (!model) return;
+    const focused = this.focused();
+    if (!focused.layout) return;
     const present = new Set<string>();
-    for (const arc of layout.arcs) {
-      if (!arc.nodeId) continue;
-      const node = model.get(arc.nodeId);
-      if (!node) continue;
-      if (this.colorMode !== 'layer') {
-        present.add(node.kind);
-        continue;
+    let arcs = 0;
+    let rings = 0;
+    let truncated = false;
+    for (const disk of this.disks) {
+      const layout = disk.layout;
+      if (!layout) continue;
+      arcs += layout.arcs.length;
+      if (layout.rings > rings) rings = layout.rings;
+      truncated ||= layout.truncated;
+      for (const arc of layout.arcs) {
+        if (!arc.nodeId) continue;
+        const node = model.get(arc.nodeId);
+        if (!node) continue;
+        if (this.colorMode !== 'layer') {
+          present.add(node.kind);
+          continue;
+        }
+        // In the layer mode a directory is grey, not "no layer" — it gets its
+        // own legend row so the two greys/teals can't be confused (phase F).
+        present.add(node.kind === DIRECTORY_KIND ? DIRECTORY_LEGEND_KEY : (node.layer ?? ''));
       }
-      // In the layer mode a directory is grey, not "no layer" — it gets its own
-      // legend row so the two greys/teals can't be confused (phase F).
-      present.add(node.kind === DIRECTORY_KIND ? DIRECTORY_LEGEND_KEY : (node.layer ?? ''));
     }
     this.emittedEdges = this.drawnEdges.length;
     this.callbacks.onViewChange({
-      arcs: layout.arcs.length,
-      rings: layout.rings,
-      truncated: layout.truncated,
+      arcs,
+      rings,
+      truncated,
       visibleEdges: this.drawnEdges.length,
       presentColorKeys: [...present],
       edgeKinds: [...model.edgeKinds],
       enabledKinds: [...this.enabledKinds],
-      breadcrumb: layout.trail.map((node) => ({ id: node.id, name: node.name })),
+      breadcrumb: focused.layout.trail.map((node) => ({ id: node.id, name: node.name })),
       zoom: this.zoom,
+      disks: this.disks.length,
     });
   }
 }
@@ -1832,8 +2624,47 @@ export class CanvasController {
 /** Pseudo arc key for the centre disk, so hover has one vocabulary. */
 const CENTRE_KEY = '@centre';
 
+/** The one disk the URL describes; it exists for the session's whole life. */
+const PRIMARY_DISK_ID = 'primary';
+
 /** The render budget, re-exported so the chrome can show `arcs / budget`. */
 export { MAX_ARCS as ARC_BUDGET };
+
+function makeDisk(
+  id: string,
+  rootId: string,
+  x: number,
+  y: number,
+  primary: boolean,
+  source: string | null
+): DiskState {
+  return {
+    id,
+    rootId,
+    x,
+    y,
+    primary,
+    source,
+    layout: null,
+    labelGeom: [],
+    labelPlan: null,
+    resultArcs: new Set(),
+    changedArcs: new Set(),
+    impactedArcs: new Set(),
+    impactModeArcs: new Set(),
+    hoverArcs: null,
+    transitionStart: 0,
+    transitionFrom: 1,
+    rootChangedAt: -Infinity,
+  };
+}
+
+/** Workspace point an edge attaches to: a wedge's centroid, else the centre. */
+function anchorOf(disk: DiskState, arc: SunburstArc | null): Point {
+  if (!arc) return { x: disk.x, y: disk.y };
+  const centroid = arcCentroid(arc);
+  return { x: disk.x + centroid.x, y: disk.y + centroid.y };
+}
 
 /**
  * Label font sizes, in SCREEN px, **bucketed to a half pixel**.
