@@ -34,11 +34,14 @@ import {
   PROJECT_VIEW_ID,
 } from '@/components/cards/cards-panel';
 import { FeedbackDialog, type FeedbackNode } from '@/components/feedback-dialog';
+import { CodePanel } from '@/components/graph/code-panel';
 import { GraphCanvas } from '@/components/graph/graph-canvas';
+import { LegendPanel } from '@/components/graph/legend-panel';
 import { NodePanel } from '@/components/graph/node-panel';
 import { StatusPanel } from '@/components/graph/status-panel';
-import type { CanvasController } from '@/graph/canvas-controller';
-import { ROOT_ID, type GraphModel, type ModelNode } from '@/graph/model';
+import type { CanvasController, ViewSummary } from '@/graph/canvas-controller';
+import { DIRECTORY_KIND, ROOT_ID, type GraphModel, type ModelNode } from '@/graph/model';
+import { useNodeDetail } from '@/graph/use-node-detail';
 import type { ColorMode } from '@/graph/palette';
 import { DEFAULT_SORT_MODE, toSortMode, type SortMode } from '@/graph/sunburst';
 import { useGraphData } from '@/graph/use-graph-data';
@@ -73,6 +76,17 @@ export default function App() {
   // they would share with someone else.
   const [sortMode, setSortMode] = useState<SortMode>(DEFAULT_SORT_MODE);
   const [selectedNode, setSelectedNode] = useState<ModelNode | null>(null);
+  // The two right-hand panels COLLAPSE rather than close (phase F): folding one
+  // away must not throw the selection out, and the state has to survive picking
+  // a different node — a reader who folded the code away wants it to stay
+  // folded while they walk the graph.
+  const [nodePanelCollapsed, setNodePanelCollapsed] = useState(false);
+  const [codePanelCollapsed, setCodePanelCollapsed] = useState(false);
+  /** Colour keys currently on the disk — the LEGEND's only input. */
+  const [colorKeys, setColorKeys] = useState<string[]>([]);
+  const colorKeysRef = useRef('');
+
+  const detailState = useNodeDetail(selectedNode);
 
   const [changes, setChanges] = useState<ChangesPayload | null>(null);
   const [changesError, setChangesError] = useState<string | null>(null);
@@ -318,6 +332,22 @@ export default function App() {
     scheduleUrlUpdate();
   }, [activeId, colorMode, scheduleUrlUpdate]);
 
+  /**
+   * The canvas reports a view summary on every re-root, re-fit and edge redraw.
+   * Only ONE thing in it belongs to React — the colour keys the legend lists —
+   * so the rest is dropped here rather than re-rendering the shell on hover.
+   */
+  const handleViewChange = useCallback(
+    (summary: ViewSummary) => {
+      scheduleUrlUpdate();
+      const key = summary.presentColorKeys.join('|');
+      if (key === colorKeysRef.current) return;
+      colorKeysRef.current = key;
+      setColorKeys(summary.presentColorKeys);
+    },
+    [scheduleUrlUpdate]
+  );
+
   useEffect(
     () => () => {
       if (urlTimer.current !== null) window.clearTimeout(urlTimer.current);
@@ -327,18 +357,55 @@ export default function App() {
 
   // ------------------------------------------------------------ commands ---
 
-  // Cmd/Ctrl+P opens the palette. Captured on the window because the canvas is
-  // a bitmap surface with no focusable children to hang a handler on.
+  /** Drop the selection and, with it, both right-hand panels. */
+  const clearSelection = useCallback(() => {
+    controllerRef.current?.setSelected(null);
+    setSelectedNode(null);
+  }, []);
+
+  /**
+   * Global keyboard handling. Both shortcuts are captured on the WINDOW: the
+   * canvas is a bitmap surface with no focusable children, and — the phase F
+   * bug — a dialog's own React `onKeyDown` only fires while the DOM focus
+   * happens to sit inside that dialog, which is not something the shell can
+   * guarantee. Escape now has ONE owner and a fixed priority:
+   *
+   *   1. the ⌘P palette, 2. settings, 3. the feedback export, 4. the selection.
+   *
+   * Nothing happens when none of those is up — Escape never navigates.
+   */
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 'p') {
         event.preventDefault();
         setPaletteOpen(true);
+        return;
+      }
+      if (event.key !== 'Escape') return;
+      if (paletteOpen) {
+        event.preventDefault();
+        setPaletteOpen(false);
+        return;
+      }
+      if (settingsOpen) {
+        event.preventDefault();
+        setSettingsOpen(false);
+        void refreshSettings();
+        return;
+      }
+      if (feedbackOpen) {
+        event.preventDefault();
+        setFeedbackOpen(false);
+        return;
+      }
+      if (selectedNode) {
+        event.preventDefault();
+        clearSelection();
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [paletteOpen, settingsOpen, feedbackOpen, selectedNode, clearSelection, refreshSettings]);
 
   /** Select a node and bring it on screen — used by the palette and the panel. */
   const navigate = useCallback((id: string) => {
@@ -373,24 +440,16 @@ export default function App() {
         colorMode={colorMode}
         onColorModeChange={setColorMode}
         sortMode={sortMode}
-        onViewChange={scheduleUrlUpdate}
+        onViewChange={handleViewChange}
         onController={(controller) => {
           controllerRef.current = controller;
         }}
         onSelect={setSelectedNode}
-        renderDetail={(node) => (
-          <NodePanel
-            node={node}
-            model={model}
-            root={status?.root ?? null}
-            onNavigate={navigate}
-            sourceMode={activeId === CHANGES_VIEW_ID ? 'diff' : 'full'}
-          />
-        )}
       />
 
-      <div className="pointer-events-none absolute inset-0 p-4">
-        <div className="flex w-[22rem] flex-col gap-3">
+      {/* Left column: everything you DRIVE the disk with. */}
+      <div className="pointer-events-none absolute inset-y-0 left-0 p-4">
+        <div className="flex max-h-full w-[22rem] flex-col gap-3">
           <StatusPanel
             status={status}
             error={error}
@@ -403,7 +462,7 @@ export default function App() {
               type="button"
               onClick={() => setPaletteOpen(true)}
               data-testid="open-palette"
-              className="flex flex-1 items-center gap-2 rounded-lg border border-border bg-surface/70 px-3 py-1.5 text-[11px] text-muted shadow-sm backdrop-blur-md transition-colors hover:border-accent/50 hover:text-foreground"
+              className="flex flex-1 items-center gap-2 rounded-lg border border-border bg-surface/70 px-3 py-1.5 text-[11px] text-muted shadow-sm backdrop-blur-md hover:border-accent/50 hover:text-foreground"
             >
               <Search className="h-3 w-3" />
               <span className="flex-1 text-left">Search the graph…</span>
@@ -414,7 +473,7 @@ export default function App() {
               onClick={() => setSettingsOpen(true)}
               aria-label="Settings"
               data-testid="open-settings"
-              className="rounded-lg border border-border bg-surface/70 p-2 text-muted shadow-sm backdrop-blur-md transition-colors hover:border-accent/50 hover:text-foreground"
+              className="rounded-lg border border-border bg-surface/70 p-2 text-muted shadow-sm backdrop-blur-md hover:border-accent/50 hover:text-foreground"
             >
               <SettingsIcon className="h-3.5 w-3.5" />
             </button>
@@ -436,8 +495,52 @@ export default function App() {
             onNavigate={navigate}
             onExport={() => setFeedbackOpen(true)}
           />
+
+          <LegendPanel
+            mode={colorMode}
+            onModeChange={setColorMode}
+            layers={model?.layers ?? []}
+            present={colorKeys}
+            onFit={() => controllerRef.current?.fitView()}
+          />
         </div>
       </div>
+
+      {/* Right column: the selection, and nothing else. */}
+      {selectedNode ? (
+        <div className="pointer-events-none absolute inset-y-0 right-0 flex w-[30rem] flex-col gap-3 p-4">
+          <NodePanel
+            key={selectedNode.id}
+            node={selectedNode}
+            model={model}
+            detail={detailState.detail}
+            loading={detailState.loading}
+            error={detailState.error}
+            root={status?.root ?? null}
+            onNavigate={navigate}
+            collapsed={nodePanelCollapsed}
+            onToggleCollapsed={() => setNodePanelCollapsed((value) => !value)}
+            // The node panel yields the lower half to the code — unless there
+            // is no code panel up, in which case it takes the column.
+            className={
+              selectedNode.kind === DIRECTORY_KIND || codePanelCollapsed
+                ? 'min-h-0 flex-1'
+                : 'max-h-[45%] shrink-0'
+            }
+          />
+          {selectedNode.kind === DIRECTORY_KIND ? null : (
+            <CodePanel
+              key={`code|${selectedNode.id}`}
+              node={selectedNode}
+              detail={detailState.detail}
+              loading={detailState.loading}
+              initialMode={activeId === CHANGES_VIEW_ID ? 'diff' : 'full'}
+              collapsed={codePanelCollapsed}
+              onToggleCollapsed={() => setCodePanelCollapsed((value) => !value)}
+            />
+          )}
+        </div>
+      ) : null}
 
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} onPick={navigate} />
       <SettingsDialog

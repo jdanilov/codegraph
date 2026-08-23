@@ -570,9 +570,14 @@ export class ApiRouter {
       });
     }
 
-    const launched = launchEditor(editorCommand, absolute, safeLine);
+    // The CONFIGURED command wins — `vscode://` is only ever the client's
+    // fallback for the 409 above. A command that fails to start is reported as
+    // such (502) rather than silently reported as opened: it used to resolve
+    // "ok" before the OS had a chance to say ENOENT, so a template naming a
+    // shell alias looked like it worked while nothing opened.
+    const launched = await launchEditor(editorCommand, absolute, safeLine);
     if (!launched.ok) {
-      return sendError(res, 500, { code: 'internal', message: launched.message });
+      return sendError(res, 502, { code: 'editor_failed', message: launched.message });
     }
     // Echo the caller's own path, not the resolved one: `validatePathWithinRoot`
     // returns a realpath, which on macOS turns `/tmp/...` into `/private/tmp/...`.

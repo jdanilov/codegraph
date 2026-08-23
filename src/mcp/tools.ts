@@ -839,6 +839,20 @@ function numberSourceLines(slice: string, firstLineNumber: number): string {
  * truncation boundary (`handleExplore`) keys off to cut on whole file sections.
  */
 const FILE_SECTION_PREFIX = '**`';
+
+/**
+ * Everything the rendered summary line says AFTER its "Found N symbols across M
+ * files." sentence — the pinned-file and unresolved-path notes.
+ *
+ * The structured twin (visualizer) recomputes the counts from the ids it is
+ * actually handing over, but those trailing clauses are still true of the same
+ * answer, so they are carried across verbatim rather than dropped.
+ */
+function trailingClauses(summaryLine: string): string {
+  const end = summaryLine.indexOf('.');
+  const rest = end === -1 ? '' : summaryLine.slice(end + 1);
+  return rest.trimEnd().length > 0 ? rest.trimEnd() : '';
+}
 // Placeholder for codegraph_explore's "Found N symbols across M files." line.
 // The honest N/M can only be known after the final truncation drops trailing
 // sections (#1046), so the header is emitted as this sentinel and substituted
@@ -6050,11 +6064,34 @@ export class ToolHandler {
       });
     }
 
-    const summary = steps.length > 0
-      ? `${summaryLine} Flow: ${steps.map((s) => s.node.name).join(' → ')}.`
-      : summaryLine;
+    // Counts describe THIS payload, not the markdown's own sentence: the id
+    // list carries the flow spine too (which can reach a file whose source did
+    // not survive the byte budget) and is capped, so quoting the rendered
+    // summary made a client show 99 rows under "Found 98 symbols…". Whatever
+    // the sentence says beyond the counts (pinned files, unresolved paths) is
+    // kept — that part is still true of this answer.
+    const files = new Set<string>();
+    const fileOf = (id: string): string | undefined => {
+      const node = subgraph.nodes.get(id);
+      if (node) return node.filePath;
+      return steps.find((step) => step.node.id === id)?.node.filePath;
+    };
+    for (const id of nodeIds) {
+      const file = fileOf(id);
+      if (file) files.add(file);
+    }
+    const symbolCount = nodeIds.length;
+    const fileCount = files.size || survivors.length;
+    const counted =
+      `Found ${symbolCount} symbol${symbolCount === 1 ? '' : 's'} ` +
+      `across ${fileCount} file${fileCount === 1 ? '' : 's'}.` +
+      trailingClauses(summaryLine);
 
-    return { nodeIds, edgeRefs, flow: hops, summary };
+    const summary = steps.length > 0
+      ? `${counted} Flow: ${steps.map((s) => s.node.name).join(' → ')}.`
+      : counted;
+
+    return { nodeIds, edgeRefs, flow: hops, summary, symbolCount, fileCount };
   }
 
   /**

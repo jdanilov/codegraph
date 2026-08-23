@@ -390,6 +390,92 @@ numbers — no contract item changed.
   edge-count readout is gone. `ViewSummary` still carries the numbers for the
   shell; nothing paints them.
 
+### Phase F clarifications — panels (additive to the canvas pass)
+
+The panels/dialog pass the canvas review deferred. It moves chrome between the
+two columns and fixes three bugs; no endpoint's shape changed except the two
+additive fields noted below.
+
+- **The two columns have one job each.** The LEFT column is everything you
+  drive the disk with — status, ⌘P/settings, questions, and now the **LEGEND**
+  (the old top-right COLOR panel) with the `Fit` control folded into its
+  header. The RIGHT column is the SELECTION and nothing else: a **node panel**
+  and, under it, a **code panel**. The canvas keeps only the controls that mean
+  nothing without a disk under them (breadcrumb, edge-kind chips, arc tooltip);
+  `<GraphCanvas renderDetail>` is gone — the shell renders the selection
+  itself, `onSelect` / `onController` / `onViewChange` are unchanged.
+- **The legend carries both vocabularies.** The active colour mode's swatches
+  (arcs) *and* the edge rows: **incoming green, outgoing amber, dashed =
+  heuristic**, read from `EDGE_DIRECTION_LEGEND` / `EDGE_PROVENANCE_LEGEND` in
+  `web/src/graph/palette.ts` — never re-typed, so the panel and the canvas
+  cannot drift. The wedge/budget, ring and edge counters are gone from the UI
+  entirely (`ViewSummary` still carries them; only `presentColorKeys` reaches
+  React, and only when it changes).
+- **Collapse, never close.** Both right-hand panels have a collapse toggle and
+  no close button. Closing was the wrong verb — it threw the selection away to
+  get the code out of the way. Collapse state is per PANEL and survives picking
+  a different node. The node panel yields the lower half of the column to the
+  code panel, and takes the whole column when there is no code panel (a
+  directory) or the code panel is folded.
+- **Escape has exactly one owner** — a window-level handler in the shell, with
+  a fixed priority: **⌘P palette → settings → feedback export → selection**.
+  Nothing when none of those is up; Escape never navigates. Dialogs no longer
+  handle it themselves: a React `onKeyDown` on the dialog element only fires
+  while the DOM focus sits inside it, which is what left ⌘P un-closable.
+  Clearing the selection hides both right-hand panels.
+- **The node panel answers "where is this" in ONE row.** `parent` — the file
+  containing the node with the node's own line range appended
+  (`src/lib/api.ts:67-135`), or the containing directory for a file/directory.
+  The `qualified`, `file` and `lines` rows and the extension/layer/language
+  pills are gone (the kind is in the title bar). "Jump to editor" is an icon
+  button in that title bar; the source/changes switch is one in the CODE
+  panel's title bar, next to the span's line range.
+- **Code gets the width.** The code panel has minimal padding and **no
+  line-number gutter** — the span's range is in the title and a hunk's `@@`
+  header carries its own. Same for the diff's old/new number columns.
+- **Qualified references.** Every list of symbols shows the owner, not a bare
+  name (`web/src/lib/qualify.ts`): `parent.symbol` when the reference is in the
+  SAME file as the selected node, extended up to the file name (three segments
+  max, extension dropped — `analytics.send`) when it is outside it. A list with
+  no file context — a question card's SYMBOLS list, the flow chain — always
+  gets the file-qualified form.
+- **A question card's counts agree with its list.** `POST /api/explore` (and
+  `/api/ask`) now also return **`symbolCount`** and **`fileCount`**, derived
+  from `nodeIds` — `symbolCount` IS `nodeIds.length`, `fileCount` the distinct
+  files those ids live in — and `summary` quotes those numbers. The markdown
+  response counts something subtly different (the symbols of the files whose
+  SOURCE survived its byte budget), which is right for a reader of that text
+  and wrong for a client rendering the id list: the list also carries the flow
+  spine, whose hops can land in a file that didn't survive. Reusing the
+  rendered sentence is what showed 99 rows under "Found 98 symbols across 7
+  files". The sentence's trailing clauses (pinned files, unresolved paths) are
+  carried over verbatim. **The agent-facing markdown is untouched** — the
+  structured twin is still opt-in and read-only.
+- **Editor jump resolution order**: the **configured command wins**.
+  `POST /api/open` runs the template from `~/.codegraph/ui.json`; only its
+  contract 409 ("nothing configured") falls back to the client-side
+  `vscode://` URL. Two fixes: the button was an anchor whose `href` was ALWAYS
+  the `vscode://` fallback (so the browser advertised — and on any path that
+  skipped the click handler, followed — VS Code even with another editor
+  configured); and `launchEditor` swallowed the child's asynchronous `error`,
+  reporting "opened" for a command that never started. It now resolves on the
+  child's `spawn`/`error` event and a failed launch answers **502
+  `editor_failed`** with an actionable message (a shell alias is not an
+  executable), instead of a silent success.
+- **The DOM is instant.** Every `transition-*` utility is gone from the
+  components, with a base-layer `transition-property: none` guard in
+  `web/src/index.css` so one can't creep back. Animations are untouched —
+  spinners still spin, and the disk's drill-down/up motion is canvas-drawn, not
+  CSS. Per-file-type **lucide** icons (`web/src/lib/file-icons.tsx`, one table,
+  reused by ⌘P, the node panel and the card lists) replaced the ⌘P colour dot;
+  the hover-only "go to" arrow on a result row is gone — the row's hover tint
+  is the affordance.
+- **Chrome tidying**: `watching` and the data version moved beside the
+  CODEGRAPH title in the status panel; a question card shows its counts as
+  `<icon> N  <icon> M`, replaced by the delete button on hover; the two
+  explanatory paragraphs ("The whole project, with every top-level folder
+  collapsed…" and "Click a directory arc to open it…") are gone.
+
 Standing views (always-present cards, client-side): **Project** (whole graph)
 and **Changes** (`/api/changes`, refreshed on `dataVersion` change).
 
@@ -417,7 +503,10 @@ paths, line spans, user note) to paste into an agent prompt. Client-side only.
 6. **F — canvas review**: depth by kind, sort modes (structural default),
    horizontal label fallback, destination-naming centre circle, grey
    directories, hover connectivity dimming, direction-coloured edges, no edge
-   tooltips, no on-canvas telemetry. *(Panels/dialog work is a separate pass.)*
+   tooltips, no on-canvas telemetry. Then a second pass over the **panels**:
+   legend + fit to the left column, selection split into node + code panels
+   that collapse, qualified references, agreeing card counts, one owner for
+   Escape, transition-free DOM.
 
 ## House rules for every phase
 

@@ -24,6 +24,8 @@ export const EMPTY_EXPLORE: ExploreStructuredResult = {
   edgeRefs: [],
   flow: [],
   summary: '',
+  symbolCount: 0,
+  fileCount: 0,
 };
 
 export type ExploreOutcome =

@@ -52,8 +52,24 @@ export interface ExploreStructuredResult {
   edgeRefs: ExploreEdgeRef[];
   /** The Flow section's path, hop by hop (empty when it found no chain). */
   flow: ExploreFlowHop[];
-  /** Short plain-text digest — the response's own summary line plus the flow. */
+  /** Short plain-text digest — the counts below, plus the flow. */
   summary: string;
+  /**
+   * The two numbers `summary` quotes, and they are derived from `nodeIds`:
+   * `symbolCount` IS `nodeIds.length`, `fileCount` the distinct files those
+   * ids live in.
+   *
+   * The markdown response counts something subtly different — the symbols of
+   * the files whose SOURCE survived its byte budget — which is right for a
+   * reader of that text and wrong for a client rendering the id list, since
+   * the list also carries the flow spine (a hop can land in a file whose
+   * source didn't survive) and is capped at {@link STRUCTURED_MAX_NODES}.
+   * Reusing the markdown's sentence made a client show 99 rows under "Found 98
+   * symbols across 7 files". These counts describe the payload the client
+   * actually got.
+   */
+  symbolCount: number;
+  fileCount: number;
 }
 
 /** Most node ids a structured result carries (a whole-repo query is bounded). */

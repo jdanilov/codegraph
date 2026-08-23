@@ -2,23 +2,27 @@
  * The graph canvas — the app's background layer.
  *
  * React's job here is narrow on purpose: mount the 2D surface, forward user
- * intent to `CanvasController`, and render the floating chrome (breadcrumb,
- * legend, edge chips, selection card, tooltips) on top of it. Painting never
+ * intent to `CanvasController`, and render the chrome that belongs to the DISK
+ * itself (breadcrumb, edge-kind chips, arc tooltip) on top of it. Painting never
  * touches React state.
  *
  * PHASE E: the representation is a DaisyDisk-style **sunburst** — the current
  * root at the centre, one ring per level, angle ∝ LoC — replacing the force
- * layout. The mount contracts are unchanged: `renderDetail` fills the selection
- * card, `onSelect` publishes the selection, `onController` hands the shell the
- * imperative handle ⌘P and the cards drive.
+ * layout.
+ *
+ * PHASE F (panels): every floating PANEL moved out of here and into the shell.
+ * The legend and the fit control now live in the left column with the
+ * questions, and the selection is rendered by the shell as two right-hand
+ * panels (node + code) rather than by a `renderDetail` slot inside the canvas.
+ * The canvas keeps exactly the controls that mean nothing without the disk
+ * under them. `onSelect`, `onController` and `onViewChange` are unchanged —
+ * they are how the shell drives it.
  */
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { ChevronRight, Crosshair } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ChevronRight } from 'lucide-react';
 
 import { ArcTooltip } from './arc-tooltip';
 import { EdgeKindChips } from './edge-kind-chips';
-import { Legend } from './legend';
-import { SelectionCard } from './selection-card';
 import {
   CanvasController,
   type ArcTooltip as ArcTooltipData,
@@ -43,8 +47,6 @@ const EMPTY_SUMMARY: ViewSummary = {
 
 export interface GraphCanvasProps {
   model: GraphModel | null;
-  /** Rendered inside the selection card; phase C's info panel plugs in here. */
-  renderDetail?(node: ModelNode): ReactNode;
   onSelect?(node: ModelNode | null): void;
   /** Published on mount and nulled on unmount — the shell's imperative handle. */
   onController?(controller: CanvasController | null): void;
@@ -65,7 +67,6 @@ export interface GraphCanvasProps {
 
 export function GraphCanvas({
   model,
-  renderDetail,
   onSelect,
   onController,
   colorMode: controlledColorMode,
@@ -76,7 +77,6 @@ export function GraphCanvas({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const controllerRef = useRef<CanvasController | null>(null);
   const [summary, setSummary] = useState<ViewSummary>(EMPTY_SUMMARY);
-  const [selected, setSelected] = useState<ModelNode | null>(null);
   const [arcTooltip, setArcTooltip] = useState<ArcTooltipData | null>(null);
   const [ownColorMode, setOwnColorMode] = useState<ColorMode>('kind');
   const lastRoot = useRef<string | null>(null);
@@ -101,7 +101,6 @@ export function GraphCanvas({
     if (!container) return;
     const controller = new CanvasController(container, {
       onSelect: (node) => {
-        setSelected(node);
         onSelectRef.current?.(node);
       },
       onViewChange: (next) => {
@@ -151,12 +150,6 @@ export function GraphCanvas({
     controller.setEdgeKinds(next);
   }, []);
 
-  const clearSelection = useCallback(() => {
-    setSelected(null);
-    onSelectRef.current?.(null);
-    controllerRef.current?.setSelected(null);
-  }, []);
-
   return (
     <div className="absolute inset-0 overflow-hidden">
       <div ref={containerRef} className="absolute inset-0" />
@@ -165,36 +158,19 @@ export function GraphCanvas({
       {arcTooltip ? <ArcTooltip tooltip={arcTooltip} /> : null}
 
       {/* Chrome floats over the canvas; only the widgets take pointer events. */}
-      <div className="pointer-events-none absolute inset-0 flex flex-col justify-between p-4">
-        <div className="flex items-start justify-end gap-3">
-          <Legend
-            mode={colorMode}
-            onModeChange={setColorMode}
-            layers={model?.layers ?? []}
-            present={summary.presentColorKeys}
+      {/* Bottom band, clear of the left column's panels and the right column's
+          selection panels — the disk's own controls, nothing else. */}
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 p-4 pl-[24rem] pr-[31rem]">
+        <div className="flex flex-col gap-3">
+          <Breadcrumb
+            trail={summary.breadcrumb}
+            onPick={(id) => controllerRef.current?.setRoot(id)}
           />
-        </div>
-
-        <div className="flex items-end justify-between gap-3">
-          <div className="flex flex-col gap-3">
-            <Breadcrumb
-              trail={summary.breadcrumb}
-              onPick={(id) => controllerRef.current?.setRoot(id)}
-            />
-            <EdgeKindChips
-              kinds={summary.edgeKinds}
-              enabled={new Set(summary.enabledKinds)}
-              onToggle={toggleKind}
-            />
-          </div>
-          <div className="flex flex-col items-end gap-3">
-            {selected ? (
-              <SelectionCard node={selected} onClose={clearSelection}>
-                {renderDetail?.(selected)}
-              </SelectionCard>
-            ) : null}
-            <DiskReadout onFit={() => controllerRef.current?.fitView()} />
-          </div>
+          <EdgeKindChips
+            kinds={summary.edgeKinds}
+            enabled={new Set(summary.enabledKinds)}
+            onToggle={toggleKind}
+          />
         </div>
       </div>
     </div>
@@ -216,7 +192,7 @@ function Breadcrumb({
 }) {
   if (trail.length === 0) return null;
   return (
-    <nav className="pointer-events-auto flex max-w-[36rem] flex-wrap items-center gap-0.5 rounded-lg border border-border bg-surface/70 px-2.5 py-1.5 text-[11px] shadow-sm backdrop-blur-md">
+    <nav className="pointer-events-auto flex max-w-[36rem] flex-wrap items-center gap-0.5 self-start rounded-lg border border-border bg-surface/70 px-2.5 py-1.5 text-[11px] shadow-sm backdrop-blur-md">
       {trail.map((entry, index) => (
         <span key={entry.id} className="flex items-center gap-0.5">
           {index > 0 ? <ChevronRight className="h-3 w-3 shrink-0 text-muted/60" /> : null}
@@ -225,7 +201,7 @@ function Breadcrumb({
             onClick={() => onPick(entry.id)}
             disabled={index === trail.length - 1}
             className={cn(
-              'max-w-[12rem] truncate rounded px-1 py-0.5 transition-colors',
+              'max-w-[12rem] truncate rounded px-1 py-0.5',
               index === trail.length - 1
                 ? 'font-medium text-foreground'
                 : 'text-muted hover:bg-background/60 hover:text-foreground'
@@ -237,29 +213,5 @@ function Breadcrumb({
         </span>
       ))}
     </nav>
-  );
-}
-
-/**
- * Re-fit control.
- *
- * Phase F removed the on-canvas stat readout that used to sit here (arcs drawn
- * against the budget, ring count, edge count, zoom): it was renderer telemetry
- * on screen at all times, and none of it is a question a developer reading a
- * codebase has. The truncation the disk performs is still surfaced — on the
- * `+N smaller` arcs themselves, which is where it means something.
- */
-function DiskReadout({ onFit }: { onFit(): void }) {
-  return (
-    <div className="pointer-events-auto flex items-center gap-3 rounded-lg border border-border bg-surface/70 px-3 py-1.5 text-[10px] text-muted shadow-sm backdrop-blur-md">
-      <button
-        type="button"
-        onClick={onFit}
-        className="flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors hover:bg-background/60 hover:text-foreground"
-        title="Reset zoom and centre the disk"
-      >
-        <Crosshair className="h-3 w-3" /> fit
-      </button>
-    </div>
   );
 }

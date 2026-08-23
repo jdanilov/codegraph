@@ -54,29 +54,79 @@ export type EditorLaunch =
   | { ok: true; argv: string[] }
   | { ok: false; reason: 'empty_command' | 'spawn_failed'; message: string };
 
-/** Launch the editor, detached, ignoring its output. */
-export function launchEditor(template: string, file: string, line: number): EditorLaunch {
+/**
+ * How long to wait for the OS to tell us the process actually started.
+ *
+ * `spawn` resolves ENOENT (command not on PATH — a shell alias, a typo) on the
+ * NEXT tick as an `error` event, so a synchronous "ok" is a guess. This used to
+ * swallow that event and report success, which is what made a misconfigured
+ * editor command look like it worked while nothing opened. A few milliseconds
+ * buys the truth; a launch that hasn't failed by then has really started.
+ */
+const SPAWN_SETTLE_MS = 250;
+
+/**
+ * Launch the editor, detached, ignoring its output.
+ *
+ * Resolves once the child has either emitted `spawn` (it is running) or `error`
+ * (it never started), so `/api/open` can answer honestly.
+ */
+export function launchEditor(
+  template: string,
+  file: string,
+  line: number
+): Promise<EditorLaunch> {
   const argv = buildEditorArgv(template, file, line);
   const command = argv[0];
   if (!command) {
-    return { ok: false, reason: 'empty_command', message: 'Editor command template is empty' };
-  }
-  try {
-    const child = spawn(command, argv.slice(1), {
-      detached: true,
-      stdio: 'ignore',
-      shell: false,
-    });
-    // A bad command fails asynchronously; swallow it so an unhandled 'error'
-    // event can't take the server down.
-    child.on('error', () => undefined);
-    child.unref();
-    return { ok: true, argv };
-  } catch (err) {
-    return {
+    return Promise.resolve({
       ok: false,
-      reason: 'spawn_failed',
-      message: err instanceof Error ? err.message : String(err),
-    };
+      reason: 'empty_command',
+      message: 'Editor command template is empty',
+    });
   }
+
+  return new Promise<EditorLaunch>((resolve) => {
+    let settled = false;
+    const finish = (outcome: EditorLaunch): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(outcome);
+    };
+    // Belt and braces: if neither event ever arrives, the request still answers.
+    const timer = setTimeout(() => finish({ ok: true, argv }), SPAWN_SETTLE_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    try {
+      const child = spawn(command, argv.slice(1), {
+        detached: true,
+        stdio: 'ignore',
+        shell: false,
+      });
+      child.on('error', (err: Error) => {
+        finish({ ok: false, reason: 'spawn_failed', message: describeSpawnError(err, command) });
+      });
+      child.on('spawn', () => {
+        child.unref();
+        finish({ ok: true, argv });
+      });
+    } catch (err) {
+      finish({
+        ok: false,
+        reason: 'spawn_failed',
+        message: describeSpawnError(err, command),
+      });
+    }
+  });
+}
+
+/** A launch failure the user can act on — "which command, and what went wrong". */
+function describeSpawnError(err: unknown, command: string): string {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (code === 'ENOENT') {
+    return `Editor command "${command}" was not found on PATH. Shell aliases and functions don't count — use the executable's name or its full path.`;
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return `Editor command "${command}" failed to start: ${message}`;
 }

@@ -15,7 +15,9 @@
  */
 import { useState } from 'react';
 import {
+  Braces,
   FileDiff,
+  Files,
   FolderTree,
   Loader2,
   MessageSquare,
@@ -29,6 +31,8 @@ import { Card as Surface } from '@/components/ui/card';
 import { DIRECTORY_KIND, type GraphModel } from '@/graph/model';
 import { colorForKind } from '@/graph/palette';
 import type { Card, ChangesPayload, ExploreResult } from '@/lib/api';
+import { iconForNode } from '@/lib/file-icons';
+import { distinctFiles, qualifiedLabel } from '@/lib/qualify';
 import { cn } from '@/lib/utils';
 
 /** Ids of the two standing views. They are client-side and never persisted. */
@@ -83,8 +87,14 @@ export function CardsPanel({
     onAsk(trimmed);
   };
 
+  // Sized by the column, not by the viewport (phase F): the legend now sits
+  // under this panel, so a fixed `max-h` against `100vh` could push it off the
+  // bottom of a short window. `flex-1 min-h-0` lets it give room back.
   return (
-    <Surface className="pointer-events-auto flex max-h-[calc(100vh-16rem)] flex-col p-3" data-testid="cards-panel">
+    <Surface
+      className="pointer-events-auto flex min-h-0 flex-1 flex-col p-3"
+      data-testid="cards-panel"
+    >
       <div className="flex shrink-0 items-center gap-2 text-[10px] uppercase tracking-[0.2em] text-muted">
         <MessageSquare className="h-3 w-3" /> questions
       </div>
@@ -110,7 +120,7 @@ export function CardsPanel({
           disabled={busy || question.trim().length === 0}
           aria-label="Ask"
           data-testid="ask-submit"
-          className="rounded-md border border-border p-1.5 text-muted transition-colors hover:border-accent/60 hover:text-accent disabled:opacity-40"
+          className="rounded-md border border-border p-1.5 text-muted hover:border-accent/60 hover:text-accent disabled:opacity-40"
         >
           {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
         </button>
@@ -142,6 +152,7 @@ export function CardsPanel({
             <QuestionRow
               key={card.id}
               card={card}
+              model={model}
               active={card.id === activeId}
               onClick={() => onActivate(card.id)}
               onDelete={() => onDelete(card.id)}
@@ -149,35 +160,32 @@ export function CardsPanel({
           ))}
         </div>
 
-        <div className="mt-2 border-t border-border/60 pt-2">
-          {activeId === CHANGES_VIEW_ID ? (
-            <ChangesBody
-              changes={changes}
-              error={changesError}
-              model={model}
-              onNavigate={onNavigate}
-            />
-          ) : activeCard ? (
-            <ResultBody
-              result={activeCard.result}
-              model={model}
-              onNavigate={onNavigate}
-              onRefine={askAvailable && !busy ? () => onRefine(activeCard) : null}
-            />
-          ) : (
-            <p className="px-1 text-[10px] leading-relaxed text-muted">
-              The whole project, with every top-level folder collapsed. Ask a question above to
-              pin an answer as a card.
-            </p>
-          )}
-        </div>
+        {activeId === CHANGES_VIEW_ID || activeCard ? (
+          <div className="mt-2 border-t border-border/60 pt-2">
+            {activeId === CHANGES_VIEW_ID ? (
+              <ChangesBody
+                changes={changes}
+                error={changesError}
+                model={model}
+                onNavigate={onNavigate}
+              />
+            ) : activeCard ? (
+              <ResultBody
+                result={activeCard.result}
+                model={model}
+                onNavigate={onNavigate}
+                onRefine={askAvailable && !busy ? () => onRefine(activeCard) : null}
+              />
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
       <button
         type="button"
         onClick={onExport}
         data-testid="open-feedback"
-        className="mt-2 flex shrink-0 items-center justify-center gap-1.5 rounded-md border border-border/70 py-1 text-[10px] text-muted transition-colors hover:border-accent/60 hover:text-accent"
+        className="mt-2 flex shrink-0 items-center justify-center gap-1.5 rounded-md border border-border/70 py-1 text-[10px] text-muted hover:border-accent/60 hover:text-accent"
       >
         <Share2 className="h-3 w-3" /> export feedback
       </button>
@@ -216,7 +224,7 @@ function StandingRow({
       data-testid={`card-row-${id}`}
       data-active={active}
       className={cn(
-        'flex w-full items-center gap-2 rounded px-1.5 py-1 text-left transition-colors',
+        'flex w-full items-center gap-2 rounded px-1.5 py-1 text-left',
         active ? 'bg-accent/15 text-accent' : 'text-foreground/85 hover:bg-accent/10'
       )}
     >
@@ -227,22 +235,33 @@ function StandingRow({
   );
 }
 
+/**
+ * One saved question.
+ *
+ * The counts are the card's whole answer in two numbers — how many symbols, in
+ * how many files — and they are drawn with icons rather than the letters `s`
+ * and `f`, which read as units of something. On hover they give their place to
+ * the delete button: a row this narrow cannot afford both, and a delete control
+ * that is always visible on every card invites the accident it enables.
+ */
 function QuestionRow({
   card,
+  model,
   active,
   onClick,
   onDelete,
 }: {
   card: Card;
+  model: GraphModel | null;
   active: boolean;
   onClick(): void;
   onDelete(): void;
 }) {
-  const count = card.result?.nodeIds.length ?? 0;
+  const counts = resultCounts(card.result, model);
   return (
     <div
       className={cn(
-        'group flex items-center gap-1 rounded pr-1 transition-colors',
+        'group flex items-center gap-1 rounded pr-1',
         active ? 'bg-accent/15' : 'hover:bg-accent/10'
       )}
     >
@@ -258,18 +277,53 @@ function QuestionRow({
         <span className={cn('flex-1 truncate text-[11px]', active && 'text-accent')}>
           {card.question}
         </span>
-        <span className="shrink-0 text-[9px] text-muted">{count}</span>
       </button>
+      <span
+        className="flex shrink-0 items-center gap-1.5 pr-1 text-[9px] text-muted group-hover:hidden"
+        title={`${counts.symbols} symbol(s) across ${counts.files} file(s)`}
+        data-testid="card-counts"
+      >
+        <span className="flex items-center gap-0.5">
+          <Braces className="h-2.5 w-2.5" />
+          {counts.symbols}
+        </span>
+        <span className="flex items-center gap-0.5">
+          <Files className="h-2.5 w-2.5" />
+          {counts.files}
+        </span>
+      </span>
       <button
         type="button"
         onClick={onDelete}
         aria-label="Delete card"
-        className="shrink-0 rounded p-1 text-muted opacity-0 transition-opacity hover:text-red-400 group-hover:opacity-100"
+        className="hidden shrink-0 rounded p-1 text-muted hover:text-red-400 group-hover:block"
       >
         <Trash2 className="h-3 w-3" />
       </button>
     </div>
   );
+}
+
+/**
+ * The counts a card advertises — and the same two numbers the answer's own
+ * summary sentence quotes.
+ *
+ * They used to disagree (99 rows in the list under "Found 98 symbols across 7
+ * files"): the sentence counted only the symbols of the files whose SOURCE
+ * survived the response budget, while the list also carries the flow spine,
+ * which can reach into a file that did not survive. The server now derives both
+ * from the same ids; these fallbacks keep cards saved before that fix honest by
+ * counting what the card actually shows.
+ */
+function resultCounts(
+  result: ExploreResult | undefined,
+  model: GraphModel | null
+): { symbols: number; files: number } {
+  const ids = result?.nodeIds ?? [];
+  return {
+    symbols: result?.symbolCount ?? ids.length,
+    files: result?.fileCount ?? distinctFiles(model, ids),
+  };
 }
 
 /** A question card's answer: the flow first, then everything it surfaced. */
@@ -315,7 +369,7 @@ function ResultBody({
               >
                 <span className="w-3 shrink-0 text-[9px] text-muted/70">{index + 1}</span>
                 <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-foreground/90">
-                  {nameOf(model, step.id)}
+                  {qualifiedLabel(model, step.id)}
                 </span>
                 {step.via ? (
                   <span className="shrink-0 text-[9px] italic text-accent/80">{step.via}</span>
@@ -353,7 +407,7 @@ function ResultBody({
           type="button"
           onClick={onRefine}
           data-testid="refine-with-ai"
-          className="flex items-center justify-center gap-1.5 rounded-md border border-border/70 py-1 text-[10px] text-muted transition-colors hover:border-accent/60 hover:text-accent"
+          className="flex items-center justify-center gap-1.5 rounded-md border border-border/70 py-1 text-[10px] text-muted hover:border-accent/60 hover:text-accent"
         >
           <Sparkles className="h-3 w-3" /> refine with AI
         </button>
@@ -472,6 +526,13 @@ function ChangesBody({
   );
 }
 
+/**
+ * One symbol of an answer.
+ *
+ * An answer that spans seven files is unreadable as a list of bare names, so
+ * every row is qualified up to its file (`analytics.send`) — there is no
+ * "current file" here to make a shorter form unambiguous.
+ */
 function NodeRow({
   id,
   model,
@@ -482,20 +543,21 @@ function NodeRow({
   onNavigate(id: string): void;
 }) {
   const node = model?.get(id) ?? null;
+  const Icon = iconForNode(node?.kind ?? DIRECTORY_KIND, node?.file ?? '');
   return (
     <button
       type="button"
       onClick={() => onNavigate(id)}
-      title={node?.qualifiedName || id}
+      title={node?.file ? `${node.file}:${node.startLine}` : node?.qualifiedName || id}
       data-testid="result-node"
       className="flex w-full items-center gap-1.5 rounded px-1.5 py-[3px] text-left hover:bg-accent/10"
     >
-      <span
-        className="h-1.5 w-1.5 shrink-0 rounded-full"
-        style={{ backgroundColor: colorForKind(node?.kind ?? DIRECTORY_KIND) }}
+      <Icon
+        className="h-3 w-3 shrink-0"
+        style={{ color: colorForKind(node?.kind ?? DIRECTORY_KIND) }}
       />
       <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-foreground/90">
-        {node?.name ?? id}
+        {qualifiedLabel(model, id)}
       </span>
       <span className="shrink-0 text-[9px] text-muted/70">{node?.kind.replace(/_/g, ' ') ?? '—'}</span>
     </button>
@@ -514,10 +576,6 @@ export function flowChain(flow: ExploreResult['flow']): Array<{ id: string; via:
   const chain = [{ id: flow[0]!.from, via: '' }];
   for (const hop of flow) chain.push({ id: hop.to, via: hop.via });
   return chain;
-}
-
-function nameOf(model: GraphModel | null, id: string): string {
-  return model?.get(id)?.name ?? id;
 }
 
 function statusLetter(status: string): string {

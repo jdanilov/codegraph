@@ -11,10 +11,11 @@
  * otherwise race stale responses onto the list.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { CornerDownLeft, Loader2, Search } from 'lucide-react';
+import { Loader2, Search } from 'lucide-react';
 
 import { colorForKind } from '@/graph/palette';
 import { searchNodes, type SearchHit } from '@/lib/api';
+import { iconForNode } from '@/lib/file-icons';
 import { cn } from '@/lib/utils';
 
 /** Keystroke settle time before a query goes out. */
@@ -87,12 +88,11 @@ export function CommandPalette({ open, onClose, onPick }: CommandPaletteProps) {
     [onPick, onClose]
   );
 
+  // Escape is NOT handled here (phase F). It used to be, and that was the bug:
+  // this handler only fires while the DOM focus sits inside the dialog, so any
+  // state where it didn't left ⌘P un-closable. The shell owns Escape on the
+  // window now, with a documented priority (palette first).
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      onClose();
-      return;
-    }
     if (event.key === 'ArrowDown' || (event.key === 'n' && event.ctrlKey)) {
       event.preventDefault();
       setActive((index) => (hits.length === 0 ? 0 : (index + 1) % hits.length));
@@ -146,35 +146,39 @@ export function CommandPalette({ open, onClose, onPick }: CommandPaletteProps) {
               {query.trim() ? 'No matches.' : 'Type to search the graph.'}
             </p>
           ) : (
-            hits.map((hit, index) => (
-              <button
-                key={hit.id}
-                type="button"
-                data-active={index === active}
-                data-testid="palette-hit"
-                onMouseEnter={() => setActive(index)}
-                onClick={() => pick(hit)}
-                className={cn(
-                  'flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors',
-                  index === active ? 'bg-accent/15' : 'hover:bg-accent/8'
-                )}
-              >
-                <span
-                  className="h-2 w-2 shrink-0 rounded-full"
-                  style={{ backgroundColor: colorForKind(hit.kind) }}
-                />
-                <span className="shrink-0 font-mono text-xs text-foreground">{hit.name}</span>
-                <span className="min-w-0 flex-1 truncate text-[10px] text-muted" title={hit.file}>
-                  {hit.file}
-                </span>
-                <span className="shrink-0 text-[10px] text-muted/70">
-                  {hit.kind.replace(/_/g, ' ')}
-                </span>
-                {index === active ? (
-                  <CornerDownLeft className="h-3 w-3 shrink-0 text-accent" />
-                ) : null}
-              </button>
-            ))
+            hits.map((hit, index) => {
+              const Icon = iconForNode(hit.kind, hit.file);
+              return (
+                <button
+                  key={hit.id}
+                  type="button"
+                  data-active={index === active}
+                  data-testid="palette-hit"
+                  onMouseEnter={() => setActive(index)}
+                  onClick={() => pick(hit)}
+                  className={cn(
+                    'flex w-full items-center gap-2 px-3 py-1.5 text-left',
+                    index === active ? 'bg-accent/15' : 'hover:bg-accent/8'
+                  )}
+                >
+                  {/* The row's type at a glance — a `.png` and a `.ts` no
+                      longer read as the same thing. The hover/active tint is
+                      the only "you are here" affordance the row needs; the
+                      trailing ↵ arrow it used to grow was noise. */}
+                  <Icon
+                    className="h-3.5 w-3.5 shrink-0"
+                    style={{ color: colorForKind(hit.kind) }}
+                  />
+                  <span className="shrink-0 font-mono text-xs text-foreground">{hit.name}</span>
+                  <span className="min-w-0 flex-1 truncate text-[10px] text-muted" title={hit.file}>
+                    {hit.file}
+                  </span>
+                  <span className="shrink-0 text-[10px] text-muted/70">
+                    {hit.kind.replace(/_/g, ' ')}
+                  </span>
+                </button>
+              );
+            })
           )}
         </div>
       </div>

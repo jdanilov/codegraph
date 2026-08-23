@@ -56,6 +56,24 @@
     -webkit-font-smoothing: antialiased;
   }
 
+  /**
+   * The DOM is instant (phase F).
+   *
+   * Every hover tint, panel and dialog used to fade in over ~150ms, which on a
+   * tool you drive by pointing at things reads as lag rather than as polish —
+   * the ⌘P dialog's row highlight was the worst of it. The class-level
+   * `transition-*` utilities are gone from the components; this rule is the
+   * guard that keeps a future one from creeping back in.
+   *
+   * ANIMATIONS are untouched: the loading spinners still spin, and the disk's
+   * drill-down/up motion is drawn on the canvas, not by CSS.
+   */
+  *,
+  *::before,
+  *::after {
+    transition-property: none !important;
+  }
+
   /* Faint grid: the canvas the graph is drawn on. */
   #root {
     background-image:

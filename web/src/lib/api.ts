@@ -180,6 +180,13 @@ export interface ExploreResult {
   edgeRefs: EdgeRef[];
   flow: FlowHop[];
   summary: string;
+  /**
+   * The two numbers `summary` quotes, derived from `nodeIds` — so the list a
+   * card renders and the sentence above it can never disagree. Optional
+   * because cards saved before this shipped don't carry them.
+   */
+  symbolCount?: number;
+  fileCount?: number;
   /** Present on `/api/ask` answers: the symbol bag the model produced. */
   symbolBag?: string;
 }

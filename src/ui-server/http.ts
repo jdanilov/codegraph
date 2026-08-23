@@ -21,7 +21,9 @@ export type ApiErrorCode =
   | 'forbidden'
   | 'internal'
   | 'method_not_allowed'
-  | 'payload_too_large';
+  | 'payload_too_large'
+  /** `/api/open`: an editor command IS configured, but it failed to start. */
+  | 'editor_failed';
 
 export interface ApiError {
   code: ApiErrorCode;

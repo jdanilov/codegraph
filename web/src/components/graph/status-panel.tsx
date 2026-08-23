@@ -29,9 +29,38 @@ export function StatusPanel({ status, error, indexing, indexLog, onIndex }: Stat
 
   return (
     <Card className="pointer-events-auto w-[22rem] p-4">
-      <div className="flex items-start justify-between gap-3">
+      {/* The live state belongs BESIDE the title, not on a row of its own
+          (phase F): "watching" and the data version are one glance's worth of
+          information, and a dedicated band for them pushed the project name
+          and its path down the panel for nothing. */}
+      <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="text-[10px] uppercase tracking-[0.3em] text-muted">CodeGraph</p>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-[10px] uppercase tracking-[0.3em] text-muted">CodeGraph</span>
+            {status?.watching ? (
+              <Badge variant="accent" className="px-1.5 py-0 text-[9px]">
+                <Activity className="h-2.5 w-2.5" /> watching
+              </Badge>
+            ) : (
+              <Badge variant="muted" className="px-1.5 py-0 text-[9px]">
+                not watching
+              </Badge>
+            )}
+            {status?.indexed ? (
+              <Badge variant="muted" className="px-1.5 py-0 text-[9px]">
+                v{status.dataVersion}
+              </Badge>
+            ) : (
+              <Badge variant="muted" className="px-1.5 py-0 text-[9px]">
+                not indexed
+              </Badge>
+            )}
+            {status?.watcherDegraded ? (
+              <Badge variant="muted" className="px-1.5 py-0 text-[9px]">
+                watcher degraded
+              </Badge>
+            ) : null}
+          </div>
           <h1 className="mt-0.5 truncate text-lg font-semibold tracking-tight">
             {status?.projectName ?? 'Loading…'}
           </h1>
@@ -42,27 +71,11 @@ export function StatusPanel({ status, error, indexing, indexLog, onIndex }: Stat
         <button
           type="button"
           onClick={() => setOpen((value) => !value)}
-          className="rounded p-1 text-muted transition-colors hover:text-foreground"
+          className="shrink-0 rounded p-1 text-muted hover:text-foreground"
           aria-label={open ? 'Collapse details' : 'Expand details'}
         >
           {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
         </button>
-      </div>
-
-      <div className="mt-2 flex flex-wrap items-center gap-1.5">
-        {status?.watching ? (
-          <Badge variant="accent">
-            <Activity className="h-3 w-3" /> watching
-          </Badge>
-        ) : (
-          <Badge variant="muted">not watching</Badge>
-        )}
-        {status?.watcherDegraded ? <Badge variant="muted">watcher degraded</Badge> : null}
-        {status?.indexed ? (
-          <Badge variant="muted">v{status.dataVersion}</Badge>
-        ) : (
-          <Badge variant="muted">not indexed</Badge>
-        )}
       </div>
 
       {open || needsIndex || error ? (

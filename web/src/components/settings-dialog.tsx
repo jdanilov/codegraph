@@ -102,9 +102,6 @@ export function SettingsDialog({ open, onClose, onSortModeChange }: SettingsDial
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}
-      onKeyDown={(event) => {
-        if (event.key === 'Escape') onClose();
-      }}
     >
       <Card className="w-[min(32rem,92vw)] p-5" data-testid="settings-dialog">
         <div className="flex items-start justify-between gap-3">
@@ -115,7 +112,7 @@ export function SettingsDialog({ open, onClose, onSortModeChange }: SettingsDial
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="rounded p-1 text-muted transition-colors hover:text-foreground"
+            className="rounded p-1 text-muted hover:text-foreground"
           >
             <X className="h-3.5 w-3.5" />
           </button>
@@ -159,7 +156,7 @@ export function SettingsDialog({ open, onClose, onSortModeChange }: SettingsDial
                     className={
                       sortMode === option.value
                         ? 'rounded-md border border-accent bg-accent/15 px-2.5 py-1 text-xs text-foreground'
-                        : 'rounded-md border border-border px-2.5 py-1 text-xs text-muted transition-colors hover:text-foreground'
+                        : 'rounded-md border border-border px-2.5 py-1 text-xs text-muted hover:text-foreground'
                     }
                   >
                     {option.label}

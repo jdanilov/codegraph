@@ -28,7 +28,7 @@ export function EdgeKindChips({ kinds, enabled, onToggle }: EdgeKindChipsProps) 
             type="button"
             onClick={() => onToggle(kind)}
             className={cn(
-              'flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] transition-colors',
+              'flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px]',
               on
                 ? 'border-border bg-background/60 text-foreground'
                 : 'border-border/50 text-muted/60 hover:text-muted'

@@ -75,9 +75,6 @@ export function FeedbackDialog({
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}
-      onKeyDown={(event) => {
-        if (event.key === 'Escape') onClose();
-      }}
     >
       <Surface className="flex w-[min(44rem,94vw)] flex-col p-5" data-testid="feedback-dialog">
         <div className="flex items-start justify-between gap-3">
@@ -88,7 +85,7 @@ export function FeedbackDialog({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="rounded p-1 text-muted transition-colors hover:text-foreground"
+            className="rounded p-1 text-muted hover:text-foreground"
           >
             <X className="h-3.5 w-3.5" />
           </button>

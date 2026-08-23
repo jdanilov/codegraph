@@ -1,30 +1,46 @@
 /**
- * The node info panel — the body of the floating selection card.
+ * The NODE panel — what the selected entry is, and what it reaches.
  *
- * Everything the contract asks a selection to answer lives here: what the node
- * IS (kind, qualified name, file span, layer), what it CONTAINS, what it
- * REACHES and what reaches it (grouped by edge kind, heuristic edges labelled
- * with the synthesizer that wired them), its SOURCE, and a jump into the
- * user's editor.
+ * Phase F reshaped it around one question: how much of the panel is spent on
+ * things the reader already knows? The answers it removed —
  *
- * Two things are deliberate:
+ *  - the extension / layer / language pills (the file name says it),
+ *  - the `qualified` and `file` rows plus a separate `lines` row (one `parent`
+ *    row says all three: `src/lib/api.ts:67-135`),
+ *  - the repeated file name above the code and the code itself (its own panel
+ *    now — see `code-panel.tsx`),
+ *  - the Close button (Esc clears the selection; the panel COLLAPSES).
+ *
+ * — and one it added: every relation is shown **qualified**
+ * (`analytics.send`, not `send`), extended up to the file name when the
+ * reference lives outside the selected node's own file. A bare method name in a
+ * list of forty references is not an answer.
+ *
+ * Two things are unchanged and deliberate:
  *
  *  - **Directories are answered locally.** `dirs[]` entries are synthesized by
- *    the graph payload and have no row behind `/api/node/:id`, so asking for
- *    one would 404. The model already holds their children, which is the only
- *    thing there is to say about a directory.
- *  - **Every relation is a navigation target.** Clicking a contained node or
- *    an edge endpoint selects and reveals it on the canvas, which is what makes
+ *    the graph payload and have no row behind `/api/node/:id`; the model
+ *    already holds their children, which is all there is to say about one.
+ *  - **Every relation is a navigation target.** Clicking a contained node or an
+ *    edge endpoint selects and reveals it on the canvas, which is what makes
  *    the panel a way to *walk* the graph rather than a read-only readout.
  */
-import { useEffect, useMemo, useState } from 'react';
-import { ChevronDown, ChevronRight, ExternalLink, Loader2 } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Loader2,
+  SquareArrowOutUpRight,
+} from 'lucide-react';
 
-import { SourceView } from './source-view';
-import { Badge } from '@/components/ui/badge';
+import { PanelButton, SidePanel } from './side-panel';
 import { DIRECTORY_KIND, type GraphModel, type ModelNode } from '@/graph/model';
 import { colorForKind } from '@/graph/palette';
-import { fetchNode, openInEditor, type NodeDetail, type NodeRelation, type NodeRef } from '@/lib/api';
+import { openInEditor, type NodeDetail, type NodeRelation, type NodeRef } from '@/lib/api';
+import { iconForNode } from '@/lib/file-icons';
+import { containerLabel, qualifiedLabel } from '@/lib/qualify';
 import { cn } from '@/lib/utils';
 
 /** Contained nodes / relations shown before the list collapses behind "+N". */
@@ -33,38 +49,33 @@ const LIST_PREVIEW = 6;
 export interface NodePanelProps {
   node: ModelNode;
   model: GraphModel | null;
+  /** `/api/node/:id`, fetched once by the shell for both right-hand panels. */
+  detail: NodeDetail | null;
+  loading: boolean;
+  error: string | null;
   /** Absolute project root from `/api/status`, for the `vscode://` fallback. */
   root: string | null;
   /** Select the node and bring it into view on the canvas. */
   onNavigate(id: string): void;
-  /** Which mode the source pane opens in ("diff" from the Changes view). */
-  sourceMode?: 'full' | 'diff';
+  collapsed: boolean;
+  onToggleCollapsed(): void;
+  /** Height policy from the shell — it knows whether the code panel is up. */
+  className?: string;
 }
 
-export function NodePanel({ node, model, root, onNavigate, sourceMode }: NodePanelProps) {
-  const [detail, setDetail] = useState<NodeDetail | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+export function NodePanel({
+  node,
+  model,
+  detail,
+  loading,
+  error,
+  root,
+  onNavigate,
+  collapsed,
+  onToggleCollapsed,
+  className,
+}: NodePanelProps) {
   const isDirectory = node.kind === DIRECTORY_KIND;
-
-  useEffect(() => {
-    setDetail(null);
-    setError(null);
-    if (isDirectory) return;
-    const controller = new AbortController();
-    setLoading(true);
-    void fetchNode(node.id, controller.signal)
-      .then((payload) => {
-        if (!controller.signal.aborted) setDetail(payload);
-      })
-      .catch((err: unknown) => {
-        if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
-      });
-    return () => controller.abort();
-  }, [node.id, isDirectory]);
 
   const contained: NodeRef[] = useMemo(() => {
     if (detail) return detail.contains;
@@ -83,23 +94,28 @@ export function NodePanel({ node, model, root, onNavigate, sourceMode }: NodePan
       }));
   }, [detail, node.children, model]);
 
-  const qualified = detail?.node.qualifiedName || node.qualifiedName;
+  const Icon = iconForNode(node.kind, node.file);
 
   return (
-    <div className="mt-3 flex min-h-0 flex-col text-[11px]">
-      <div className="flex flex-wrap items-center gap-1.5">
-        {node.layer ? <Badge variant="accent">{node.layer}</Badge> : null}
-        {detail?.node.isExported ? <Badge variant="muted">exported</Badge> : null}
-        {detail?.node.visibility ? (
-          <Badge variant="muted">{detail.node.visibility}</Badge>
-        ) : null}
-        {detail?.node.language ? <Badge variant="muted">{detail.node.language}</Badge> : null}
-      </div>
-
-      <dl className="mt-2 flex flex-col gap-1">
-        {qualified && qualified !== node.name ? <Row label="qualified" value={qualified} /> : null}
-        <Row label={isDirectory ? 'path' : 'file'} value={node.file || '(project root)'} />
-        {!isDirectory ? <Row label="lines" value={`${node.startLine}–${node.endLine}`} /> : null}
+    <SidePanel
+      data-testid="node-panel"
+      collapsed={collapsed}
+      onToggleCollapsed={onToggleCollapsed}
+      className={className ?? 'max-h-[45%] shrink-0'}
+      bodyClassName="px-2.5 py-2 text-[11px]"
+      icon={<Icon className="h-3.5 w-3.5" style={{ color: colorForKind(node.kind) }} />}
+      title={
+        <span title={node.qualifiedName || node.name}>{node.name}</span>
+      }
+      meta={node.kind.replace(/_/g, ' ')}
+      actions={
+        isDirectory ? null : (
+          <EditorJump root={root} file={node.file} line={node.startLine || 1} />
+        )
+      }
+    >
+      <dl className="flex flex-col gap-1">
+        <Row label="parent" value={containerLabel(node)} />
         {isDirectory ? <Row label="loc" value={String(node.weight)} /> : null}
       </dl>
 
@@ -107,10 +123,6 @@ export function NodePanel({ node, model, root, onNavigate, sourceMode }: NodePan
         <pre className="mt-2 max-h-16 overflow-auto rounded border border-border/60 bg-background/40 px-2 py-1 font-mono text-[10px] leading-snug text-foreground/80">
           {detail.node.signature}
         </pre>
-      ) : null}
-
-      {!isDirectory ? (
-        <EditorJump root={root} file={node.file} line={node.startLine || 1} />
       ) : null}
 
       {loading ? (
@@ -133,72 +145,66 @@ export function NodePanel({ node, model, root, onNavigate, sourceMode }: NodePan
           title="outgoing"
           arrow="→"
           relations={detail?.outgoing ?? []}
+          model={model}
+          contextFile={node.file}
           onNavigate={onNavigate}
         />
         <RelationSections
           title="incoming"
           arrow="←"
           relations={detail?.incoming ?? []}
+          model={model}
+          contextFile={node.file}
           onNavigate={onNavigate}
         />
-
-        {/* Waits for the detail payload, which already carries the span — so
-            the source pane costs zero extra requests. Keyed by node id so a
-            navigation remounts it with clean state instead of reconciling. */}
-        {!isDirectory && detail ? (
-          <SourceView
-            key={`${detail.node.id}|${sourceMode ?? 'full'}`}
-            file={detail.node.file}
-            startLine={detail.node.startLine || 1}
-            endLine={detail.node.endLine || detail.node.startLine || 1}
-            initial={detail.source}
-            initialMode={sourceMode}
-          />
-        ) : null}
       </div>
-    </div>
+    </SidePanel>
   );
 }
 
 /**
- * "Jump to editor" — POSTs `/api/open`, and on the contract's 409 ("no editor
- * command configured") falls back to the `vscode://` URL scheme. The button IS
- * that URL: rendering it as a real anchor means the fallback works even if the
- * click handler never runs, and makes the target visible on hover.
+ * "Jump to editor" — a title-bar icon button (phase F).
+ *
+ * Resolution order, and the phase F bug fix: the CONFIGURED editor command
+ * wins. The button POSTs `/api/open`, which runs the template from
+ * `~/.codegraph/ui.json` server-side; only the contract's 409 ("nothing
+ * configured") falls back to the `vscode://` URL scheme. It used to be rendered
+ * as an anchor whose `href` was ALWAYS that fallback URL — so the browser
+ * advertised (and, on any path that skipped the click handler, followed)
+ * `vscode://` even when the user had configured a different editor. A launch
+ * that fails is now reported instead of being silently swallowed.
  */
 function EditorJump({ root, file, line }: { root: string | null; file: string; line: number }) {
-  const [note, setNote] = useState<string | null>(null);
-  const href = useMemo(() => vscodeUrl(root, file, line), [root, file, line]);
+  const [state, setState] = useState<{ status: 'idle' | 'ok' | 'error'; message: string }>({
+    status: 'idle',
+    message: 'Jump to editor',
+  });
 
-  const handle = async (event: React.MouseEvent<HTMLAnchorElement>): Promise<void> => {
-    event.preventDefault();
-    setNote(null);
+  const jump = async (): Promise<void> => {
     const result = await openInEditor(file, line);
     if (result.ok) {
-      setNote('opened');
+      setState({ status: 'ok', message: 'Opened in your editor' });
       return;
     }
     if (result.reason === 'unconfigured') {
       // No server-side editor command: hand the OS the URL scheme instead.
-      setNote('no editor command set — using vscode://');
-      window.location.href = href;
+      setState({ status: 'ok', message: 'No editor command set — using vscode://' });
+      window.location.href = vscodeUrl(root, file, line);
       return;
     }
-    setNote(result.message);
+    setState({ status: 'error', message: result.message });
   };
 
   return (
-    <div className="mt-2 flex items-center gap-2">
-      <a
-        href={href}
-        onClick={(event) => void handle(event)}
-        data-testid="editor-jump"
-        className="inline-flex items-center gap-1.5 rounded border border-border/70 px-2 py-1 text-[10px] text-muted transition-colors hover:border-accent/60 hover:text-accent"
-      >
-        <ExternalLink className="h-3 w-3" /> jump to editor
-      </a>
-      {note ? <span className="truncate text-[10px] text-muted">{note}</span> : null}
-    </div>
+    <PanelButton onClick={() => void jump()} label={state.message} data-testid="editor-jump">
+      {state.status === 'ok' ? (
+        <Check className="h-3.5 w-3.5 text-accent" />
+      ) : state.status === 'error' ? (
+        <AlertTriangle className="h-3.5 w-3.5 text-red-400" />
+      ) : (
+        <SquareArrowOutUpRight className="h-3.5 w-3.5" />
+      )}
+    </PanelButton>
   );
 }
 
@@ -215,11 +221,15 @@ function RelationSections({
   title,
   arrow,
   relations,
+  model,
+  contextFile,
   onNavigate,
 }: {
   title: string;
   arrow: string;
   relations: NodeRelation[];
+  model: GraphModel | null;
+  contextFile: string;
   onNavigate(id: string): void;
 }) {
   const groups = useMemo(() => groupByKind(relations), [relations]);
@@ -231,7 +241,12 @@ function RelationSections({
       </div>
       {groups.map(([kind, items]) => (
         <Section key={kind} title={`${arrow} ${kind}`} count={items.length} defaultOpen>
-          <RelationList items={items} onNavigate={onNavigate} />
+          <RelationList
+            items={items}
+            model={model}
+            contextFile={contextFile}
+            onNavigate={onNavigate}
+          />
         </Section>
       ))}
     </div>
@@ -265,7 +280,7 @@ function Section({
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
-        className="flex w-full items-center gap-1 rounded px-0.5 py-0.5 text-left text-[10px] text-muted transition-colors hover:text-foreground"
+        className="flex w-full items-center gap-1 rounded px-0.5 py-0.5 text-left text-[10px] text-muted hover:text-foreground"
       >
         {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
         <span className="font-medium">{title}</span>
@@ -285,6 +300,7 @@ function NodeList({ items, onNavigate }: { items: NodeRef[]; onNavigate(id: stri
         <TargetRow
           key={item.id}
           kind={item.kind}
+          file={item.file}
           name={item.name}
           title={item.qualifiedName || item.name}
           onClick={() => onNavigate(item.id)}
@@ -299,9 +315,13 @@ function NodeList({ items, onNavigate }: { items: NodeRef[]; onNavigate(id: stri
 
 function RelationList({
   items,
+  model,
+  contextFile,
   onNavigate,
 }: {
   items: NodeRelation[];
+  model: GraphModel | null;
+  contextFile: string;
   onNavigate(id: string): void;
 }) {
   const [all, setAll] = useState(false);
@@ -311,12 +331,21 @@ function RelationList({
       {shown.map((relation, index) => {
         const target = relation.node;
         const heuristic = relation.provenance === 'heuristic';
+        // Qualified: `parent.symbol` inside this file, up to the file name
+        // outside it — a bare name is not enough to tell two `send`s apart.
+        const label = qualifiedLabel(
+          model,
+          target?.id ?? relation.target,
+          contextFile,
+          target ?? undefined
+        );
         return (
           <TargetRow
             key={`${relation.source}|${relation.target}|${relation.line ?? index}`}
             kind={target?.kind ?? 'unknown'}
-            name={target?.name ?? relation.target}
-            title={target?.qualifiedName || relation.target}
+            file={target?.file ?? ''}
+            name={label}
+            title={target?.qualifiedName || target?.file || relation.target}
             heuristic={heuristic}
             note={heuristic ? (relation.synthesizedBy ?? 'synthesized') : undefined}
             disabled={!target}
@@ -333,6 +362,7 @@ function RelationList({
 
 function TargetRow({
   kind,
+  file,
   name,
   title,
   note,
@@ -341,6 +371,7 @@ function TargetRow({
   onClick,
 }: {
   kind: string;
+  file: string;
   name: string;
   title: string;
   note?: string;
@@ -348,6 +379,7 @@ function TargetRow({
   disabled?: boolean;
   onClick(): void;
 }) {
+  const Icon = iconForNode(kind, file);
   return (
     <button
       type="button"
@@ -357,13 +389,13 @@ function TargetRow({
       data-testid="relation-row"
       data-kind={kind}
       className={cn(
-        'group flex w-full items-center gap-1.5 rounded px-1.5 py-[3px] text-left transition-colors',
+        'group flex w-full items-center gap-1.5 rounded px-1.5 py-[3px] text-left',
         disabled ? 'cursor-default opacity-50' : 'hover:bg-accent/10'
       )}
     >
-      <span
-        className={cn('h-1.5 w-1.5 shrink-0 rounded-full', heuristic && 'opacity-60')}
-        style={{ backgroundColor: colorForKind(kind) }}
+      <Icon
+        className={cn('h-3 w-3 shrink-0', heuristic && 'opacity-60')}
+        style={{ color: colorForKind(kind) }}
       />
       <span className="min-w-0 flex-1 truncate font-mono text-foreground/90">{name}</span>
       {note ? (
@@ -391,7 +423,7 @@ function MoreButton({ count, onClick }: { count: number; onClick(): void }) {
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-baseline gap-2">
-      <dt className="w-14 shrink-0 text-muted">{label}</dt>
+      <dt className="w-12 shrink-0 text-muted">{label}</dt>
       <dd className="min-w-0 flex-1 truncate font-mono text-foreground/90" title={value}>
         {value}
       </dd>
