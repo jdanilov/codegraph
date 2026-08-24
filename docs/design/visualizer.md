@@ -1466,6 +1466,108 @@ somewhere you did not ask it to go.
   seven-character infix) with 0 misses, and 300 rows sorted with 0 out of order
   plus equal names keeping their input order.
 
+### Performance round (G5.3) — incremental blit: move the last frame, paint only what moved
+
+G5.2 is right about the 84ms and right about the cliff, and still leaves pan
+juddering. This round puts a blit back — **viewport-sized only, and with the
+region the move exposes filled live every frame**, so it has neither the memory
+shape that broke G5.1 nor the black edge that broke G5.
+
+- **The diagnosis G5.2 missed: culling makes a frame cheap in GEOMETRY, not in
+  PIXELS.** On an accelerated 2D canvas the arc paths and the per-glyph curved
+  labels are not drawn when they are issued — they rasterise at **commit**. A
+  culled scene issues far fewer paths, but the ones it does issue still cover
+  the viewport, so the compositor still rasterises megapixels every frame. That
+  is the residual judder: it scales with the *area* the picture covers, and
+  culling cannot reduce that area, because the area is what the user is looking
+  at. The only way down is to stop producing the pixels — which is what a blit
+  is for.
+- **Pan, per frame.** ① One `drawImage` of the snapshot, shifted by the pan
+  delta. ② The **exposed region** — the viewport minus the blit's landing rect,
+  which for a pan is one or two thin edge strips. ③ Each strip is
+  background-filled, **clipped**, and painted by the *ordinary* scene pass with
+  the cull rect set to the strip: same arcs, same centres, same edges, same
+  tethers, same layering, nothing special-cased — the cull rejects everything
+  the pan did not uncover, so a strip is nearly free. ④ **Re-capture**: the
+  composed visible canvas is copied back into the snapshot and the stored camera
+  advances. That last step is what makes the cost O(*this frame's* delta) rather
+  than O(the whole pan): next frame's exposure is only the next few pixels, so a
+  drag that crosses three screens never pays more per frame than a drag that
+  moves one pixel.
+- **The rounded-camera no-drift rule.** Each frame's blit offset is rounded to
+  whole **device** pixels, and the camera stored with the snapshot is that
+  ROUNDED one — not the true camera. So every delta is measured against what the
+  pixels actually show. The error against the true camera is at most **half a
+  device pixel per axis and cannot accumulate**, however long the drag runs;
+  storing the true camera instead compounds it without bound (the probe's
+  mutation control drifts 285 device px over 600 steps). Strips are painted
+  under the same rounded camera, so the seam is self-consistent, and the settled
+  full redraw repaints exactly and re-captures.
+- **Zoom is the other trade.** A wheel frame scales the last **settled**
+  snapshot and deliberately **does not re-capture** — re-capturing a resampled
+  image compounds its own blur frame over frame, which is how a soft picture
+  becomes a wrong one. Zoom-in is soft until the settle window lands the real
+  redraw (the same trade the label plan already makes); **zoom-out exposes a
+  frame-shaped region around the scaled rect, and that region is filled live
+  exactly like a pan strip**, so there is no black there either. Because nothing
+  re-bases the snapshot mid-gesture, the accumulated ratio only grows, and past
+  **3× either way** the blit is refused: the rest of that gesture is direct
+  redraws. Softness has limits, and the limit falls out of the arithmetic rather
+  than out of a flag.
+- **The viewport-size hard limit.** The snapshot is *always* exactly the size of
+  the visible backing store. G5.1's 2w × 2h scene canvas is what put the texture
+  past the GPU cap and dropped the composite into software; the exposed region
+  is filled live *precisely so* there is never a reason to paint anything off
+  screen. Black edges are impossible by construction, not by budget: the blit's
+  on-screen part and the exposed rects **tile the viewport exactly** — no gap, no
+  overlap — and every exposed rect is background-filled before it is painted.
+  That tiling is also what erases the previous frame's chrome without a clear.
+- **Layering: capture before chrome.** The snapshot holds the scene only; the
+  disk `×`, the tether affordance and the drag ghost are drawn fresh *after* the
+  capture, on every frame, full or gesture. They are screen-space and cost two
+  circles, and the `×` / tether dot are **hover-gated** while hover is frozen for
+  the duration of a gesture — so baking them in would stamp a button the pointer
+  has since left. Capturing first is the simplest layering that cannot go stale.
+- **Invalidation is default-deny, unchanged in spirit from G5.** `requestDraw()`
+  — what every mutation path already calls — marks the scene dirty, and a dirty
+  scene is never blitted. **Exactly two sites opt out** (`requestCameraDraw`):
+  the pan branch of the pointer-move handler and `onWheel`. So model/layout/root
+  changes, a disk spawned, moved or closed, a wedge drag and its ghost, re-root
+  transitions, hover, selection, cards, impact mode, legend and edge-kind
+  filters, colour and sort modes, the ⌘P pulse, and resize / DPR changes all
+  force a full direct redraw by construction; a future path that forgets is
+  slower, never wrong. The deferred hover stays, and now schedules a frame
+  *without* dirtying — parking a hover changes nothing on screen. A full redraw
+  always ends by capturing a fresh snapshot with the exact camera, and the
+  capture is skipped (and the snapshot dropped) on any animating or pulsing
+  frame: a mid-animation snapshot must never be stamped back.
+- **Labels: plan wide, paint narrow.** The label plan is built only at full
+  passes; a gesture strip **replays** it and never rebuilds (a plan built from a
+  strip would be a plan for the strip, and storing it would throw away every
+  label on the rest of the screen). So a wedge a pan has just uncovered would
+  arrive bare and be named at settle, ≤100ms later. To make a modest pan
+  label-complete immediately, the full pass now builds the plan against the
+  viewport **expanded by 200 CSS px per side** while PAINTING stays culled to the
+  real rect — planning is one `measureText` pass, painting is the expensive part,
+  and only the cheap one grows. The `planStillFits` replay gates are unchanged.
+- Probed with a throwaway numeric probe over the real exported `planGestureBlit`
+  and `exposedRegion`, bundled with esbuild. **Pan:** 400 random
+  viewport/DPR/camera setups × 60 steps = **24,000** cases, with sub-pixel,
+  whole-pixel and viewport-sized deltas — **0 gaps, 0 double-draws, 0 strips
+  outside the viewport, 0 shape mismatches** against a scanline oracle that
+  samples every rect edge and a 25 × 25 grid; strips averaged **8.2% of the
+  viewport's area**. **No drift:** **182,921** consecutive rounded steps under a
+  deliberately biased sub-pixel drift — **0 violations**, worst error **0.4999998
+  device px** (the half-pixel bound, well inside the ≤1 the design asks for).
+  **Zoom:** **8,000** cursor-anchored cases over a log-uniform ⅙…6× factor —
+  **0 gaps, 0 overlapping strips, 0 outside**, the scaled rect matching the exact
+  re-projection of the snapshot's corners, and the 3× refusal firing on exactly
+  the 3,069 cases past the bound and no others. **Mutation controls:** storing
+  the true camera instead of the rounded one is caught on **35,869 of 36,000**
+  steps (worst drift 285 device px), and shrinking each strip by one pixel opens
+  a gap on **2,000 of 2,000** cases — so the zeroes above are results, not
+  tautologies.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all

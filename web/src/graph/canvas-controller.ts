@@ -261,6 +261,63 @@ const LABEL_SETTLE_MS = 100;
  */
 const CULL_MARGIN_PX = 24;
 
+/**
+ * How recently the camera must have moved for a frame to be served by the
+ * INCREMENTAL BLIT rather than by a scene pass over the whole viewport
+ * (performance round G5.3).
+ *
+ * Culling made a gesture frame cheap in *geometry*, but not in *pixels*: arc
+ * fills and per-glyph curved labels rasterise at commit, so a culled frame
+ * still hands the compositor megapixels of fresh ink. A camera-only gesture
+ * changes nothing about the scene, only where it sits, so the frame is the last
+ * one moved — one `drawImage` of a snapshot the size of the viewport, plus a
+ * live scene pass over the sliver the move exposed.
+ *
+ * Deliberately SHORTER than {@link LABEL_SETTLE_MS}: the settle window keeps the
+ * frame loop alive for 100ms after the gesture stops, so a window of 50ms
+ * guarantees the loop reaches a frame that is a real (full) redraw — which is
+ * what repaints exactly, re-plans the labels and refreshes the snapshot.
+ */
+const BLIT_GESTURE_MS = 50;
+
+/**
+ * How far a wheel gesture's accumulated zoom may drift from the snapshot it is
+ * scaling before the blit is abandoned for the rest of that gesture.
+ *
+ * A zoom blit resamples, so it is soft until the settle window lands the real
+ * redraw — the same trade the label plan already makes. Past this ratio the
+ * softness stops being "slightly soft" and starts being a different picture, so
+ * the frames go direct instead. There is no re-capture during a zoom (see
+ * {@link CanvasController.captureSnapshot}), which is what makes "the rest of
+ * the gesture" fall out of the ratio rather than needing a flag.
+ */
+const ZOOM_BLIT_MAX_RATIO = 3;
+
+/**
+ * Device px by which the zoom blit's exposed frame overlaps the scaled
+ * snapshot.
+ *
+ * A pan blit lands on whole device pixels, so its exposed strips abut the blit
+ * exactly and one device px is one device px. A zoom blit lands on fractional
+ * ones, where an exactly-abutting clip can leave a hairline of stale pixels;
+ * one px of deliberate overlap costs a sliver of double-drawn scene and cannot
+ * leave a seam.
+ */
+const ZOOM_BLIT_BLEED_PX = 1;
+
+/**
+ * How far past the viewport the LABEL PLAN is built, in CSS px per side.
+ *
+ * Painting is culled to the pixels being painted; PLANNING is not. A gesture
+ * strip replays the plan rather than rebuilding it (rebuilding from a strip
+ * would throw away every label outside the strip), so a wedge the pan has just
+ * pulled into view has no planned label until the camera settles. Planning one
+ * screen-third past every edge at each full pass means a pan of up to that far
+ * arrives label-complete; it costs one extra `measureText` pass over the wedges
+ * in the margin, and nothing extra at paint time.
+ */
+const LABEL_PLAN_MARGIN_PX = 200;
+
 /** Entries a colour cache holds before it is dropped wholesale and refilled. */
 const COLOR_CACHE_MAX = 4000;
 
@@ -350,6 +407,77 @@ interface DrawnEdge {
    * cross-disk curve, which lives in workspace space.
    */
   diskId: string | null;
+}
+
+/**
+ * A rectangle of the canvas, in CSS px, that a scene pass is being run for.
+ *
+ * A full frame's is the whole viewport; a gesture frame runs one per exposed
+ * strip. Everything below {@link CanvasController.cullFor} is written against
+ * this rather than against `(this.width, this.height)`, which is what lets a
+ * strip use the same painting code as a full frame.
+ */
+export interface ViewRect {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+/** A device-px rectangle of the backing store. */
+export interface BlitRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/**
+ * The camera a snapshot of the last full frame was painted under.
+ *
+ * A camera is exactly (origin, scale) — every disk, arc, rope and tether is
+ * placed through those two — so re-projecting a finished frame onto a new
+ * camera is one `drawImage`: `new = newOrigin + (old − oldOrigin) × ratio`,
+ * which composes a pan and a cursor-anchored zoom alike. The device pixel ratio
+ * and the CSS size ride along because a change to either means the snapshot's
+ * pixels no longer describe this canvas at all.
+ *
+ * The snapshot is always exactly the size of the VISIBLE canvas. Round G5.1
+ * painted a 2w × 2h one so a pan could read margin pixels instead of exposing
+ * background, and on a large display at ratio 2 that put the backing store past
+ * the GPU's maximum texture dimension: the "one drawImage" fell off the
+ * accelerated path and took 84ms. Never again — the exposed region is filled
+ * live instead, which costs a thin strip of scene and no memory at all.
+ */
+export interface SnapshotCamera {
+  /** Camera origin, in CSS px, that the snapshot's pixels actually show. */
+  originX: number;
+  originY: number;
+  scale: number;
+  ratio: number;
+  /** CSS size of the canvas the snapshot mirrors. */
+  width: number;
+  height: number;
+}
+
+/** How a gesture frame reuses the snapshot: where it lands, what it misses. */
+export interface GestureBlit {
+  /** `'pan'` is a whole-device-px translation; `'zoom'` resamples. */
+  kind: 'pan' | 'zoom';
+  /** Device-px rect the whole snapshot is stamped into. */
+  dest: BlitRect;
+  /**
+   * The viewport minus `dest`, in device px — disjoint rects which together
+   * with the on-screen part of `dest` tile the viewport exactly.
+   */
+  exposed: BlitRect[];
+  /**
+   * Camera origin, in CSS px, that the exposed region must be painted under —
+   * for a pan the ROUNDED one the blitted pixels show, so the strips agree with
+   * them; for a zoom the true one, which `dest` was derived from exactly.
+   */
+  originX: number;
+  originY: number;
 }
 
 /**
@@ -587,6 +715,26 @@ export class CanvasController {
   private readonly arcFills = new Map<string, string>();
   /** When the camera last moved — the label pass waits for this to go stale. */
   private cameraMovedAt = -Infinity;
+
+  /**
+   * Anything but the camera changed since the last full redraw (round G5.3).
+   *
+   * Set by {@link requestDraw}, which is what EVERY mutation path already calls
+   * — so a new one is dirty by default and the snapshot can only ever be blitted
+   * for a frame that is genuinely a camera transform of the last one. The two
+   * camera-only paths (a pan drag, the wheel) opt out through
+   * {@link requestCameraDraw}. A path that forgets is merely slower, never
+   * wrong, which is the right way round for a cache like this.
+   */
+  private sceneDirty = true;
+  /** When a camera-ONLY gesture last moved the camera. */
+  private cameraGestureAt = -Infinity;
+  /** Which camera-only gesture that was — a zoom never re-captures. */
+  private cameraGestureKind: 'pan' | 'zoom' | null = null;
+  /** The last exactly-painted scene, at the backing-store resolution. */
+  private snapshotCanvas: HTMLCanvasElement | null = null;
+  /** The camera those pixels show — `null` when they describe nothing. */
+  private snapshotCamera: SnapshotCamera | null = null;
 
   /**
    * A pointer position whose hit test was deferred because the camera was in
@@ -1382,6 +1530,10 @@ export class CanvasController {
     if (this.frame !== null) cancelAnimationFrame(this.frame);
     this.resizeObserver.disconnect();
     this.canvas.remove();
+    // The snapshot is a second backing store the size of the canvas — let it go
+    // with the canvas it mirrors.
+    this.snapshotCanvas = null;
+    this.snapshotCamera = null;
   }
 
   // --------------------------------------------------------------- layout ---
@@ -1684,22 +1836,40 @@ export class CanvasController {
   // -------------------------------------------------------------- painting ---
 
   /**
-   * Ask for a frame — the model, the layouts, the hover, a filter, a card, a
-   * disk's position, or just the camera. One entry point, coalesced to one
-   * `requestAnimationFrame`.
+   * Ask for a frame because SOMETHING CHANGED — the model, the layouts, the
+   * hover, a filter, a card, a disk's position…
    *
-   * Round G5.2 removed the camera-only fast path that used to sit beside this
-   * one: a gesture frame is now the same culled redraw as any other frame, so
-   * there is no snapshot to keep, nothing to invalidate, and no way for the
-   * picture to be stale.
+   * This is the default and every mutation path uses it: it marks the scene
+   * dirty, which is what forbids the next frame from reusing the snapshot. A
+   * path that genuinely only moved the camera opts out explicitly
+   * ({@link requestCameraDraw}); anything that forgets to is merely slower, not
+   * wrong, which is the right way round for a cache like this.
    */
   private requestDraw(): void {
+    this.sceneDirty = true;
+    this.scheduleFrame();
+  }
+
+  /**
+   * Ask for a frame after a CAMERA-ONLY gesture — a pan drag, a wheel zoom.
+   *
+   * Exactly two callers, and adding a third means proving the scene is
+   * bit-identical under the new camera.
+   */
+  private requestCameraDraw(kind: 'pan' | 'zoom'): void {
+    this.cameraGestureAt = performance.now();
+    this.cameraGestureKind = kind;
+    this.scheduleFrame();
+  }
+
+  /** One frame, coalesced. Neither marks nor clears {@link sceneDirty}. */
+  private scheduleFrame(): void {
     if (this.frame !== null || this.disposed) return;
     this.frame = requestAnimationFrame(() => {
       this.frame = null;
       if (this.disposed) return;
       this.draw();
-      if (this.disks.some((disk) => disk.transitionStart > 0)) this.requestDraw();
+      if (this.disks.some((disk) => disk.transitionStart > 0)) this.scheduleFrame();
     });
   }
 
@@ -1715,7 +1885,31 @@ export class CanvasController {
       this.updateHover(at);
     }
 
-    // Straight onto the visible canvas, in CSS px. Every frame is a real frame.
+    // Mid-gesture, with nothing but the camera changed: stamp the last exact
+    // frame back through the camera delta and paint only what the move exposed.
+    if (this.drawGesture(ratio)) return;
+    this.drawFull(ratio);
+  }
+
+  /**
+   * A frame with nothing to reuse: clear, paint the whole viewport, keep it.
+   *
+   * The picture is written straight onto the visible canvas in CSS px — there
+   * is no offscreen scene canvas, and there never will be again (see
+   * {@link SnapshotCamera}). The snapshot is taken from the finished pixels,
+   * BEFORE the chrome goes on: the `×` and the tether dot are hover-gated and
+   * hover is frozen for the duration of a gesture, so baking them in would
+   * stamp a button that the pointer has since left. The chrome is screen-space
+   * and costs two circles, so every frame — full or gesture — simply draws it
+   * fresh on top of a chrome-less scene.
+   */
+  private drawFull(ratio: number): void {
+    // Cleared BEFORE painting: a mutation that lands mid-frame (a summary
+    // callback re-entering the controller) must survive as dirty, so the next
+    // frame is a real redraw and the capture below is skipped.
+    const sceneChanged = this.sceneDirty;
+    this.sceneDirty = false;
+
     const ctx = this.ctx;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.globalAlpha = 1;
@@ -1724,12 +1918,148 @@ export class CanvasController {
     ctx.fillRect(0, 0, this.width, this.height);
 
     const model = this.model;
-    if (!model) return;
+    if (!model) {
+      this.snapshotCamera = null;
+      return;
+    }
 
     if (this.edgesDirty) this.rebuildEdges();
 
     const origin = this.origin();
     const scale = this.scale();
+    this.paintScene(ctx, model, origin, scale, this.viewport(), true);
+
+    this.captureSnapshot(ratio, origin, scale, sceneChanged);
+
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.globalAlpha = 1;
+    this.drawDiskChrome(ctx);
+    this.drawGhost(ctx);
+
+    // Two things keep the frame loop alive on their own: the ⌘P pulse, and the
+    // camera-settle window that owes the labels one more (full) pass.
+    if (this.pulseNodeId !== null || this.cameraSettling()) this.scheduleFrame();
+
+    // The edge count is part of the summary, and it only ever changes here.
+    if (this.drawnEdges.length !== this.emittedEdges) this.emitSummary();
+  }
+
+  /**
+   * The camera-gesture fast path: move the last exact frame and fill in what
+   * moving it exposed. `true` when the frame was served this way.
+   *
+   * Culling made a gesture frame cheap in geometry but not in pixels — arc
+   * fills and per-glyph curved labels rasterise at commit, so a culled frame
+   * still hands the compositor the whole viewport of fresh ink. Here the
+   * viewport arrives as one `drawImage` (GPU, viewport-sized, never larger) and
+   * the only scene work is the strip the move uncovered: one or two thin edges
+   * for a pan, a thin frame for a zoom out. Because a pan RE-CAPTURES the
+   * composed result each frame, the next frame's strip is only the next few
+   * pixels — the strip cost is O(this frame's delta), not O(the whole pan).
+   *
+   * Every condition below is a reason the snapshot cannot describe this frame:
+   * the scene changed, a disk is animating, the pulse is breathing, the canvas
+   * or its device pixel ratio moved under it, a NON-camera drag is in flight
+   * (the wedge ghost, a disk being moved), or the gesture has simply stopped.
+   */
+  private drawGesture(ratio: number): boolean {
+    const snapshot = this.snapshotCamera;
+    const source = this.snapshotCanvas;
+    const model = this.model;
+    if (!snapshot || !source || !model || this.sceneDirty) return false;
+    if (performance.now() - this.cameraGestureAt >= BLIT_GESTURE_MS) return false;
+    if (snapshot.ratio !== ratio) return false;
+    if (snapshot.width !== this.width || snapshot.height !== this.height) return false;
+    if (this.pulseNodeId !== null) return false;
+    if (this.drag !== null && this.drag.mode !== 'pan') return false;
+    if (this.disks.some((disk) => disk.transitionStart > 0)) return false;
+
+    const origin = this.origin();
+    const scale = this.scale();
+    const plan = planGestureBlit(snapshot, origin.x, origin.y, scale);
+    if (!plan) return false;
+
+    const ctx = this.ctx;
+
+    // 1. The snapshot, moved. A pan is a whole-device-px translation of an
+    //    image onto itself at its own size, so it cannot resample; a zoom is
+    //    the same image scaled about the point the wheel pinned, which is
+    //    exactly what (origin, scale) then vs now says.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.imageSmoothingEnabled = plan.kind === 'zoom';
+    ctx.drawImage(source, plan.dest.x, plan.dest.y, plan.dest.w, plan.dest.h);
+    ctx.imageSmoothingEnabled = true;
+
+    // 2. What the move exposed, painted LIVE — the same scene code, clipped to
+    //    the strip and culled to it. Black edges are impossible by
+    //    construction: the blit's on-screen part and these rects tile the
+    //    viewport exactly, and every one of them is background-filled first.
+    if (this.edgesDirty) this.rebuildEdges();
+    const stripOrigin = { x: plan.originX, y: plan.originY };
+    for (const rect of plan.exposed) {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.beginPath();
+      ctx.rect(rect.x, rect.y, rect.w, rect.h);
+      ctx.clip();
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.globalAlpha = 1;
+      const view: ViewRect = {
+        x0: rect.x / ratio,
+        y0: rect.y / ratio,
+        x1: (rect.x + rect.w) / ratio,
+        y1: (rect.y + rect.h) / ratio,
+      };
+      ctx.fillStyle = BACKGROUND;
+      ctx.fillRect(view.x0, view.y0, view.x1 - view.x0, view.y1 - view.y0);
+      this.paintScene(ctx, model, stripOrigin, scale, view, false);
+      ctx.restore();
+    }
+
+    // 3. Keep the composed result, and advance the stored camera to the ROUNDED
+    //    one the pixels now show. A zoom deliberately does not: re-capturing a
+    //    resampled image would compound its blur frame over frame, so a wheel
+    //    gesture keeps scaling the last SETTLED snapshot until it runs out of
+    //    ratio (see {@link ZOOM_BLIT_MAX_RATIO}).
+    if (plan.kind === 'pan') this.captureSnapshot(ratio, stripOrigin, snapshot.scale, false);
+
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.globalAlpha = 1;
+    this.drawDiskChrome(ctx);
+    this.drawGhost(ctx);
+
+    if (this.pulseNodeId !== null || this.cameraSettling()) this.scheduleFrame();
+    return true;
+  }
+
+  /**
+   * The scene itself — every disk, then the workspace-space ropes — for one
+   * rectangle of the canvas.
+   *
+   * The rectangle is the whole viewport for a full frame and one exposed strip
+   * for a gesture frame, and NOTHING here knows which: a strip is the same
+   * arcs, centres, edges, tethers and labels in the same order, clipped by the
+   * caller and culled to the same rect. `planLabels` is the one distinction —
+   * see {@link drawLabels}.
+   */
+  private paintScene(
+    ctx: CanvasRenderingContext2D,
+    model: GraphModel,
+    origin: Point,
+    scale: number,
+    view: ViewRect,
+    planLabels: boolean
+  ): void {
+    // Planning is deliberately WIDER than painting: see LABEL_PLAN_MARGIN_PX.
+    const planView: ViewRect | null = planLabels
+      ? {
+          x0: view.x0 - LABEL_PLAN_MARGIN_PX,
+          y0: view.y0 - LABEL_PLAN_MARGIN_PX,
+          x1: view.x1 + LABEL_PLAN_MARGIN_PX,
+          y1: view.y1 + LABEL_PLAN_MARGIN_PX,
+        }
+      : null;
 
     for (const disk of this.disks) {
       const layout = disk.layout;
@@ -1754,18 +2084,27 @@ export class CanvasController {
       // are culled by their own curve below, since either can cross a viewport
       // that neither of its two disks touches.
       const k = scale * animationScale;
-      const cull = this.cullFor(origin.x + disk.x * scale, origin.y + disk.y * scale, k);
+      const cx = origin.x + disk.x * scale;
+      const cy = origin.y + disk.y * scale;
+      const cull = this.cullFor(cx, cy, k, view);
       if (cull.dMin > layout.maxRadius) continue;
 
       ctx.save();
-      ctx.translate(origin.x + disk.x * scale, origin.y + disk.y * scale);
+      ctx.translate(cx, cy);
       ctx.scale(k, k);
       ctx.globalAlpha = progress < 1 ? 0.25 + 0.75 * eased : 1;
 
       this.drawArcs(ctx, disk, layout, model, k, cull);
       if (cull.dMin <= layout.centreRadius) this.drawCentre(ctx, disk, layout, k);
       this.drawEdges(ctx, disk.id, k, cull);
-      this.drawLabels(ctx, disk, model, k, cull);
+      this.drawLabels(
+        ctx,
+        disk,
+        model,
+        k,
+        cull,
+        planView ? this.cullFor(cx, cy, k, planView) : null
+      );
 
       ctx.restore();
     }
@@ -1773,7 +2112,7 @@ export class CanvasController {
     // Cross-disk relations live in workspace space and are drawn once, over the
     // disks: a curve that vanished under an opaque wedge would claim a
     // connection it never showed.
-    const workspaceCull = this.cullFor(origin.x, origin.y, scale);
+    const workspaceCull = this.cullFor(origin.x, origin.y, scale, view);
     ctx.save();
     ctx.translate(origin.x, origin.y);
     ctx.scale(scale, scale);
@@ -1781,35 +2120,99 @@ export class CanvasController {
     this.drawTethers(ctx, scale, workspaceCull);
     this.drawEdges(ctx, null, scale, workspaceCull);
     ctx.restore();
-
-    this.drawDiskChrome(ctx);
-    this.drawGhost(ctx);
-
-    // Two things keep the frame loop alive on their own: the ⌘P pulse, and the
-    // camera-settle window that owes the labels one more (full) pass.
-    if (this.pulseNodeId !== null || this.cameraSettling()) this.requestDraw();
-
-    // The edge count is part of the summary, and it only ever changes here.
-    if (this.drawnEdges.length !== this.emittedEdges) this.emitSummary();
   }
 
   /**
-   * The viewport in the local units of a frame whose origin sits at screen
-   * `(cx, cy)` and whose unit is `k` screen px — a disk's frame, or the
+   * Keep the pixels just painted, with the camera they show.
+   *
+   * The snapshot canvas is exactly the size of the visible backing store, and
+   * the copy is canvas → canvas, never `getImageData`: this is a GPU blit,
+   * a readback is a synchronisation point.
+   *
+   * Skipped — and the previous snapshot dropped — while anything is animating:
+   * a transition or pulse frame is a moment in an animation, not a scene at
+   * rest, and reusing one after the animation finished would show the picture
+   * mid-morph. Dropping rather than keeping is the safe direction: no snapshot
+   * simply means the next gesture frame is a full redraw.
+   */
+  private captureSnapshot(
+    ratio: number,
+    origin: Point,
+    scale: number,
+    sceneChanged: boolean
+  ): void {
+    // A wheel gesture blits from the last SETTLED snapshot and never refreshes
+    // it, which is also what makes the ratio bound stick: once the zoom leaves
+    // the snapshot, nothing re-bases it, so the rest of the gesture is direct
+    // redraws. The one thing that overrides that is the scene itself changing
+    // under the gesture — then the held snapshot describes a picture that no
+    // longer exists, and it is dropped rather than kept.
+    if (
+      this.cameraGestureKind === 'zoom' &&
+      performance.now() - this.cameraGestureAt < BLIT_GESTURE_MS
+    ) {
+      if (sceneChanged) this.snapshotCamera = null;
+      return;
+    }
+    const animating =
+      this.sceneDirty || this.pulseNodeId !== null || this.disks.some((d) => d.transitionStart > 0);
+    const width = this.canvas.width;
+    const height = this.canvas.height;
+    if (animating || width === 0 || height === 0) {
+      this.snapshotCamera = null;
+      return;
+    }
+    let target = this.snapshotCanvas;
+    if (!target) {
+      target = document.createElement('canvas');
+      this.snapshotCanvas = target;
+    }
+    if (target.width !== width || target.height !== height) {
+      target.width = width;
+      target.height = height;
+    }
+    const ctx = target.getContext('2d');
+    if (!ctx) {
+      this.snapshotCamera = null;
+      return;
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(this.canvas, 0, 0);
+    this.snapshotCamera = {
+      originX: origin.x,
+      originY: origin.y,
+      scale,
+      ratio,
+      width: this.width,
+      height: this.height,
+    };
+  }
+
+  /** The whole visible canvas, in CSS px. */
+  private viewport(): ViewRect {
+    return { x0: 0, y0: 0, x1: this.width, y1: this.height };
+  }
+
+  /**
+   * A rect of the canvas in the local units of a frame whose origin sits at
+   * screen `(cx, cy)` and whose unit is `k` screen px — a disk's frame, or the
    * workspace's.
    *
-   * The rect is the VISIBLE canvas, padded by {@link CULL_MARGIN_PX} for the
-   * strokes and glyphs that sit slightly outside their wedge at its own edge.
-   * Round G5.2 took the half-viewport margin back out with the blit it existed
-   * for: every frame is painted for the pixels the screen actually shows, so
-   * there is nothing off screen that a later frame has to be able to reuse.
+   * `view` is the CSS-px rect actually being painted, padded by
+   * {@link CULL_MARGIN_PX} for the strokes and glyphs that sit slightly outside
+   * their wedge at its own edge. For a full frame that is the visible canvas;
+   * for a gesture strip it is the strip, which is what makes the strip nearly
+   * free — the cull rejects everything the pan did not uncover.
    */
-  private cullFor(cx: number, cy: number, k: number): ViewCull {
+  private cullFor(cx: number, cy: number, k: number, view: ViewRect): ViewCull {
     return makeCull(
-      (-CULL_MARGIN_PX - cx) / k,
-      (-CULL_MARGIN_PX - cy) / k,
-      (this.width + CULL_MARGIN_PX - cx) / k,
-      (this.height + CULL_MARGIN_PX - cy) / k
+      (view.x0 - CULL_MARGIN_PX - cx) / k,
+      (view.y0 - CULL_MARGIN_PX - cy) / k,
+      (view.x1 + CULL_MARGIN_PX - cx) / k,
+      (view.y1 + CULL_MARGIN_PX - cy) / k
     );
   }
 
@@ -2227,16 +2630,33 @@ export class CanvasController {
     disk: DiskState,
     model: GraphModel,
     k: number,
-    cull: ViewCull
+    cull: ViewCull,
+    planCull: ViewCull | null
   ): void {
     // While the camera is moving the last PLAN is replayed through arithmetic
     // gates only. Rebuilding it costs an orientation choice and a `measureText`
     // per candidate wedge, which at 60fps is exactly the judder the round-4
     // review reported; the gates below are a handful of multiplications and the
     // real pass runs the moment the gesture stops.
-    const reuse = this.cameraSettling() && disk.labelPlan !== null;
-    const plan = reuse ? disk.labelPlan! : this.buildLabelPlan(ctx, disk, k, cull);
-    if (!reuse) disk.labelPlan = plan;
+    //
+    // `planCull === null` means this pass is one EXPOSED STRIP of a gesture
+    // frame, and it replays or it draws nothing: a plan built from a strip
+    // would be a plan for the strip, and storing it would throw away every
+    // label on the rest of the screen. A wedge the pan has just uncovered
+    // therefore arrives bare and is named when the camera settles — which the
+    // wide planning margin makes rare, since a plan already covers a screen
+    // third past every edge.
+    const build = planCull !== null && !(this.cameraSettling() && disk.labelPlan !== null);
+    let plan: PlannedLabel[];
+    if (build) {
+      plan = this.buildLabelPlan(ctx, disk, k, planCull!);
+      disk.labelPlan = plan;
+    } else if (disk.labelPlan !== null) {
+      plan = disk.labelPlan;
+    } else {
+      return;
+    }
+    const reuse = !build;
 
     for (const label of plan) {
       const arc = label.geom.arc;
@@ -2275,8 +2695,10 @@ export class CanvasController {
     const plan: PlannedLabel[] = [];
     for (const geom of disk.labelGeom) {
       // The `measureText` this pass exists to spend is spent on what is on
-      // screen. The plan is therefore viewport-shaped — which is exactly what
-      // the replay above re-checks it against.
+      // screen, plus {@link LABEL_PLAN_MARGIN_PX} of slack so a modest pan is
+      // label-complete before the camera settles. The plan is therefore
+      // viewport-shaped — which is exactly what the replay above re-checks it
+      // against, at the real (unexpanded) rect.
       if (!arcVisible(cull, geom.arc)) continue;
       if (this.isHiddenArc(geom.arc)) continue;
       const label = this.planLabel(ctx, geom, k);
@@ -2953,7 +3375,10 @@ export class CanvasController {
         this.panX += dx;
         this.panY += dy;
         this.cameraMoved();
-        this.requestDraw();
+        // Camera only: the scene is unchanged, so the frame is the last one
+        // shifted plus the strip the shift uncovered — see `drawGesture`. One
+        // of exactly two sites that opt out of the dirty default.
+        this.requestCameraDraw('pan');
         return;
       }
       if (drag.mode === 'move-disk') {
@@ -2980,12 +3405,15 @@ export class CanvasController {
     // which would land in the middle of a wheel zoom, which has no drag to
     // suppress it the way a pan does. It is deferred to the settled frame
     // instead: the pointer has not moved, only what is under it, so answering
-    // once at the end is the same answer for less work. (Kept in round G5.2:
-    // the redraw is direct now, but the hit test the deferral skips is exactly
-    // the per-tick work a wheel gesture cannot afford.)
+    // once at the end is the same answer for less work. (Kept through rounds
+    // G5.2 and G5.3: the hit test the deferral skips is exactly the per-tick
+    // work a wheel gesture cannot afford, whatever the frame is made of.)
     if (this.cameraSettling()) {
       this.pendingHover = position;
-      this.requestDraw();
+      // `scheduleFrame`, not `requestDraw`: parking a hover changes nothing on
+      // screen, and dirtying the scene here would cancel the blit for every
+      // pointer move a wheel zoom happens to sit under.
+      this.scheduleFrame();
       return;
     }
     this.pendingHover = null;
@@ -3235,7 +3663,10 @@ export class CanvasController {
     this.panX = position.x - before.x * scale - centre.x;
     this.panY = position.y - before.y * scale - centre.y;
     this.cameraMoved();
-    this.requestDraw();
+    // Camera only, exactly like a pan: the blit scales the last settled frame
+    // about the point the gesture pinned, which is what (origin, scale) then vs
+    // now says. The other of the two sites that opt out of the dirty default.
+    this.requestCameraDraw('zoom');
     this.emitSummary();
   };
 
@@ -3474,6 +3905,106 @@ function fontSpec(fontPx: number, k: number): string {
 
 /** Entries the text-metrics cache holds before it stops growing. */
 const TEXT_CACHE_MAX = 4000;
+
+// ------------------------------------------------------------------ blit ---
+
+/**
+ * The part of the viewport a blit does NOT cover, as disjoint device-px rects.
+ *
+ * Plain rectangle subtraction, written so the answer is a TILING rather than a
+ * cover: `dest ∩ viewport` plus everything returned here is the viewport
+ * exactly, with no rect overlapping another. That is the whole correctness
+ * argument for the incremental blit — every pixel on screen this frame was
+ * either stamped from the snapshot or painted live, and none was painted twice.
+ * When `dest` misses the viewport entirely the answer is the viewport itself,
+ * which degenerates the gesture frame into a full one without a special case.
+ *
+ * `bleed` grows the covered rect's assumed edges INWARD, so the returned rects
+ * overlap the blit by that much. It is 0 for a pan, whose rects land on whole
+ * device pixels and abut exactly; a zoom lands on fractional ones, where an
+ * exactly-abutting clip can leave a hairline of stale pixels.
+ */
+export function exposedRegion(dest: BlitRect, vw: number, vh: number, bleed = 0): BlitRect[] {
+  if (vw <= 0 || vh <= 0) return [];
+  const whole: BlitRect[] = [{ x: 0, y: 0, w: vw, h: vh }];
+  const ix0 = Math.max(0, dest.x) + bleed;
+  const iy0 = Math.max(0, dest.y) + bleed;
+  const ix1 = Math.min(vw, dest.x + dest.w) - bleed;
+  const iy1 = Math.min(vh, dest.y + dest.h) - bleed;
+  if (!(ix1 > ix0 && iy1 > iy0)) return whole;
+
+  const out: BlitRect[] = [];
+  if (iy0 > 0) out.push({ x: 0, y: 0, w: vw, h: iy0 });
+  if (iy1 < vh) out.push({ x: 0, y: iy1, w: vw, h: vh - iy1 });
+  if (ix0 > 0) out.push({ x: 0, y: iy0, w: ix0, h: iy1 - iy0 });
+  if (ix1 < vw) out.push({ x: ix1, y: iy0, w: vw - ix1, h: iy1 - iy0 });
+  return out;
+}
+
+/**
+ * How a gesture frame reuses `snapshot` under the camera `(originX, originY,
+ * scale)` — or `null` when it cannot, and the frame must be drawn in full.
+ *
+ * Two shapes, told apart by the scale ratio alone (not by which gesture is in
+ * flight — a pan drag that starts before a wheel zoom has settled is still
+ * looking at a snapshot taken at another scale, and must scale it):
+ *
+ *  - **pan** — the ratio is 1, so the snapshot only moves. The offset is
+ *    rounded to whole DEVICE px and the camera returned is the rounded one, so
+ *    the strips are painted under exactly the camera the blitted pixels show
+ *    and the caller's re-capture stores that same camera. The next frame's
+ *    offset is therefore measured against what is really on screen: the error
+ *    against the true camera is at most half a device px on each axis and
+ *    CANNOT accumulate, however long the drag runs. A pan of a whole viewport
+ *    or more in one frame reuses nothing and is refused.
+ *  - **zoom** — the snapshot is scaled about the point the wheel pinned, which
+ *    falls straight out of the two cameras: `new = newOrigin + (old − oldOrigin)
+ *    × ratio`. It resamples, so it is soft until the settle window repaints it,
+ *    and past {@link ZOOM_BLIT_MAX_RATIO} either way it is refused — a snapshot
+ *    stretched three times over has stopped being the picture.
+ */
+export function planGestureBlit(
+  snapshot: SnapshotCamera,
+  originX: number,
+  originY: number,
+  scale: number
+): GestureBlit | null {
+  const ratio = snapshot.ratio;
+  const vw = Math.round(snapshot.width * ratio);
+  const vh = Math.round(snapshot.height * ratio);
+  if (!(vw > 0 && vh > 0) || !Number.isFinite(ratio) || ratio <= 0) return null;
+  const factor = scale / snapshot.scale;
+  if (!Number.isFinite(factor) || factor <= 0) return null;
+
+  if (Math.abs(factor - 1) <= 1e-9) {
+    const dx = Math.round((originX - snapshot.originX) * ratio);
+    const dy = Math.round((originY - snapshot.originY) * ratio);
+    if (Math.abs(dx) >= vw || Math.abs(dy) >= vh) return null;
+    const dest: BlitRect = { x: dx, y: dy, w: vw, h: vh };
+    return {
+      kind: 'pan',
+      dest,
+      exposed: exposedRegion(dest, vw, vh),
+      originX: snapshot.originX + dx / ratio,
+      originY: snapshot.originY + dy / ratio,
+    };
+  }
+
+  if (factor > ZOOM_BLIT_MAX_RATIO || factor < 1 / ZOOM_BLIT_MAX_RATIO) return null;
+  const dest: BlitRect = {
+    x: (originX - snapshot.originX * factor) * ratio,
+    y: (originY - snapshot.originY * factor) * ratio,
+    w: vw * factor,
+    h: vh * factor,
+  };
+  return {
+    kind: 'zoom',
+    dest,
+    exposed: exposedRegion(dest, vw, vh, ZOOM_BLIT_BLEED_PX),
+    originX,
+    originY,
+  };
+}
 
 // ---------------------------------------------------------------- culling ---
 
