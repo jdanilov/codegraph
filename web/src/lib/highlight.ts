@@ -113,3 +113,81 @@ export function escapeHtml(text: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
 }
+
+/**
+ * Split highlight.js output into one HTML string PER SOURCE LINE.
+ *
+ * A bubble lays its body out as one grid row per logical line, so that a long
+ * line can WRAP inside its own row and the gutter number beside it still points
+ * at the line it belongs to. That needs the highlighted HTML split at every
+ * newline — and highlight.js emits spans that freely cross newlines (a block
+ * comment, a template literal, a multi-line string are all one span), so a
+ * naive `split('\n')` produces rows with unbalanced tags: the browser closes
+ * them at the row boundary and every following row loses its colour.
+ *
+ * The fix is the standard one: carry the open-span STACK across the break.
+ * At each newline every open span is closed, the line is emitted, and the same
+ * stack is re-opened verbatim at the start of the next one. The result is
+ * per-line HTML that is individually balanced and, concatenated with newlines
+ * between the rows, renders exactly the text the highlighter was given.
+ *
+ * Tag-shape-agnostic on purpose: anything that is not `</…>` and does not
+ * self-close pushes, `</…>` pops. hljs only ever emits `<span>`, but a build
+ * that emitted something else would degrade to "one extra wrapper re-opened"
+ * rather than to broken markup.
+ *
+ * Pure and total. Text outside tags is copied through untouched — it is
+ * already escaped by the highlighter, and re-escaping it would double every
+ * entity in the body.
+ */
+export function splitHighlightedLines(html: string): string[] {
+  const lines: string[] = [];
+  const open: string[] = [];
+  let current = '';
+  let index = 0;
+
+  /** Close every open span, emit the row, and re-open the same stack. */
+  const breakLine = (): void => {
+    for (let i = 0; i < open.length; i++) current += '</span>';
+    lines.push(current);
+    current = open.join('');
+  };
+
+  /** Copy a run of text, breaking the row at every newline inside it. */
+  const text = (run: string): void => {
+    let start = 0;
+    for (;;) {
+      const at = run.indexOf('\n', start);
+      if (at < 0) {
+        current += run.slice(start);
+        return;
+      }
+      current += run.slice(start, at);
+      breakLine();
+      start = at + 1;
+    }
+  };
+
+  while (index < html.length) {
+    const next = html.indexOf('<', index);
+    if (next < 0) {
+      text(html.slice(index));
+      break;
+    }
+    if (next > index) text(html.slice(index, next));
+    const close = html.indexOf('>', next);
+    if (close < 0) {
+      // A `<` with no `>` after it is not a tag — it is text the highlighter
+      // would have escaped — so it is copied rather than swallowing the rest.
+      text(html.slice(next));
+      break;
+    }
+    const tag = html.slice(next, close + 1);
+    current += tag;
+    if (tag.startsWith('</')) open.pop();
+    else if (!tag.endsWith('/>')) open.push(tag);
+    index = close + 1;
+  }
+  lines.push(current);
+  return lines;
+}

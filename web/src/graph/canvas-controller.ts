@@ -1391,6 +1391,21 @@ export class CanvasController {
    * name. Everything else does — a file bubble is the whole file, a symbol
    * bubble its own span.
    */
+  /**
+   * How many lines a node's bubble will show — its own span, which is what a
+   * spawn knows before any source has been fetched.
+   *
+   * The number the header prints ends up being the FETCHED span's length, and
+   * for an ordinary node the two are the same; where they differ (a stale
+   * index, a truncated read) the box is a few rows out, which is a box, not a
+   * bug. `0` for a node the model does not have, which reads as the minimum.
+   */
+  private bubbleLoc(nodeId: string | null): number {
+    const node = nodeId ? this.model?.get(nodeId) : null;
+    if (!node) return 0;
+    return Math.max(1, node.endLine - node.startLine + 1);
+  }
+
   private bubbleable(nodeId: string): boolean {
     const node = this.model?.get(nodeId);
     return Boolean(node && node.kind !== DIRECTORY_KIND && node.file);
@@ -1430,16 +1445,21 @@ export class CanvasController {
     // — and since B2.3 those two ARE the same number: a bubble's footprint in
     // the world is exactly its frame px, at every zoom, which is what being a
     // world object means.
+    //
+    // B3: that default is now the node's OWN size — three lines of code get a
+    // three-line box — from the same pure helper the ghost was drawn from, so
+    // the release lands exactly the rectangle the drag promised.
     const scale = this.scale();
     const frameScale = bubbleFrameScale(scale);
-    const halfW = (BUBBLE_DEFAULT_WIDTH * frameScale) / 2 / scale;
-    const halfH = (BUBBLE_DEFAULT_HEIGHT * frameScale) / 2 / scale;
+    const size = bubbleDefaultSize(this.bubbleLoc(nodeId));
+    const halfW = (size.w * frameScale) / 2 / scale;
+    const halfH = (size.h * frameScale) / 2 / scale;
     this.createBubble({
       nodeId,
       x: at.x - halfW,
       y: at.y - halfH,
-      w: BUBBLE_DEFAULT_WIDTH,
-      h: BUBBLE_DEFAULT_HEIGHT,
+      w: size.w,
+      h: size.h,
       scrollTop: 0,
       expanded: false,
       sourceDiskId,
@@ -1644,6 +1664,11 @@ export class CanvasController {
     bubble.w = size.w;
     bubble.h = size.h;
     bubble.view.setSize(size.w, size.h);
+    // A narrower box wraps more lines and a wider one fewer (B3), so the row
+    // offsets the threads are drawn from are only true for the width they were
+    // measured at. The browser has to reflow for the resize anyway; this reads
+    // the result of that reflow back rather than forcing a second one.
+    this.measureBubbleBody(bubble);
     this.requestDraw();
     this.notifyWorkspace();
   }
@@ -1771,6 +1796,11 @@ export class CanvasController {
       bubble.fontScale = presentation.fontScale;
       bubble.view.setFontScale(presentation.fontScale);
       if (!bubble.measured) continue;
+      // The frame was just re-laid out at a different size of type, and type
+      // does not wrap at exactly proportional places at every size (B3) — so
+      // the row offsets are re-read from the layout that was just written,
+      // before anything is computed from them.
+      this.measureBubbleBody(bubble);
       // The centre-line rule: whatever was in the middle of the frame stays in
       // the middle of it. Under a frame that scales as one thing that is the
       // offset it already had — but the DOM holds the offset in LAYOUT px, so
@@ -1785,6 +1815,12 @@ export class CanvasController {
         padBottom: bubble.metrics.padBottom,
         lineHeight: bubble.metrics.lineHeight,
         lineCount: bubble.lineCount,
+        // What the scrollport can actually scroll, measured (B3): with
+        // wrapping, `rows × lineHeight` is a floor on the content, not the
+        // content, and a limit built from it would clamp the offset short.
+        ...(bubble.metrics.contentHeight !== undefined
+          ? { contentHeight: bubble.metrics.contentHeight }
+          : {}),
         fromScale: from,
         toScale: presentation.fontScale,
       });
@@ -2047,6 +2083,11 @@ export class CanvasController {
       padTop: geometry.padTop,
       padBottom: geometry.padBottom,
       lineHeight: geometry.lineHeight,
+      // B3: where every row actually is, since a wrapped line is no longer at
+      // its index times a row height. Carried as data so the anchor stays a
+      // pure function of numbers the DOM was asked for once.
+      rowEdges: geometry.rowEdges,
+      contentHeight: geometry.contentHeight,
     };
     bubble.firstLine = geometry.firstLine;
     bubble.lineCount = geometry.lineCount;
@@ -2135,12 +2176,18 @@ export class CanvasController {
     const x = (rect.x + rect.w + CALL_OPEN_GAP_PX * frameScale - origin.x) / scale;
     const y = (anchor.y - caller.metrics.headerHeight * frameScale - origin.y) / scale;
 
+    // The chain keeps its COLUMN — the callee is as wide as the caller, so a
+    // traced flow reads as a row of boxes rather than a ragged one, and a
+    // width the user dragged carries down the chain. Its HEIGHT is its own
+    // (B3): the callee is usually far shorter than whatever opened it, and
+    // inheriting a tall box gave a four-line function twenty lines of nothing.
+    const size = clampBubbleSize(caller.w, bubbleDefaultSize(this.bubbleLoc(calleeId)).h);
     this.createBubble({
       nodeId: calleeId,
       x,
       y,
-      w: caller.w,
-      h: caller.h,
+      w: size.w,
+      h: size.h,
       scrollTop: 0,
       expanded: false,
       sourceDiskId: null,
@@ -4347,8 +4394,12 @@ export class CanvasController {
    */
   private drawBubbleGhost(ctx: CanvasRenderingContext2D, drag: DragState): void {
     const frameScale = bubbleFrameScale(this.scale());
-    const width = BUBBLE_DEFAULT_WIDTH * frameScale;
-    const height = BUBBLE_DEFAULT_HEIGHT * frameScale;
+    // The same pure helper `spawnBubble` uses, off the same node: B3 sizes a
+    // bubble to its code, so the ghost has to be sized to it too or the release
+    // would produce a different box from the one the drag drew.
+    const size = bubbleDefaultSize(this.bubbleLoc(drag.nodeId));
+    const width = size.w * frameScale;
+    const height = size.h * frameScale;
     const x = drag.x - width / 2;
     const y = drag.y - height / 2;
     const corner = Math.min(8, width / 2, height / 2);
@@ -5351,13 +5402,29 @@ export const BUBBLE_LABEL_BELOW = 0.5;
 export const BUBBLE_FONT_SCALE_STEP = 0.05;
 /** The frame's own 1px border, which the scrollport does not get to use. */
 export const BUBBLE_FRAME_BORDER_PX = 1;
-/** Default and clamp range for the box the user drags out and resizes. */
-export const BUBBLE_DEFAULT_WIDTH = 380;
-export const BUBBLE_DEFAULT_HEIGHT = 260;
+/**
+ * Default and clamp range for the box the user drags out and resizes.
+ *
+ * B3 doubles the default WIDTH (B1's 380 was a column narrow enough that most
+ * real code lines ran off the side of it, which is what the horizontal scroll
+ * existed to paper over; lines wrap now, and a wider box is what makes a wrap
+ * the exception rather than the rule) and derives the default HEIGHT from the
+ * node's own line count — see {@link bubbleDefaultSize}.
+ *
+ * The HEIGHT floor came down with it. B1's 96 was a floor for a box that was
+ * always 260 tall to begin with; a three-line function is now allowed to be a
+ * three-line box, and a floor above that would inflate exactly the bubbles the
+ * round exists to shrink. What is left is the smallest box that is still a
+ * usable one: the header, and enough body under it to read a line in.
+ */
+export const BUBBLE_DEFAULT_WIDTH = 760;
 export const BUBBLE_MIN_WIDTH = 200;
-export const BUBBLE_MIN_HEIGHT = 96;
-export const BUBBLE_MAX_WIDTH = 1200;
+export const BUBBLE_MIN_HEIGHT = 56;
+export const BUBBLE_MAX_WIDTH = 2000;
 export const BUBBLE_MAX_HEIGHT = 1000;
+/** Rows a spawned bubble shows: at least this many, at most that many (B3). */
+export const BUBBLE_MIN_CONTENT_ROWS = 3;
+export const BUBBLE_MAX_CONTENT_ROWS = 30;
 /** Tether arms, mirroring the disk tether's own shape (`workspace.ts`). */
 export const BUBBLE_TETHER_ARM_SHARE = 0.42;
 export const BUBBLE_TETHER_MIN_ARM = 8;
@@ -5490,6 +5557,43 @@ export function bubblePresentation(cameraScale: number): BubblePresentation {
 }
 
 /**
+ * The box a bubble is BORN in — as tall as the code it is about to show (B3).
+ *
+ * B1 spawned every bubble at one fixed size, which was wrong in both
+ * directions at once: a three-line accessor got a box with twenty lines of
+ * empty space under it, and a thousand-line file got the same box as the
+ * accessor. Neither is a size anybody would have dragged. So the height is
+ * derived from the node's own line count, clamped to a window that keeps both
+ * ends honest — {@link BUBBLE_MIN_CONTENT_ROWS} so a one-line constant still
+ * has a body to be read in, {@link BUBBLE_MAX_CONTENT_ROWS} so a long file
+ * opens as a readable window onto itself rather than as a wall the workspace
+ * disappears behind. Everything past that is a scroll, which is what the body
+ * is for.
+ *
+ * Built from the same fallback metrics the anchor arithmetic falls back to
+ * ({@link BUBBLE_METRICS_FALLBACK} — the CSS in `bubble-view.ts`, which is
+ * what the frame will actually be laid out at) plus the frame's own two
+ * borders, so the first paint fits its rows exactly rather than approximately.
+ * A line count that is missing or nonsense reads as the minimum: a box is
+ * always a NUMBER.
+ *
+ * Pure, so the ghost drawn under the cursor and the bubble the release
+ * produces are the same rectangle by construction.
+ */
+export function bubbleDefaultSize(lineCount: number): { w: number; h: number } {
+  const lines = Number.isFinite(lineCount) ? Math.floor(lineCount) : 0;
+  const rows = Math.min(BUBBLE_MAX_CONTENT_ROWS, Math.max(BUBBLE_MIN_CONTENT_ROWS, lines));
+  const metrics = BUBBLE_METRICS_FALLBACK;
+  const height =
+    metrics.headerHeight +
+    metrics.padTop +
+    rows * metrics.lineHeight +
+    metrics.padBottom +
+    BUBBLE_FRAME_BORDER_PX * 2;
+  return clampBubbleSize(BUBBLE_DEFAULT_WIDTH, height);
+}
+
+/**
  * A user-dragged size, held inside the range a bubble is still usable in.
  *
  * Plainly CSS px, at every zoom — which is what the fixed frame buys: the
@@ -5498,7 +5602,7 @@ export function bubblePresentation(cameraScale: number): BubblePresentation {
  */
 export function clampBubbleSize(width: number, height: number): { w: number; h: number } {
   const w = Number.isFinite(width) ? width : BUBBLE_DEFAULT_WIDTH;
-  const h = Number.isFinite(height) ? height : BUBBLE_DEFAULT_HEIGHT;
+  const h = Number.isFinite(height) ? height : bubbleDefaultSize(0).h;
   return {
     w: Math.min(BUBBLE_MAX_WIDTH, Math.max(BUBBLE_MIN_WIDTH, w)),
     h: Math.min(BUBBLE_MAX_HEIGHT, Math.max(BUBBLE_MIN_HEIGHT, h)),
@@ -5514,9 +5618,17 @@ export interface BubbleScrollAnchorInput {
   /** Padding above the first row and below the last. */
   padTop: number;
   padBottom: number;
-  /** One source row, in frame px. */
+  /** One VISUAL row, in frame px. */
   lineHeight: number;
   lineCount: number;
+  /**
+   * The scrolling content's measured height, in frame px (B3).
+   *
+   * Optional: without it the height is `padTop + lines × lineHeight +
+   * padBottom`, which is exact for a body in which nothing wrapped and a floor
+   * for one in which something did.
+   */
+  contentHeight?: number;
   /** Layout scale the body is laid out at now, and the one it is going to. */
   fromScale: number;
   toScale: number;
@@ -5565,7 +5677,9 @@ export function bubbleScrollForFontScale(input: BubbleScrollAnchorInput): number
   const scrollTop = Math.max(0, finiteOr(input.scrollTop, 0));
   // In frame px, and therefore the same at either scale: content and viewport
   // are laid out through the same factor.
-  const limit = Math.max(0, padTop + count * lineHeight + padBottom - viewport);
+  const content = finiteOr(input.contentHeight, Number.NaN);
+  const height = content > 0 ? content : padTop + count * lineHeight + padBottom;
+  const limit = Math.max(0, height - viewport);
   // Nothing to anchor to: there are no rows, or they have no height. The
   // offset survives, clamped — a body with no lines has nowhere else to be.
   if (!(lineHeight > 0) || count === 0) return Math.min(scrollTop, limit);
@@ -5655,6 +5769,22 @@ export function bubbleTetherAnchor(
 
 // --------------------------------------------- code bubbles: call tracing ---
 
+/**
+ * The vertical middle of one displayed line, from a measured edge table.
+ *
+ * `NaN` for anything the table cannot answer, so the caller falls back to the
+ * unwrapped arithmetic rather than anchoring a thread at nothing.
+ */
+export function bubbleRowCentre(edges: readonly number[], index: number): number {
+  if (index < 0 || index + 1 >= edges.length) return Number.NaN;
+  const top = edges[index];
+  const bottom = edges[index + 1];
+  if (typeof top !== 'number' || typeof bottom !== 'number') return Number.NaN;
+  if (!Number.isFinite(top) || !Number.isFinite(bottom)) return Number.NaN;
+  // A table that is not monotonic is a table that was measured mid-relayout.
+  return bottom >= top ? (top + bottom) / 2 : Number.NaN;
+}
+
 /** A finite number, or the fallback — every input below one of these comes from the DOM. */
 function finiteOr(value: number | undefined | null, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -5673,18 +5803,42 @@ export interface BubbleBodyMetrics {
   /** Padding above the first row and below the last. */
   padTop: number;
   padBottom: number;
-  /** One source row, top to top — the same number of frame px at every zoom. */
+  /**
+   * One VISUAL row, top to top — the same number of frame px at every zoom.
+   *
+   * Since B3 a logical line can be several of these, so this is the fallback
+   * unit rather than the answer: it is what the arithmetic uses when there are
+   * no measured offsets (a body that has not been measured yet, or a frame
+   * showing its label), and what the default box's height is built from.
+   */
   lineHeight: number;
+  /**
+   * Where each displayed line actually STARTS, in frame px from the top of the
+   * scrolling content — `lineCount + 1` entries, the last being the bottom of
+   * the last row (B3).
+   *
+   * Measured by the view (a grid row per logical line) and passed through as
+   * DATA, which is what keeps the anchor below pure while wrapping makes
+   * "line N is at padTop + N × lineHeight" false. Absent — or the wrong length
+   * — falls back to exactly that arithmetic, which is still correct for every
+   * line that did not wrap and is the only thing available before a measure.
+   */
+  rowEdges?: readonly number[];
+  /** Padding, rows and padding together, in frame px. Absent → derived. */
+  contentHeight?: number;
 }
 
 /**
  * What a bubble reads at before it has ever been measured — the CSS in
- * `bubble-view.ts` (11px text at 1.55, a 4px-padded 11px/1.2 header, 6px of
- * gutter padding). Used for the frame or two between a spawn and its content,
- * so an anchor is always a NUMBER.
+ * `bubble-view.ts` (11px text at 1.55, a 4px-padded header whose tallest child
+ * is a 16px button, over a 1px rule, and 6px of padding above the first row
+ * and below the last). Used for the frame or two between a spawn and its
+ * content, so an anchor is always a NUMBER — and, since B3, as the arithmetic
+ * {@link bubbleDefaultSize} builds a new bubble's box out of, which is why the
+ * header's number is the sum of the CSS rather than a round one near it.
  */
 export const BUBBLE_METRICS_FALLBACK: BubbleBodyMetrics = {
-  headerHeight: 22,
+  headerHeight: 25,
   padTop: 6,
   padBottom: 6,
   lineHeight: 17.05,
@@ -5820,9 +5974,21 @@ export function bubbleCallAnchor(input: BubbleCallAnchorInput): BubbleCallAnchor
   // all frame px of a body whose proportions do not change with the zoom — and
   // the frame is drawn at `frameScale`, so the whole offset crosses it once,
   // as a unit.
+  //
+  // WHERE the line is comes from the body's measured row offsets when there
+  // are any (B3: a wrapped line is several visual rows tall, so its top is not
+  // its index times a row height) and from that arithmetic when there are not.
+  // The two agree exactly for a body in which nothing wrapped, which is what
+  // makes the fallback a fallback rather than a different answer.
   const scrollTop = Math.max(0, finiteOr(input.scrollTop, 0));
-  const row = lineHeight;
-  const offset = (padTop + (line - first) * row + row / 2 - scrollTop) * frameScale;
+  const index = line - first;
+  const edges = input.metrics?.rowEdges;
+  const measured =
+    edges && edges.length >= count + 1 ? bubbleRowCentre(edges, index) : Number.NaN;
+  const centre = Number.isFinite(measured)
+    ? measured
+    : padTop + index * lineHeight + lineHeight / 2;
+  const offset = (centre - scrollTop) * frameScale;
   const candidate = top + offset;
   if (candidate < top) return { x: bx, y: top, side, clamped: true, mode: 'clamped' };
   if (candidate > bottom) return { x: bx, y: bottom, side, clamped: true, mode: 'clamped' };

@@ -16,7 +16,12 @@
  * the source view's own theme, which is exactly the point: the two views colour
  * code identically.
  */
-import { escapeHtml, highlightWith, loadHighlighter } from '@/lib/highlight';
+import {
+  escapeHtml,
+  highlightWith,
+  loadHighlighter,
+  splitHighlightedLines,
+} from '@/lib/highlight';
 
 /** What the view reports back. Every callback is a user gesture, never a frame. */
 export interface BubbleViewCallbacks {
@@ -93,7 +98,15 @@ const BORDER = 'var(--border)';
 const MUTED = 'var(--muted)';
 const FONT_MONO = 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace';
 const FONT_UI = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif';
-const LINE_HEIGHT = '1.55';
+/**
+ * The source's line height, as a unitless multiplier of {@link CODE_PX}.
+ *
+ * A number rather than a string since B3: the gutter marker has to be placed
+ * half a VISUAL row down a cell that may be many rows tall, so the row height
+ * is arithmetic here as well as a declaration.
+ */
+const CODE_LINE_HEIGHT = 1.55;
+const LINE_HEIGHT = String(CODE_LINE_HEIGHT);
 const CODE_PX = 11;
 /** Padding above the first source row and below the last, in FRAME px. */
 const BODY_PAD_PX = 6;
@@ -195,6 +208,20 @@ export interface BubbleBodyGeometry {
   lineCount: number;
   /** Real file line of the first row. */
   firstLine: number;
+  /**
+   * Top of every row, plus the bottom of the last one — `lineCount + 1`
+   * numbers, in FRAME px from the top of the scrolling content (so the first
+   * entry is {@link padTop}).
+   *
+   * B3: a logical line WRAPS, so it can occupy any number of visual rows and
+   * `padTop + index × lineHeight` is no longer where it is. The rows are a
+   * grid, so the layout already knows the answer; it is read out once, here,
+   * and handed to the anchor arithmetic as data — which keeps that arithmetic
+   * pure and keeps a frame from ever asking the DOM where a line is.
+   */
+  rowEdges: number[];
+  /** Padding, rows and padding together — what the scrollport can scroll. */
+  contentHeight: number;
 }
 
 export class BubbleView {
@@ -215,9 +242,16 @@ export class BubbleView {
   private readonly labelLoc: HTMLSpanElement;
   private readonly callbacks: BubbleViewCallbacks;
 
-  /** Gutter rows, so "scroll to line" is an offset the layout already knows. */
-  private gutter: HTMLDivElement | null = null;
-  private code: HTMLElement | null = null;
+  /**
+   * The body's two columns of row cells (B3).
+   *
+   * One entry per LOGICAL line in each array, index-aligned with each other and
+   * with the gutter's printed numbers — so "scroll to line", "put a marker on
+   * line N" and "where is line N" are all an index rather than a search, even
+   * though a line may now be several visual rows tall.
+   */
+  private gutterCells: HTMLElement[] = [];
+  private codeCells: HTMLElement[] = [];
   private firstLine = 1;
   private isLabel = false;
   private lastTransform = '';
@@ -367,7 +401,11 @@ export class BubbleView {
     Object.assign(this.body.style, {
       flex: '1 1 auto',
       minHeight: '0',
-      overflow: 'auto',
+      // Vertical only (B3). Long lines WRAP now, so there is nothing left to
+      // scroll sideways to — and a horizontal scrollbar under a wrapped body
+      // would be an affordance for a direction the content cannot move in.
+      overflowY: 'auto',
+      overflowX: 'hidden',
       overscrollBehavior: 'contain',
       background: 'transparent',
     });
@@ -603,8 +641,8 @@ export class BubbleView {
    */
   setContent(content: BubbleContent): void {
     const seq = ++this.renderSeq;
-    this.gutter = null;
-    this.code = null;
+    this.gutterCells = [];
+    this.codeCells = [];
     this.markers.clear();
     this.closePicker();
     this.body.replaceChildren();
@@ -621,59 +659,103 @@ export class BubbleView {
     this.firstLine = content.startLine;
     const lines = content.text.split('\n');
 
-    const row = document.createElement('div');
-    Object.assign(row.style, { display: 'flex', alignItems: 'flex-start', minWidth: 'min-content' });
-
-    const gutter = document.createElement('div');
-    Object.assign(gutter.style, {
-      position: 'sticky',
-      left: '0',
-      zIndex: '1',
-      flex: '0 0 auto',
-      padding: `${layoutPx(BODY_PAD_PX)} ${layoutPx(6)} ${layoutPx(BODY_PAD_PX)} ${layoutPx(8)}`,
-      textAlign: 'right',
-      color: `color-mix(in oklab, ${MUTED} 65%, transparent)`,
+    // ---- one GRID ROW per logical line (B3) --------------------------------
+    //
+    // B1/B2 laid the body out as a gutter column beside one `<pre>` of the
+    // whole span, which is only correct while a source line is exactly one
+    // visual row: the Nth line number sits at `N × line-height` because the
+    // Nth line of code does too. B3 WRAPS long lines instead of scrolling
+    // sideways, which breaks that correspondence — so the row becomes the unit
+    // of layout. A CSS grid of `auto 1fr` puts the number and its code in the
+    // same row whatever the code does, the row grows to however many visual
+    // lines the code needs, and the number stays pinned to the FIRST of them
+    // (`alignSelf: start`), which is the line it names.
+    const grid = document.createElement('div');
+    Object.assign(grid.style, {
+      // Positioned, so a row's `offsetTop` is measured against this box's own
+      // padding edge — which is what makes the measured offsets below start at
+      // `padTop` and stay independent of the header above them.
+      position: 'relative',
+      display: 'grid',
+      gridTemplateColumns: 'auto minmax(0, 1fr)',
+      // Cells STRETCH to their row (the default): the gutter cell has to be as
+      // tall as the wrapped code beside it for its rule to run the height of
+      // the row, and the number inside it is held at the top by its own flex.
+      alignItems: 'stretch',
+      padding: `${layoutPx(BODY_PAD_PX)} 0`,
       ...this.codeFont(),
-      userSelect: 'none',
-      background: SURFACE,
-      borderRight: `${layoutPx(1)} solid color-mix(in oklab, ${BORDER} 60%, transparent)`,
     });
+
+    const gutterCells: HTMLElement[] = [];
+    const codeCells: HTMLElement[] = [];
     for (let i = 0; i < lines.length; i++) {
       const number = document.createElement('div');
       number.textContent = String(content.startLine + i);
-      gutter.append(number);
+      Object.assign(number.style, {
+        // Positioned, so the call marker below can hang off it.
+        position: 'relative',
+        padding: `0 ${layoutPx(6)} 0 ${layoutPx(8)}`,
+        color: `color-mix(in oklab, ${MUTED} 65%, transparent)`,
+        userSelect: 'none',
+        background: SURFACE,
+        borderRight: `${layoutPx(1)} solid color-mix(in oklab, ${BORDER} 60%, transparent)`,
+        // The cell is as tall as the row (so the column's rule is continuous
+        // past a line that wrapped) while the NUMBER inside it stays on the
+        // first visual row — which is the line it names.
+        display: 'flex',
+        alignItems: 'flex-start',
+        justifyContent: 'flex-end',
+        boxSizing: 'border-box',
+      });
+
+      const code = document.createElement('div');
+      Object.assign(code.style, {
+        padding: `0 ${layoutPx(10)}`,
+        // The whole point of the round: a line too long for the box comes back
+        // on the next visual row instead of pushing a horizontal scrollbar
+        // under it. `anywhere` is the last resort for a single unbreakable
+        // token (a minified line, a long URL) — better a hard break than a row
+        // that overflows its own frame.
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
+        overflowWrap: 'anywhere',
+        // A blank line is a `<div>` with nothing in it, which lays out at zero
+        // height — so a run of blank lines would collapse the code column
+        // against a gutter that still counted them. One row is the floor.
+        minHeight: layoutPx(CODE_PX * CODE_LINE_HEIGHT),
+      });
+      code.className = 'hljs-code';
+      code.innerHTML = escapeHtml(lines[i] ?? '');
+
+      grid.append(number, code);
+      gutterCells.push(number);
+      codeCells.push(code);
     }
 
-    const pre = document.createElement('pre');
-    Object.assign(pre.style, {
-      margin: '0',
-      padding: `${layoutPx(BODY_PAD_PX)} ${layoutPx(10)}`,
-      flex: '1 1 auto',
-      whiteSpace: 'pre',
-      ...this.codeFont(),
-    });
-    const code = document.createElement('code');
-    code.className = 'hljs-code';
-    code.innerHTML = escapeHtml(content.text);
-    pre.append(code);
-
-    row.append(gutter, pre);
-    this.body.append(row);
+    this.body.append(grid);
     if (content.truncated) {
       const cut = this.notice('truncated', 'var(--accent)', false);
       cut.style.padding = `0 ${layoutPx(10)} ${layoutPx(6)}`;
       this.body.append(cut);
     }
-    this.gutter = gutter;
-    this.code = code;
+    this.gutterCells = gutterCells;
+    this.codeCells = codeCells;
 
     // The highlighter is a lazy chunk; the escaped text above is what shows
     // until it lands, so a bubble is readable from the first frame either way.
+    // It highlights the WHOLE span (a per-line highlight would lose every
+    // multi-line construct) and the result is split per line with the open
+    // span stack carried across each break — see `splitHighlightedLines`. A
+    // split that does not come back with one row per line is not applied at
+    // all: escaped text is a correct body, half-coloured rows are not.
     const { file, text } = content;
     void loadHighlighter().then((engine) => {
-      if (seq !== this.renderSeq || !this.code) return;
+      if (seq !== this.renderSeq || this.codeCells.length !== lines.length) return;
       const html = highlightWith(engine, text, file);
-      if (html) this.code.innerHTML = html;
+      if (!html) return;
+      const rows = splitHighlightedLines(html);
+      if (rows.length !== this.codeCells.length) return;
+      for (let i = 0; i < rows.length; i++) this.codeCells[i]!.innerHTML = rows[i]!;
     });
   }
 
@@ -726,12 +808,11 @@ export class BubbleView {
     this.closePicker();
     for (const marker of this.markers.values()) marker.remove();
     this.markers.clear();
-    const gutter = this.gutter;
-    if (!gutter || sites.size === 0) return;
+    if (this.gutterCells.length === 0 || sites.size === 0) return;
 
     for (const [line, callees] of sites) {
       if (callees.length === 0) continue;
-      const row = gutter.children[line - this.firstLine];
+      const row = this.gutterCells[line - this.firstLine];
       if (!(row instanceof HTMLElement)) continue;
       const openable = callees.filter((callee) => callee.available);
       const names = callees.map((callee) => callee.name).join(', ');
@@ -739,7 +820,10 @@ export class BubbleView {
       const marker = document.createElement('span');
       Object.assign(marker.style, {
         position: 'absolute',
-        top: '50%',
+        // Half a row down, not half the CELL down: a wrapped line's cell is as
+        // tall as all of its visual rows, and the dot annotates the row the
+        // number is on (B3).
+        top: layoutPx((CODE_PX * CODE_LINE_HEIGHT) / 2),
         borderRadius: '999px',
         background: openable.length > 0 ? MARKER_COLOR : MARKER_COLOR_DEAD,
         cursor: openable.length > 0 ? 'pointer' : 'default',
@@ -759,7 +843,6 @@ export class BubbleView {
         event.stopPropagation();
         this.onMarkerClick(line, callees, marker);
       });
-      row.style.position = 'relative';
       row.append(marker);
       this.markers.set(line, marker);
     }
@@ -779,7 +862,11 @@ export class BubbleView {
     marker.style.width = layoutPx(MARKER_PX);
     marker.style.height = layoutPx(MARKER_PX);
     marker.style.marginTop = layoutPx(-MARKER_PX / 2);
-    marker.style.left = layoutPx(-(MARKER_PX + MARKER_GAP_PX));
+    // Inside the gutter cell's own left padding since B3: the gutter is a
+    // column of per-row cells now rather than one block with the numbers
+    // inside it, so a negative offset would put the dot outside the body
+    // instead of in the gutter's margin.
+    marker.style.left = layoutPx(MARKER_GAP_PX);
   }
 
   /** One callee opens straight away; several ask which one. */
@@ -899,38 +986,50 @@ export class BubbleView {
    * touches the DOM to find out where a line is.
    */
   bodyGeometry(): BubbleBodyGeometry | null {
-    const gutter = this.gutter;
-    if (!gutter || gutter.childElementCount === 0) return null;
-    const first = gutter.children[0];
+    const cells = this.codeCells;
+    const count = cells.length;
+    if (count === 0) return null;
+    const first = cells[0];
     if (!(first instanceof HTMLElement)) return null;
-    const second = gutter.children[1];
-    // Sub-pixel on purpose: `offsetTop` is rounded to whole px, and dividing a
-    // rounded row height by the scale it was measured at is how a base metric
-    // picks up a few percent of error that then multiplies by the line number.
-    const firstRect = first.getBoundingClientRect();
-    const measured =
-      second instanceof HTMLElement
-        ? second.getBoundingClientRect().top - firstRect.top
-        : firstRect.height;
-    if (!(measured > 0)) return null;
     // Two DOM units, two divisors, and which one applies is decided by what
     // the property answers in (B2.3). `getBoundingClientRect` is SCREEN px —
     // frame px through BOTH the layout scale and the root's transform, whose
-    // product is exactly the frame scale — so a row divides by that one
+    // product is exactly the frame scale — so a rect divides by that one
     // number. `offsetHeight` / `offsetTop` are LAYOUT px, which a transform
     // does not touch, so they divide by the layout scale alone.
     const frame = this.frameScale > 0 ? this.frameScale : 1;
     const font = this.fontScale > 0 ? this.fontScale : 1;
+
+    // Sub-pixel on purpose: `offsetTop` is rounded to whole px, and dividing a
+    // rounded row height by the scale it was measured at is how a base metric
+    // picks up a few percent of error that then multiplies by the line number.
+    // This is the height of ONE VISUAL row, which is what a fallback (and any
+    // arithmetic that has no measured offsets to work from) needs.
+    const firstRect = first.getBoundingClientRect();
+    const visualRow = firstRect.height > 0 ? firstRect.height / frame : 0;
+    if (!(visualRow > 0)) return null;
+
+    // Every row's top, in one linear pass over an already-computed layout —
+    // the one read that makes wrapping affordable. The last entry is the
+    // bottom of the last row, so a row's extent is always `[i, i + 1]`.
+    const rowEdges: number[] = new Array(count + 1);
+    for (let i = 0; i < count; i++) rowEdges[i] = (cells[i]?.offsetTop ?? 0) / font;
+    const last = cells[count - 1];
+    rowEdges[count] = ((last?.offsetTop ?? 0) + (last?.offsetHeight ?? 0)) / font;
+
+    const padTop = rowEdges[0] ?? BODY_PAD_PX;
     return {
       headerHeight: this.header.offsetHeight / font,
-      padTop: first.offsetTop / font,
+      padTop,
       padBottom: BODY_PAD_PX,
       // In frame px, which is the same number at every zoom: the whole frame
       // scales as one thing, so a row is a fixed share of the box that holds
       // it and there is one row height in the system rather than one per zoom.
-      lineHeight: measured / frame,
-      lineCount: gutter.childElementCount,
+      lineHeight: visualRow,
+      lineCount: count,
       firstLine: this.firstLine,
+      rowEdges,
+      contentHeight: (rowEdges[count] ?? padTop) + BODY_PAD_PX,
     };
   }
 
@@ -1050,11 +1149,13 @@ export class BubbleView {
 
   /** Scroll so a real FILE line sits at the top of the body. */
   scrollToLine(line: number): void {
-    const gutter = this.gutter;
-    if (!gutter) return;
-    const index = Math.max(0, Math.min(gutter.childElementCount - 1, line - this.firstLine));
-    const row = gutter.children[index];
-    // `offsetTop` is layout px, and this class hands out frame px.
+    const count = this.codeCells.length;
+    if (count === 0) return;
+    const index = Math.max(0, Math.min(count - 1, line - this.firstLine));
+    const row = this.codeCells[index];
+    // `offsetTop` is layout px, and this class hands out frame px. It is
+    // measured rather than computed for the same reason the anchors are: with
+    // wrapping, a row's top is not its index times a row height (B3).
     if (row instanceof HTMLElement) this.setScrollTop(row.offsetTop / this.fontScale);
   }
 
