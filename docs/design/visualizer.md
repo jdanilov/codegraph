@@ -1898,6 +1898,175 @@ anchor mode and no second rectangle a frame has to choose between.
   caught on 10,546 scroll cases and anchoring the top line instead of the
   centre one on 40,216 — so the zeroes above are results, not tautologies.
 
+### Code bubbles (B2.2) — world-scaled zoom-out (additive; SUPERSEDES B2.1's fixed frame for camera < 1 ONLY)
+
+B2.1 fixed the frame in screen space in both directions: the camera moved a
+bubble and never resized it, at any zoom. Zooming IN that way is right — a box
+of text does not get more useful for being enormous — but zooming OUT that way
+is wrong, and looking at it settled the question: a full-size box floating over
+a workspace of shrunken disks does not read as part of the same picture, and
+five of them cover it. So the rule is now split at camera 1, by one number:
+
+```
+s = min(camera.scale, 1)          // the FRAME scale
+```
+
+- **camera ≥ 1 — B2.1, unchanged, to the letter.** `s = 1`. The frame is the
+  user's own CSS px, the camera only moves it, the body's TYPE zooms through
+  the quantised font mechanism up to the 1.5× clamp, and the centre-line
+  scroll rule keeps the reading position. Nothing in this regime moved.
+- **camera < 1 — the frame shrinks with the world.** `s = camera`, so the
+  on-screen frame is the set size × `s`, still anchored at its world point.
+  A bubble now behaves like a disk on the way out: the workspace zooms as one
+  thing.
+
+**The mechanism is a transform, not a re-layout.** `s` is a CSS `scale()` on
+the bubble's ROOT (`transform-origin: 0 0`, composited, in the same string as
+the translate that was already written every frame), so the whole frame —
+header, gutter, source, call markers, scrollbars, the corner grip — shrinks in
+exact proportion, and **nothing inside the frame reflows**: `width`/`height`
+stay the user's own frame px, the scroll offset is untouched, a text selection
+survives, and the content's geometry relative to the frame is constant at every
+zoom. Per-frame cost is unchanged: still one transform string per bubble, still
+one compare before the write.
+
+**The two zoom mechanisms compose; they never multiply.** Inside a scaled frame
+the transform IS the zoom, so the FONT-based text scale is **pinned at 1**
+below camera 1 — scaling the type as well would shrink it twice. The composed
+on-screen text height is therefore `s × textScale`, which is `camera × 1` below
+1 and `1 × min(camera, 1.5)` above it. Both are exactly 1 at camera 1, so
+crossing the seam produces **no pop**: the frame scale is continuous by
+definition (`min` of two continuous functions), the composed text height is
+continuous because the two regimes meet at 1, and the composed frame size is
+monotone in the camera throughout. The readability threshold is continuous in
+the same sense — the frame and the type do not change size there at all, only
+the FACE does. One happy side effect: a wheel gesture anywhere below camera 1
+now costs **zero** font writes and zero re-anchoring, where B2.1 re-laid every
+row about twenty times across that range.
+
+**The label counter-scales, because it is the one thing that must stay
+readable.** Below `camera = 0.5` (B1's number, unchanged) the body is still
+hidden with `visibility` and the node's **name, kind badge and LoC** are still
+centred on the frame — but the label is now a child of the ROOT rather than of
+the frame, carrying `scale(1 / s)`, which cancels the root's own scale exactly.
+It reads at a fixed screen size at every zoom. At deep zoom-out it is therefore
+LARGER than the frame it names, which is deliberate and is what a disk's own
+labels do; it is not clipped, because it no longer sits under the frame's
+`overflow: hidden`.
+
+**Drag and close at low zoom: the label is the handle.** B2.1 kept the header
+live under a `pointer-events: none` label because a box you cannot move or
+shut is a trap. The header still exists and still works — but at camera 0.1 it
+is drawn two pixels tall, so it cannot be the answer any more. The label's
+BACKDROP stays inert (it covers rather more than the frame once counter-scaled,
+and a handle that big would eat the canvas around a tiny bubble); its CONTENT —
+the name/kind/LoC block — takes the pointer, is the drag handle, and carries a
+close `×` of its own. Both are fixed-size, so the affordance a zoomed-out
+bubble offers is exactly as big as the thing you can read. The corner grip is
+not duplicated there: it shrinks with the frame, stays usable through the
+0.5–1 band, and below the threshold resizing is simply a zoomed-in gesture.
+
+**Interaction converts through `s`, in one direction each.**
+
+- **Resize** — screen px in, frame px out: `w += dx / s`. Drag 40px at
+  `s = 0.5` and the frame gains 80 frame px, which is 40px on screen, so the
+  corner tracks the cursor 1:1 at every zoom; what changes with the zoom is how
+  much box that buys. (B2.1 needed no conversion; `s = 1` is still that case.)
+- **Header / label drag** — unchanged: screen px in, WORLD units out through
+  the camera's own scale, because the anchor is a world point. That is 1:1 on
+  screen in both regimes and needed no edit.
+- **Wheel** — the wheel belongs to whatever is under the pointer, as before.
+  Between 0.5 and 1 the shrunken scrollport still scrolls natively, and its
+  `scrollTop` is still plain frame px (the browser converts; a transform does
+  not change `scrollTop`'s units), so the anchor maths reads the same number it
+  always did. Below the threshold the body is hidden, so there is nothing to
+  scroll and the wheel is inert over the frame and its label — the same thing
+  it has done over a bubble's header since B1.
+- **Spawn** — a bubble spawned while zoomed out gets its DEFAULT size in FRAME
+  px, so it appears at default × `s` and matches the bubbles already there
+  rather than towering over them. The ghost is drawn at that same on-screen
+  size, so the outline under the cursor is the box the release produces; the
+  drop point crosses two factors (frame → screen through `s`, screen → world
+  through the camera) instead of B2.1's one. Persistence is untouched: `w`/`h`
+  are frame px, which is what they always were, and no migration exists or is
+  needed.
+
+**Anchors gain the factor, in one place each.** `bubbleScreenRect` now reports
+`w × s`, `h × s` — it is the single rectangle every screen-space consumer is
+built from, so the origin tether (`bubbleTetherAnchor`, still unchanged in
+code) tracks the scaled frame for free. `bubbleCallAnchor` keeps its four
+regimes (`line`, `clamped`, `header`, `centered`) with their exact meanings and
+takes `frameScale` as an input: the header is subtracted as `headerHeight × s`
+and the whole content offset — `padTop + (line − firstLine) × lineHeight ×
+textScale + half a row − scrollTop`, all of it frame px — crosses `s` once, as
+a unit. The result is that the anchor is **`s`-homothetic about the frame's
+top-left**: same regime, same side, every offset exactly `s` times B2.1's, so
+at `s = 1` it reproduces B2.1 term for term. Click-to-open still lands the
+callee to the right of its caller and level with the call site, and its two
+frame-px quantities (the gap, and the one-header lift that puts CONTENT rather
+than border level with the line) now cross `s` before the camera — which makes
+the whole placement pure WORLD arithmetic below camera 1, so a traced chain
+keeps its spacing at any zoom.
+
+**One source of truth for `s`.** `bubblePresentation(camera)` returns
+`{ frameScale, textScale, label }` and `bubbleFrameScale` is the only place the
+`min(camera, 1)` is written. The DOM transform, the screen rect the canvas
+draws tethers from, the resize conversion, the spawn and the ghost all read it
+from there, so the overlay and the canvas cannot disagree about how big a
+bubble is.
+
+**Two DOM reads had to learn the difference between a screen px and a frame
+px**, and they are the only two: `getBoundingClientRect` answers in SCREEN px,
+so the measured row height divides by `s` before it is cached (a row measured
+while zoomed out would otherwise be reported short by exactly that factor, and
+that number multiplies by the line number); and the multi-callee picker, which
+positions in frame px inside the scaled root, divides its two screen
+measurements back down before using them. `offsetTop` / `offsetHeight` are
+layout px and a transform does not touch them, so they are read as they are.
+
+**The blit is untouched, a third time.** Bubbles are still DOM in a
+`pointer-events: none` overlay, never painted into the canvas; threads and
+tethers are still chrome after `captureSnapshot`, in screen space, from the
+live camera; snapshots are still viewport-sized; there are still **exactly
+two** `requestCameraDraw` sites. The frame scale rides the transform that was
+already being written, so this round adds no per-frame work at all.
+
+- Probed with throwaway numeric probes over the real exported helpers, bundled
+  with esbuild. **Presentation:** 12,000 random camera scales, log-uniform over
+  0.005–8 with the seams and their neighbourhoods over-sampled — **0
+  violations** across `frameScale === min(camera, 1)` exactly, the text-scale
+  regime split (7,932 pinned below 1; 4,068 quantised above, of which 2,515 at
+  the 1.5× clamp), the label threshold, totality, 34 continuity checks at
+  camera 1 and at 0.5 (left and right limits of both the composed text height
+  and the frame size, down to ε = 1e-12), and 20,000 monotonicity steps for
+  each of the composed frame size and the composed text height. **Anchors:**
+  18,000 random frame × `s` × metrics × scroll × range × line cases — **0
+  violations** across totality, the side/border choice against the scaled
+  frame, the anchor never leaving the scaled frame, the closed-form recheck of
+  8,732 in-range rows under that case's own `s`, text scale and scroll offset,
+  the clamp flag and the exact edge it lands on, 18,000 camera-translation
+  cases (the whole picture panned, anchor moved rigidly with it), 18,000
+  homothety checks (same regime at `s` and at 1, offsets exactly `s` times),
+  and **18,000 / 18,000 cases reproducing B2.1's own formula EXACTLY at
+  `s = 1`** — the guarantee that the zoom-in half of the model did not move.
+  Every branch was exercised (3,096 `line`, 7,632 `clamped`, 2,792 `header`,
+  4,480 `centered`). **Mutation controls**, each the real bundle with one
+  operator changed: leaving the text scale unpinned below camera 1 (so the
+  transform and the font both shrink it) is caught on 7,551 presentation cases,
+  and letting the frame scale past 1 on 3,373; subtracting the header unscaled
+  (B2.1's rule, now wrong) is caught on 15,061 anchor cases, dropping the frame
+  scale from the content offset on 6,065, and clamping against the frame's
+  unscaled height on 19,950 — and all three anchor mutants still reproduce
+  B2.1 at `s = 1`, which is exactly what a zoom-out-only regression looks like.
+  So the zeroes above are results, not tautologies.
+- **Explicit non-goals this phase.** No lower bound on the frame scale: a
+  bubble is allowed to become a speck, because that is what the disks do and a
+  floor would put it back to being the thing that does not shrink. No
+  level-of-detail switch beyond the existing label (no "fewer rows at small
+  sizes" — the transform is uniform or it is not honest). No re-layout of the
+  workspace on zoom, and no editing, still.
+
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all

@@ -1420,11 +1420,15 @@ export class CanvasController {
    */
   private spawnBubble(nodeId: string, at: Point, sourceDiskId: string | null): void {
     if (!this.bubbleable(nodeId)) return;
-    // The frame is CSS px on screen and the workspace is world units, so the
-    // half-extents cross exactly one conversion — the camera's own scale.
+    // The size is the DEFAULT in frame px, whatever the zoom — a bubble spawned
+    // while zoomed out is the same box as its neighbours, drawn at the same
+    // scale as them, not a giant one. Centring it on the drop point therefore
+    // crosses two factors: frame px → screen px (the frame scale, which is what
+    // the ghost was drawn at) and screen px → world units (the camera's).
     const scale = this.scale();
-    const halfW = BUBBLE_DEFAULT_WIDTH / 2 / scale;
-    const halfH = BUBBLE_DEFAULT_HEIGHT / 2 / scale;
+    const frameScale = bubbleFrameScale(scale);
+    const halfW = (BUBBLE_DEFAULT_WIDTH * frameScale) / 2 / scale;
+    const halfH = (BUBBLE_DEFAULT_HEIGHT * frameScale) / 2 / scale;
     this.createBubble({
       nodeId,
       x: at.x - halfW,
@@ -1613,15 +1617,19 @@ export class CanvasController {
   }
 
   /**
-   * Corner drag: screen px in, frame px out — and they are the same px.
+   * Corner drag: screen px in, frame px out, across the frame's own scale.
    *
-   * The frame is fixed in screen space (B2.1), so the grip needs no conversion
-   * at all: drag it 40px and the frame is 40px wider, at any zoom, for good.
+   * The frame is stored in frame px and drawn at `min(camera, 1)` (B2.2), so
+   * the grip divides by that one number — drag 40 screen px at scale 0.5 and
+   * the frame grows 80 frame px, which is 40 px on screen. The box follows the
+   * cursor 1:1 at every zoom, which is the only behaviour a grip can have; what
+   * changes with the zoom is how much box that buys.
    */
   private resizeBubble(id: string, dx: number, dy: number): void {
     const bubble = this.bubbleById(id);
     if (!bubble) return;
-    const size = clampBubbleSize(bubble.w + dx, bubble.h + dy);
+    const frameScale = Math.max(1e-6, bubbleFrameScale(this.scale()));
+    const size = clampBubbleSize(bubble.w + dx / frameScale, bubble.h + dy / frameScale);
     if (size.w === bubble.w && size.h === bubble.h) return;
     bubble.w = size.w;
     bubble.h = size.h;
@@ -1690,16 +1698,23 @@ export class CanvasController {
    *
    * One transform each, from the camera the canvas is about to be (or has just
    * been) drawn under. No React, no layout read, no canvas call: bubbles are
-   * DOM and the blit never learns they exist. The frame's SIZE is not touched
-   * here, because it does not depend on the camera (B2.1).
+   * DOM and the blit never learns they exist. The frame's `width`/`height` are
+   * still not touched here — they are the user's own px — but the transform
+   * now carries the frame SCALE as well as the position (B2.2), which is a
+   * composited write that reflows nothing.
    */
   private syncBubbles(): void {
     if (this.bubbles.length === 0) return;
     const origin = this.origin();
     const scale = this.scale();
-    const label = bubblePresentation(scale).label;
+    const presentation = bubblePresentation(scale);
     for (const bubble of this.bubbles) {
-      bubble.view.place(origin.x + bubble.x * scale, origin.y + bubble.y * scale, label);
+      bubble.view.place(
+        origin.x + bubble.x * scale,
+        origin.y + bubble.y * scale,
+        presentation.label,
+        presentation.frameScale
+      );
     }
   }
 
@@ -1712,6 +1727,12 @@ export class CanvasController {
    * pan, every hover, every selection — and while a bubble is showing its
    * label there is nothing to lay out, so it is skipped there too and picked
    * up on the way back in.
+   *
+   * B2.2 makes it a no-op over the whole zoomed-OUT range as well: below camera
+   * 1 the text scale is pinned at 1 and the frame's own transform does the
+   * zooming, so a wheel gesture out of the readable range costs no font write
+   * and no re-anchoring at all. The centre-line rule below therefore only ever
+   * runs where B2.1 ran it — between camera 1 and the 1.5× clamp.
    */
   private syncBubbleText(): void {
     if (this.bubbles.length === 0) return;
@@ -1748,21 +1769,24 @@ export class CanvasController {
   }
 
   /**
-   * Where a bubble's FRAME sits on screen right now.
+   * Where a bubble's FRAME sits on screen right now, and how big it is drawn.
    *
-   * Its size is the user's own, in CSS px, at every zoom (B2.1) — the camera
-   * only moves it. The position is derived from the LIVE camera rather than
-   * from anything the last frame stored, so a tether cannot lag the frame it
-   * leaves by a frame during a gesture.
+   * Its size is the user's own CSS px at camera 1 and above, and shrinks with
+   * the world below it (B2.2) — the same `min(camera, 1)` the DOM transform
+   * uses, read from the same helper so the canvas and the overlay cannot
+   * disagree. The position is derived from the LIVE camera rather than from
+   * anything the last frame stored, so a tether cannot lag the frame it leaves
+   * by a frame during a gesture.
    */
   private bubbleScreenRect(bubble: BubbleState): BubbleRect {
     const origin = this.origin();
     const scale = this.scale();
+    const frameScale = bubbleFrameScale(scale);
     return {
       x: origin.x + bubble.x * scale,
       y: origin.y + bubble.y * scale,
-      w: bubble.w,
-      h: bubble.h,
+      w: bubble.w * frameScale,
+      h: bubble.h * frameScale,
     };
   }
 
@@ -2022,6 +2046,9 @@ export class CanvasController {
     return bubbleCallAnchor({
       rect: this.bubbleScreenRect(bubble),
       label: presentation.label,
+      // The transform the DOM is drawn through — the same helper the rect and
+      // `place` read, so the canvas and the overlay share one number.
+      frameScale: presentation.frameScale,
       // The scale the DOM is laid out at, which `syncBubbleText` has already
       // brought up to date for this frame — one number, two consumers.
       textScale: bubble.textScale,
@@ -2065,14 +2092,18 @@ export class CanvasController {
 
     const scale = this.scale();
     const origin = this.origin();
+    const frameScale = bubbleFrameScale(scale);
     const rect = this.bubbleScreenRect(caller);
     const anchor = this.bubbleCallAnchorOf(caller, line, Number.POSITIVE_INFINITY);
-    // Screen px back into world units — one conversion, the camera's, since
-    // the frame is fixed in screen space (B2.1). Its top is lifted by the
-    // header so it is the new bubble's CONTENT that lands level with the call
-    // site, which is what "level with" has to mean for the eye.
-    const x = (rect.x + rect.w + CALL_OPEN_GAP_PX - origin.x) / scale;
-    const y = (anchor.y - caller.metrics.headerHeight - origin.y) / scale;
+    // Screen px back into world units. Both frame-px quantities — the gap and
+    // the header lift — are drawn through the frame scale, so they cross it
+    // before the camera's (B2.2); the placement is then pure WORLD arithmetic,
+    // and "to the right, level with the call site" holds at any zoom instead of
+    // sliding as the camera moves. The top is lifted by the header so it is the
+    // new bubble's CONTENT that lands level with the call site, which is what
+    // "level with" has to mean for the eye.
+    const x = (rect.x + rect.w + CALL_OPEN_GAP_PX * frameScale - origin.x) / scale;
+    const y = (anchor.y - caller.metrics.headerHeight * frameScale - origin.y) / scale;
 
     this.createBubble({
       nodeId: calleeId,
@@ -4279,12 +4310,14 @@ export class CanvasController {
 
   /**
    * The bubble half of the ghost: the frame, where it will be, at exactly the
-   * size it will be — which under B2.1 is one pair of numbers at every zoom,
-   * so the outline under the cursor is the box the release produces.
+   * size it will READ at — the default box drawn through the frame scale
+   * (B2.2), so a spawn while zoomed out promises the small box it is actually
+   * going to produce rather than a full-size one that then shrinks.
    */
   private drawBubbleGhost(ctx: CanvasRenderingContext2D, drag: DragState): void {
-    const width = BUBBLE_DEFAULT_WIDTH;
-    const height = BUBBLE_DEFAULT_HEIGHT;
+    const frameScale = bubbleFrameScale(this.scale());
+    const width = BUBBLE_DEFAULT_WIDTH * frameScale;
+    const height = BUBBLE_DEFAULT_HEIGHT * frameScale;
     const x = drag.x - width / 2;
     const y = drag.y - height / 2;
     const corner = Math.min(8, width / 2, height / 2);
@@ -5245,11 +5278,13 @@ const TEXT_CACHE_MAX = 4000;
 /**
  * A bubble's on-screen box, in CSS px. `x`/`y` is its top-left corner.
  *
- * A bubble is anchored to a WORLD point and sized in SCREEN px, and as of
- * B2.1 that size is FIXED: the camera moves the frame around the screen and
- * never resizes it. Only the text inside it zooms (see
- * {@link bubbleTextScale}), so `w`/`h` are exactly the numbers the user
- * dragged the corner to.
+ * A bubble is anchored to a WORLD point and sized in FRAME px — the numbers
+ * the user dragged the corner to. This rect is those numbers as they are
+ * DRAWN: `w`/`h` carry the frame scale (`min(camera, 1)`), so they are the
+ * user's own px at camera 1 and above, and shrink with the world below it
+ * (B2.2). Everything screen-space downstream — both tether families, the
+ * click-to-open placement — is built from this one rect, so there is a single
+ * place the scale enters.
  */
 export interface BubbleRect {
   x: number;
@@ -5288,42 +5323,74 @@ export const BUBBLE_TETHER_ARM_SHARE = 0.42;
 export const BUBBLE_TETHER_MIN_ARM = 8;
 
 /**
- * How a bubble reads at a given camera scale — the fixed-frame rule, whole
- * (B2.1, and it REPLACES B1's hybrid box scale plus its title chip).
+ * How a bubble reads at a given camera scale (B2.2 — it supersedes B2.1's
+ * fixed frame on the zoom-OUT side only, and B2.1 in turn replaced B1's hybrid
+ * box scale and its title chip).
  *
- * The frame itself is not in here at all, and that is the change: its width
- * and height are the user's own CSS px and the camera only ever moves it.
- * What the camera does drive is what is INSIDE the frame:
+ * Two regimes, split at camera 1, and the whole model is the one number
+ * `s = min(camera, 1)`:
  *
- *  - **at or above {@link BUBBLE_LABEL_BELOW}** the body's type scales with
- *    the world — zoom out and the same box holds more, smaller lines; zoom in
- *    and it holds fewer, larger ones — but never past
- *    {@link BUBBLE_MAX_TEXT_SCALE}, because reading one wedge closely should
- *    not turn a bubble into a billboard;
- *  - **below it** no type the body can be given is readable, so the body is
- *    replaced by the node's NAME, KIND and LoC centred in the frame at a fixed
- *    readable size. The frame is retained — it is the same object in the same
- *    place, holding its space in the layout the user built, saying what it is
- *    instead of what it says.
+ *  - **camera ≥ 1 — exactly B2.1.** `s = 1`: the frame is the user's own CSS
+ *    px and the camera only moves it around the screen. What zooms is the
+ *    body's TYPE, up to {@link BUBBLE_MAX_TEXT_SCALE}, because reading one
+ *    wedge closely should not turn a bubble into a billboard.
+ *  - **camera < 1 — the frame shrinks with the world.** `s = camera`: the
+ *    whole frame is drawn at `s` (a CSS transform on the root, so header,
+ *    gutter, text, markers and scrollbars all shrink in proportion and nothing
+ *    reflows), which is what a disk does and what makes a zoomed-out workspace
+ *    read as one picture. The type is NOT zoomed a second time here — the
+ *    transform IS the zoom — so `textScale` pins at 1 and the two mechanisms
+ *    compose rather than multiply.
+ *
+ * The composition is continuous at the seam by construction: on-screen text
+ * height goes as `frameScale × textScale`, which is `camera × 1` below 1 and
+ * `1 × min(camera, 1.5)` above it — both are 1 at camera 1, so crossing the
+ * boundary produces no pop. The same holds at {@link BUBBLE_LABEL_BELOW},
+ * where only the FACE changes: below it no type the body can be given is
+ * readable, so the body is replaced by the node's NAME, KIND and LoC — drawn
+ * at a fixed readable screen size by counter-scaling the label against `s`, so
+ * a tiny frame still says what it is. The frame keeps shrinking underneath it.
  *
  * Pure and total, and the text scale is quantised
  * ({@link BUBBLE_TEXT_SCALE_STEP}), so the same camera scale always produces
- * exactly the same answer: crossing the threshold in either direction is
- * idempotent, and the DOM and the anchor maths always read one number.
+ * exactly the same answer: crossing either boundary is idempotent, and the DOM
+ * and the anchor maths always read ONE number for each of the two scales.
  */
 export interface BubblePresentation {
-  /** Multiplier on the body's font-size and line-height. */
+  /** What the camera draws the whole FRAME at — `min(camera, 1)`. */
+  frameScale: number;
+  /** Multiplier on the body's font-size and line-height, INSIDE the scaled frame. */
   textScale: number;
   /** Below the readability threshold: centred label instead of source. */
   label: boolean;
 }
 
-/** The multiplier the body's TYPE is drawn at — `min(camera, 1.5)`, quantised. */
+/**
+ * The scale the whole frame is drawn at — `min(camera, 1)` (B2.2).
+ *
+ * Zoom out and a bubble shrinks with the world exactly as a disk does; zoom in
+ * and it stops growing, because a box of text does not get more useful for
+ * being enormous. This is the single source of truth for that number: the DOM
+ * transform, the screen rect the tethers are built from, the resize
+ * conversion and the ghost all read it here, so they cannot disagree.
+ */
+export function bubbleFrameScale(cameraScale: number): number {
+  if (!Number.isFinite(cameraScale)) return 1;
+  return Math.min(1, Math.max(0, cameraScale));
+}
+
+/**
+ * The multiplier the body's TYPE is drawn at, inside the frame.
+ *
+ * `min(max(camera, 1), 1.5)`, quantised. Below camera 1 it is pinned at 1 and
+ * the frame's own scale does the zooming — scaling the font as well would
+ * shrink the text twice (B2.2). Above it, B2.1's rule verbatim.
+ */
 export function bubbleTextScale(cameraScale: number): number {
   if (!Number.isFinite(cameraScale)) return BUBBLE_MAX_TEXT_SCALE;
-  const clamped = Math.min(Math.max(cameraScale, 0), BUBBLE_MAX_TEXT_SCALE);
+  const clamped = Math.min(Math.max(cameraScale, 1), BUBBLE_MAX_TEXT_SCALE);
   const stepped = Math.round(clamped / BUBBLE_TEXT_SCALE_STEP) * BUBBLE_TEXT_SCALE_STEP;
-  return Math.min(BUBBLE_MAX_TEXT_SCALE, Math.max(0, stepped));
+  return Math.min(BUBBLE_MAX_TEXT_SCALE, Math.max(1, stepped));
 }
 
 /** Is the camera far enough out that no size of type in the frame is worth reading? */
@@ -5331,9 +5398,13 @@ export function bubbleIsLabel(cameraScale: number): boolean {
   return Number.isFinite(cameraScale) && cameraScale < BUBBLE_LABEL_BELOW;
 }
 
-/** {@link bubbleTextScale} and {@link bubbleIsLabel} as the one answer a frame needs. */
+/** The three numbers a frame needs, from one camera scale, in one place. */
 export function bubblePresentation(cameraScale: number): BubblePresentation {
-  return { textScale: bubbleTextScale(cameraScale), label: bubbleIsLabel(cameraScale) };
+  return {
+    frameScale: bubbleFrameScale(cameraScale),
+    textScale: bubbleTextScale(cameraScale),
+    label: bubbleIsLabel(cameraScale),
+  };
 }
 
 /**
@@ -5525,11 +5596,20 @@ export type BubbleAnchorMode = 'line' | 'clamped' | 'header' | 'centered';
 
 /** Everything the caller-side anchor depends on. All screen px except `metrics`/`scrollTop`. */
 export interface BubbleCallAnchorInput {
-  /** The bubble's FIXED frame as it sits on screen this frame. */
+  /** The bubble's frame as it sits on screen this frame — already scaled. */
   rect: BubbleRect;
   /** Below the readability threshold: a centred label, so there is no line to point at. */
   label: boolean;
-  /** The TEXT's scale, which is the only thing the camera changes inside the frame. */
+  /**
+   * What the whole frame is drawn at, `min(camera, 1)` (B2.2).
+   *
+   * `rect` already carries it, but the CONTENT offsets below are in frame px
+   * and have to cross the same factor to become screen px — so it is an input
+   * rather than something inferred from a width whose unscaled value this
+   * function never sees.
+   */
+  frameScale: number;
+  /** The TEXT's scale, inside the frame, which is 1 whenever the frame is scaled. */
   textScale: number;
   metrics: BubbleBodyMetrics;
   /** Real file line of the first displayed row. */
@@ -5581,11 +5661,14 @@ export interface BubbleCallAnchorPoint {
  *    row to point at, so the anchor is the frame's own middle and nothing
  *    pretends otherwise.
  *
- * The camera is not an input. A bubble's frame is fixed in screen px, so
- * everything the camera does to this answer it does by moving `rect` —
- * translate the frame and the anchor translates with it, exactly. What the
- * camera DOES change inside the frame is `textScale`, and it enters in one
- * place: the height of a row.
+ * The camera enters in exactly two ways and no others. It MOVES the frame —
+ * translate `rect` and the anchor translates with it, exactly, at any scale —
+ * and it SCALES the frame (`frameScale`, B2.2), which multiplies every content
+ * offset inside the box, because the box's own contents are drawn through that
+ * same transform. `textScale` is the third scale in the system and it lives
+ * strictly inside the frame, entering in one place: the height of a row.
+ * Position and scale are separate: at a fixed `frameScale`, panning the camera
+ * still translates this answer rigidly.
  *
  * Pure and total: every branch returns finite numbers for any input, because a
  * NaN here would silently poison a bezier and blank a frame.
@@ -5601,6 +5684,10 @@ export function bubbleCallAnchor(input: BubbleCallAnchorInput): BubbleCallAnchor
 
   if (input.label) return { x: bx, y: y + h / 2, side, clamped: false, mode: 'centered' };
 
+  // The frame's own scale: every frame-px quantity below becomes screen px by
+  // crossing it exactly once. At 1 — camera 1 and above — the whole of the
+  // arithmetic reduces to B2.1's, term for term.
+  const frameScale = Math.max(0, finiteOr(input.frameScale, 1));
   const textScale = Math.max(1e-6, finiteOr(input.textScale, 1));
   const headerHeight = Math.max(
     0,
@@ -5612,8 +5699,9 @@ export function bubbleCallAnchor(input: BubbleCallAnchorInput): BubbleCallAnchor
     finiteOr(input.metrics?.lineHeight, BUBBLE_METRICS_FALLBACK.lineHeight)
   );
 
-  // The header is chrome and does not zoom, so it is subtracted unscaled.
-  const header = Math.min(headerHeight, h);
+  // The header does not take the TEXT's zoom — it is chrome, not content — but
+  // it is part of the frame, so it takes the frame's.
+  const header = Math.min(headerHeight * frameScale, h);
   const top = y + header;
   const bottom = y + h;
   const count = Math.max(0, Math.floor(finiteOr(input.lineCount, 0)));
@@ -5629,11 +5717,13 @@ export function bubbleCallAnchor(input: BubbleCallAnchorInput): BubbleCallAnchor
     return { x: bx, y: line < first ? top : bottom, side, clamped: true, mode: 'clamped' };
   }
 
-  // Content space IS screen space inside a fixed frame, so the row's middle
-  // needs no outer multiplication: only the row's own height is zoomed.
+  // Content space is FRAME space — `scrollTop`, `padTop` and the row height are
+  // all plain px of an unscaled body — and the frame is drawn through
+  // `frameScale`, so the whole offset crosses it once, as a unit. Inside the
+  // frame the row's height is still the only thing `textScale` touches.
   const scrollTop = Math.max(0, finiteOr(input.scrollTop, 0));
   const row = lineHeight * textScale;
-  const offset = padTop + (line - first) * row + row / 2 - scrollTop;
+  const offset = (padTop + (line - first) * row + row / 2 - scrollTop) * frameScale;
   const candidate = top + offset;
   if (candidate < top) return { x: bx, y: top, side, clamped: true, mode: 'clamped' };
   if (candidate > bottom) return { x: bx, y: bottom, side, clamped: true, mode: 'clamped' };

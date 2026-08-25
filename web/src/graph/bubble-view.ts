@@ -27,8 +27,11 @@ export interface BubbleViewCallbacks {
   /** Header drag, in SCREEN px. The controller converts to world units. */
   onMove(dx: number, dy: number): void;
   /**
-   * Corner drag, in SCREEN px — which is also bubble px, since the frame is
-   * fixed in screen space and the camera never scales it.
+   * Corner drag, in SCREEN px.
+   *
+   * Screen px are FRAME px only while the frame scale is 1 (B2.2: zooming out
+   * shrinks the frame with the world). The controller divides by that scale,
+   * so the box always grows under the cursor at exactly the cursor's speed.
    */
   onResize(dx: number, dy: number): void;
   /**
@@ -133,8 +136,10 @@ export class BubbleView {
   private readonly expandButton: HTMLButtonElement;
   private readonly header: HTMLDivElement;
   private readonly body: HTMLDivElement;
-  /** The zoomed-out face: name, kind and LoC centred in the SAME frame. */
+  /** The zoomed-out face: name, kind and LoC centred on the SAME frame. */
   private readonly label: HTMLDivElement;
+  /** The label's own content — the part that is a handle rather than a backdrop. */
+  private readonly labelInner: HTMLDivElement;
   private readonly labelName: HTMLSpanElement;
   private readonly labelKind: HTMLSpanElement;
   private readonly labelLoc: HTMLSpanElement;
@@ -149,6 +154,17 @@ export class BubbleView {
   private lastTransform = '';
   private width = 0;
   private height = 0;
+  /**
+   * What the camera is scaling the whole frame by right now (B2.2).
+   *
+   * `min(camera, 1)`: zoom out and the frame shrinks with the world like a
+   * disk does; zoom in and it holds its size. It is a CSS transform on the
+   * root, so nothing inside the frame reflows — but it does mean a screen px
+   * and a frame px are no longer the same px, and everything here that reads
+   * the DOM in screen units (a measured row, a marker's position) divides by
+   * it to get back to frame units.
+   */
+  private frameScale = 1;
   /** Multiplier the body's type is currently laid out at (B2.1). */
   private textScale = 1;
   /** Rising per render, so a highlighter that lands late cannot paint a stale body. */
@@ -288,22 +304,52 @@ export class BubbleView {
 
     // ---- zoomed out: the same frame, saying what it is ----------------------
     // Centred on the WHOLE frame rather than on the body, so the block sits in
-    // the middle of the box the user laid out. It is `pointer-events: none`,
-    // which is what lets the header underneath stay a drag handle with working
-    // buttons while it is up.
+    // the middle of the box the user laid out.
+    //
+    // B2.2: it is a child of the ROOT rather than of the frame, and it
+    // counter-scales — the frame shrinks with the world now, and a name that
+    // shrank with it would be exactly the thing the label exists to avoid. The
+    // `1 / frameScale` here cancels the root's own scale, so the label reads at
+    // a fixed screen size at every zoom; the frame's `overflow: hidden` is not
+    // above it any more, so at deep zoom-out it is allowed to be bigger than
+    // the box it names, the way a disk's label is.
     this.label = document.createElement('div');
     Object.assign(this.label.style, {
       position: 'absolute',
       inset: '0',
       display: 'none',
+      alignItems: 'center',
+      justifyContent: 'center',
+      // The backdrop is inert: it covers the frame (and, counter-scaled, rather
+      // more than the frame), and a handle that big would eat the canvas
+      // around a tiny bubble. Only the content inside it takes the pointer.
+      pointerEvents: 'none',
+      textAlign: 'center',
+      // Deliberately NOT clipped. At deep zoom-out the block is taller than the
+      // speck it names, and cutting it off there would leave a zoomed-out
+      // workspace of unreadable slivers — which is the one thing the label
+      // exists to prevent. A disk's labels overrun their wedge for the same
+      // reason.
+      overflow: 'visible',
+    });
+
+    // The part that IS the affordance: at low zoom the header is scaled down to
+    // a couple of pixels, so the label carries the drag and the close instead.
+    // A bubble you cannot move or shut at low zoom would be a trap — B2.1 kept
+    // the header for exactly that reason, and this keeps the promise a
+    // different way now that the header shrinks.
+    this.labelInner = document.createElement('div');
+    Object.assign(this.labelInner.style, {
+      display: 'flex',
       flexDirection: 'column',
       alignItems: 'center',
       justifyContent: 'center',
       gap: '5px',
       padding: '8px 12px',
+      maxWidth: '100%',
       boxSizing: 'border-box',
-      pointerEvents: 'none',
-      textAlign: 'center',
+      pointerEvents: 'auto',
+      cursor: 'grab',
       overflow: 'hidden',
     });
     this.labelKind = document.createElement('span');
@@ -332,10 +378,13 @@ export class BubbleView {
       font: `10px/1.2 ${FONT_UI}`,
       whiteSpace: 'nowrap',
     });
-    this.label.append(this.labelKind, this.labelName, this.labelLoc);
+    const labelClose = this.makeButton('×', 'Close this bubble', () => this.callbacks.onClose());
+    this.labelInner.append(this.labelKind, this.labelName, this.labelLoc, labelClose);
+    this.label.append(this.labelInner);
+    this.bindDrag(this.labelInner, (dx, dy) => this.callbacks.onMove(dx, dy));
 
-    this.full.append(header, this.body, this.label, grip);
-    this.root.append(this.full);
+    this.full.append(header, this.body, grip);
+    this.root.append(this.full, this.label);
     parent.append(this.root);
     this.applyBoxSize();
   }
@@ -636,12 +685,14 @@ export class BubbleView {
    * The app's own popover lives in React and this overlay is imperative, so
    * this is hand-rolled to the same rules the rest of the bubble follows —
    * inline styles against the app's CSS variables, no transition, dismissed by
-   * the next press anywhere. Its offsets are plain CSS px against the frame,
-   * which is the whole benefit of a frame that never scales: screen px and box
-   * px are the same px, so it lands beside its marker at any zoom.
+   * the next press anywhere. Its offsets are plain FRAME px, because it is a
+   * child of the frame and rides the frame's own scale — so the two screen
+   * measurements it starts from are divided back into frame px first (B2.2),
+   * and it lands beside its marker at any zoom.
    */
   private showPicker(line: number, callees: BubbleCallSite[], marker: HTMLElement): void {
     this.closePicker();
+    const frame = this.frameScale > 0 ? this.frameScale : 1;
     const markerBox = marker.getBoundingClientRect();
     const rootBox = this.root.getBoundingClientRect();
 
@@ -660,8 +711,8 @@ export class BubbleView {
       boxShadow: '0 10px 30px rgba(0, 0, 0, 0.45)',
       font: `500 11px/1.3 ${FONT_UI}`,
     });
-    const left = Math.max(0, markerBox.left - rootBox.left + 12);
-    const top = Math.max(0, markerBox.bottom - rootBox.top + 4);
+    const left = Math.max(0, (markerBox.left - rootBox.left) / frame + 12);
+    const top = Math.max(0, (markerBox.bottom - rootBox.top) / frame + 4);
     picker.style.left = `${Math.min(left, Math.max(0, this.width - 130))}px`;
     picker.style.top = `${Math.min(top, Math.max(0, this.height - 40))}px`;
 
@@ -747,6 +798,12 @@ export class BubbleView {
         : firstRect.height;
     if (!(measured > 0)) return null;
     const scale = this.textScale > 0 ? this.textScale : 1;
+    // `getBoundingClientRect` answers in SCREEN px, and since B2.2 the root
+    // carries a `scale()` — so the frame scale has to come back out of the
+    // measurement, or a row measured while zoomed out would be reported short
+    // by exactly that factor. `offsetHeight` / `offsetTop` below are layout px
+    // and a transform does not touch them, so they are read as they are.
+    const frame = this.frameScale > 0 ? this.frameScale : 1;
     return {
       headerHeight: this.header.offsetHeight,
       padTop: first.offsetTop,
@@ -754,7 +811,7 @@ export class BubbleView {
       // Reported at text scale 1: the anchor maths multiplies it back up by
       // whatever the text is being drawn at, so there is one row height in the
       // system rather than one per zoom level.
-      lineHeight: measured / scale,
+      lineHeight: measured / scale / frame,
       lineCount: gutter.childElementCount,
       firstLine: this.firstLine,
     };
@@ -763,11 +820,13 @@ export class BubbleView {
   // -------------------------------------------------------------- geometry ---
 
   /**
-   * The size of the frame, in CSS px — fixed in SCREEN space (B2.1).
+   * The size of the frame, in FRAME px — the user's own number (B2.1), drawn
+   * through the camera's frame scale (B2.2).
    *
-   * The camera does not appear here and never will: zooming moves a bubble,
-   * it does not resize it. What the user dragged the corner to is what is on
-   * screen at every zoom level.
+   * The camera does not appear here: it is a transform on the root, applied in
+   * {@link place}. What the user dragged the corner to is what the box is at
+   * camera 1 and above; below it the same box is drawn smaller, with every
+   * proportion inside it untouched.
    */
   setSize(width: number, height: number): void {
     this.width = width;
@@ -804,15 +863,25 @@ export class BubbleView {
   }
 
   /**
-   * The per-frame call: where the bubble sits, and which face it is showing.
+   * The per-frame call: where the bubble sits, how big the camera is drawing
+   * it, and which face it is showing.
    *
    * This is deliberately the ONLY thing that happens to a bubble on a normal
    * frame — one string compare and (at most) one style write, no React, no
    * layout read, and nothing that touches the canvas or its snapshot. The
-   * frame's own size is not in here at all, because it does not depend on the
-   * camera.
+   * frame's own `width`/`height` are still not in here, because they are the
+   * user's own CSS px and only a resize changes them: what the camera changes
+   * is the `scale()` those px are drawn through (B2.2), which is a composited
+   * transform and reflows nothing.
    */
-  place(x: number, y: number, label: boolean): void {
+  place(x: number, y: number, label: boolean, frameScale: number): void {
+    const scale = Number.isFinite(frameScale) && frameScale > 0 ? frameScale : 1;
+    if (scale !== this.frameScale) {
+      this.frameScale = scale;
+      // Cancel the root's scale for the label only, so the one thing on a
+      // zoomed-out bubble that has to stay readable does.
+      this.label.style.transform = scale === 1 ? 'none' : `scale(${1 / scale})`;
+    }
     if (label !== this.isLabel) {
       this.isLabel = label;
       // Under a label there is no gutter on screen, so a picker hanging off
@@ -824,7 +893,10 @@ export class BubbleView {
       // survive a round trip across the threshold untouched.
       this.body.style.visibility = label ? 'hidden' : 'visible';
     }
-    const transform = `translate3d(${x}px, ${y}px, 0)`;
+    const transform =
+      scale === 1
+        ? `translate3d(${x}px, ${y}px, 0)`
+        : `translate3d(${x}px, ${y}px, 0) scale(${scale})`;
     if (transform !== this.lastTransform) {
       this.lastTransform = transform;
       this.root.style.transform = transform;
