@@ -224,6 +224,23 @@ export interface BubbleBodyGeometry {
   contentHeight: number;
 }
 
+/**
+ * The size of the block a zoomed-out bubble actually PAINTS, in SCREEN px
+ * (B3.1).
+ *
+ * The label counter-scales against the root's transform, so its size on screen
+ * is the same number at every zoom — which is exactly why it is measured once
+ * and cached rather than recomputed per frame, and why the unit it is measured
+ * in is the unit it is used in. `offsetWidth`/`offsetHeight` rather than a
+ * client rect on purpose: a transform does not touch them, so what comes back
+ * cannot be contaminated by the root scale the counter-scale is in the middle
+ * of cancelling.
+ */
+export interface BubbleLabelGeometry {
+  w: number;
+  h: number;
+}
+
 export class BubbleView {
   readonly root: HTMLDivElement;
   private readonly full: HTMLDivElement;
@@ -451,11 +468,19 @@ export class BubbleView {
     // (B2.3): they are already fixed on screen by the counter-scale, and
     // laying them out larger would only cancel out again. The label is only
     // ever shown below camera 0.5, where the layout scale is 1 regardless.
+    // B3.1: hidden by VISIBILITY rather than by `display`, the same way the
+    // body is — it keeps its layout box while the frame is showing its source,
+    // so the block's painted size can be measured once, off the frame path,
+    // alongside the body's rows. (A `display: none` label answers 0 × 0, which
+    // would have forced the measurement onto the frame that crosses the zoom
+    // threshold.) Hidden is still hidden: it paints nothing and, visibility
+    // being inherited, takes no pointer either.
     this.label = document.createElement('div');
     Object.assign(this.label.style, {
       position: 'absolute',
       inset: '0',
-      display: 'none',
+      display: 'flex',
+      visibility: 'hidden',
       alignItems: 'center',
       justifyContent: 'center',
       // The backdrop is inert: it covers the frame (and, counter-scaled, rather
@@ -1033,6 +1058,30 @@ export class BubbleView {
     };
   }
 
+  /**
+   * The size of the LABEL block on screen, or `null` while it has none (B3.1).
+   *
+   * Read once per header write — the only thing that changes what the block
+   * says — and cached by the controller, for the same reason the body's rows
+   * are: the tether that has to end on this block is drawn every frame, and a
+   * frame must not ask the DOM anything.
+   *
+   * Screen px, and the same screen px at every zoom: the block sits inside a
+   * counter-scaled label whose `scale(1 / rootScale)` hands back exactly the
+   * factor the root's transform took, so its composed scale is 1 and its
+   * layout size IS its size on screen. The one thing that is not scale-free is
+   * the `max-width: 100%` clamp above it, which is a share of a box measured
+   * in layout px — so the clamp is applied by the caller, in frame px, and
+   * what is reported here is the block's own unclamped extent.
+   */
+  labelGeometry(): BubbleLabelGeometry | null {
+    const w = this.labelInner.offsetWidth;
+    const h = this.labelInner.offsetHeight;
+    if (!Number.isFinite(w) || !Number.isFinite(h)) return null;
+    if (!(w > 0) || !(h > 0)) return null;
+    return { w, h };
+  }
+
   // -------------------------------------------------------------- geometry ---
 
   /**
@@ -1127,7 +1176,11 @@ export class BubbleView {
       // Under a label there is no gutter on screen, so a picker hanging off
       // one would be a menu attached to nothing.
       if (label) this.closePicker();
-      this.label.style.display = label ? 'flex' : 'none';
+      // `visibility`, not `display`, for the label as well (B3.1): it keeps its
+      // box on both sides of the threshold, so {@link labelGeometry} answers
+      // the same number whichever face is showing and a frame never has to
+      // measure it.
+      this.label.style.visibility = label ? 'visible' : 'hidden';
       // `visibility`, not `display`: the body keeps its layout box, so its
       // scroll offset, any selection in it and its measured geometry all
       // survive a round trip across the threshold untouched.

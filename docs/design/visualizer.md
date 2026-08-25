@@ -2247,6 +2247,112 @@ scheduling.
   frame is uniform or it is not honest). No re-layout of the workspace on zoom,
   and no editing, still.
 
+### Code bubbles (B3.1) — the tether lands on the face that is painted (additive; SUPERSEDES B1's "box or chip occupy the same rectangle")
+
+A bubble's origin tether was drawn into the MIDDLE of the bubble. Not by a
+rounding error and not at one particular zoom: the arithmetic was right about a
+rectangle that had stopped being the one on screen.
+
+**What broke, and when.** B1 wrote the rule down — the tether is fed *"the rect
+that is actually painted this frame — box or chip — so the chip case needs no
+second code path"* — and it was true then, because B1's zoomed-out chip filled
+exactly the box the frame did. B2.1 replaced the chip with a **counter-scaled
+label**: a child of the root wearing `scale(1 / rootScale)`, which hands back
+exactly the factor the root's transform took, so the block reads at a **fixed
+size on screen while the frame keeps shrinking with the world**. That is the
+whole point of it — and it is also the moment the two rectangles stopped being
+one. `bubbleScreenRect` is `w × s, h × s` and the label is `w × h` screen px
+regardless of `s`, so below the threshold the frame is a *speck inside the thing
+the user is looking at*: at camera 0.2 a 760-frame-px bubble is 152px of frame
+under ~200 × 75px of label. The tether kept landing on the frame's border,
+which is to say **inside the label**, and it got worse the further out you
+zoomed — which is precisely where a tether is the only thing telling you where a
+bubble came from. `bubbleTetherAnchor`'s own docblock still asserted the dead
+invariant ("the two occupy exactly the same rectangle"); the maths it guards was
+never wrong.
+
+**The rule, restated so it cannot rot again.** *The tether ends on the boundary
+of what is PAINTED, along the ray to the wedge* — the bubble's exact analogue of
+a disk tether ending at the rim. One new pure function owns the difference:
+
+```
+bubblePaintedRect(frame, face) = frame                       // nothing else painted
+                               = concentric max(frame, face) // the label is bigger
+```
+
+- **Concentric, so the union is the per-axis maximum.** The label is centred on
+  the frame it names, so the two rectangles share a centre and their union is a
+  rectangle — no polygon, no second border walk, and anything that only wants a
+  bubble's CENTRE (a `towardX`, a nearest-wedge scan) gets the same answer from
+  either. `bubbleTetherAnchor` is unchanged, and stays the one place the border
+  point is computed: it was always right about the rect it was given, so the fix
+  is upstream of it, in **which** rect it is given.
+- **The frame itself, to the bit, above the threshold.** When nothing bigger is
+  painted the function returns the input's own numbers rather than re-deriving a
+  corner from a centre — an identity, not an approximation of one, so every
+  consumer can be switched to it without a second code path and without moving a
+  pixel at camera ≥ 0.5. That is what lets the call threads (B2) ride the same
+  rectangle: their only regime down there is the centred one, which is a
+  function of the rect alone, so they land on the label too — and their line,
+  clamped and header regimes, which read a header height and a row offset out of
+  the rect, are provably untouched because the rect is the same object it was.
+- **The label's size is MEASURED, once, off the frame path.** The block's screen
+  size is scale-free (that is what the counter-scale buys), so it is read when
+  the header is written — the only thing that changes what the label says — and
+  cached in the bubble's state beside the body's row offsets. A frame still
+  touches the DOM exactly zero times. To make that read possible the label is
+  hidden by **`visibility`, not `display`**, the same way the body already is:
+  it keeps its layout box on both sides of the threshold, so it answers with its
+  real size at any zoom, and a zoom that crosses 0.5 does no DOM work at all.
+  (A `display: none` label answers 0 × 0, which would have forced the
+  measurement onto the very frame the threshold is crossed on.) Hidden is still
+  hidden: nothing is painted, and visibility being inherited, nothing takes a
+  pointer either.
+- **Two units, one clamp.** `offsetWidth`/`offsetHeight` rather than a client
+  rect, because a transform does not touch them — so the number cannot be
+  contaminated by the root scale the counter-scale is in the middle of
+  cancelling. The only thing about the block that is NOT scale-free is its
+  `max-width: 100%`, a share of a box measured in layout px, so the block is
+  measured unclamped and the clamp is applied where the frame px live: its
+  ceiling on screen is `bubble.w`, because the counter-scale gives back exactly
+  what the root took. A resize therefore needs no re-measurement.
+- **Refusal is inherited, and gets stricter.** A wedge inside the PAINTED rect
+  draws nothing, exactly as a wedge inside the frame always did — a bubble
+  sitting on top of its own origin has no honest line to draw, and the rect that
+  decides it is now the one the eye would judge it by.
+
+- Probed with a throwaway numeric probe over the real exported helpers, bundled
+  from `web/src/graph/` with esbuild: **12,000 random cases → 166,295 checks, 0
+  violations**. Each case is a bubble in frame px (200–2000 × 56–1200) placed
+  through a random origin and a camera log-uniform over 0.05–8 with the label
+  threshold's neighbourhood over-sampled (6,509 above it, 5,491 below; 4,581
+  where the label is the bigger rectangle and 7,419 where the frame still is),
+  crossed with 3 wedge positions each — 32,402 tethers drawn and 3,598 refused,
+  every refusal checked to be a wedge genuinely inside the painted rect. The
+  assertions are the rule itself: the start point is **on** the painted border
+  (one coordinate exactly at its half-extent, neither beyond it), **on the ray**
+  from the painted centre to the wedge (perpendicular distance ≤ ε) and
+  **between** the two (never behind the centre, never past the wedge); the end
+  is the wedge to the bit; the arm never exceeds half the gap; and the painted
+  rect is concentric with the frame, contains both rectangles, and IS the frame
+  exactly when nothing else is painted. **Mutation controls**, each the real
+  bundle with one operator changed and counted only where it moves the endpoint
+  at all: ending at the rect's **centre** is caught on 32,402/32,402; building
+  the rect in **frame px instead of screen px** on 32,400/32,400; and the
+  **pre-B3.1 rule itself** — the frame's border, blind to the label — on
+  9,914/9,914 of the rays where it gives a different answer. So the zero above
+  is a result, not a tautology.
+- **The blit is untouched, a fifth time.** Tethers are still chrome drawn after
+  `captureSnapshot` from the live camera, snapshots are still viewport-sized,
+  and there are still exactly **two** `requestCameraDraw` sites (the pan branch
+  of `onPointerMove`, and `onWheel`). The per-frame cost of the fix is one
+  comparison and, below the threshold, two `Math.max`.
+- **Explicit non-goals.** No visible backdrop behind the label to make the
+  painted face rectangular in the first place (it would be a new object in the
+  picture to solve an arithmetic problem). No per-frame measurement, and no
+  re-measurement on resize — the clamp is arithmetic. And no change to where a
+  tether ARRIVES: the wedge end keeps its radial convention and its dot.
+
 
 ## Phases (agent train, sequential)
 

@@ -36,7 +36,7 @@
 import { fetchSource, openInEditor } from '@/lib/api';
 import { formatNumber } from '@/lib/utils';
 
-import { BubbleView, type BubbleCallSite } from './bubble-view';
+import { BubbleView, type BubbleCallSite, type BubbleLabelGeometry } from './bubble-view';
 import {
   bundleControlPoints,
   bundleCurve,
@@ -741,6 +741,16 @@ interface BubbleState {
   callLines: Map<number, string[]>;
   /** Measured body geometry, or the fallback until there is a body to measure. */
   metrics: BubbleBodyMetrics;
+  /**
+   * The zoomed-out face's own size in SCREEN px, measured when the header was
+   * last written (B3.1), or `null` if it has never had one.
+   *
+   * Scale-free, so it is measured once rather than per frame: the label
+   * counter-scales against the root's transform, which is what makes the block
+   * the same size on screen at every zoom — and what makes it, rather than the
+   * shrinking frame, the thing a tether has to land on down there.
+   */
+  labelSize: BubbleLabelGeometry | null;
   /** Has {@link BubbleView.bodyGeometry} answered for the CURRENT content yet? */
   measured: boolean;
   /** Real file line of the first displayed row, and how many rows there are. */
@@ -1518,6 +1528,7 @@ export class CanvasController {
       calls: [],
       callLines: new Map(),
       metrics: BUBBLE_METRICS_FALLBACK,
+      labelSize: null,
       measured: false,
       firstLine: node.startLine,
       lineCount: 0,
@@ -1563,6 +1574,12 @@ export class CanvasController {
       canExpand: node.kind !== 'file',
       expanded: bubble.expanded,
     });
+    // The one place the label's text changes is the line above, so it is the
+    // one place its painted size can change (B3.1). Read here, cached in the
+    // state, and never read again: the tether that ends on this block is drawn
+    // every frame, and a frame does arithmetic over measured numbers or it
+    // does nothing.
+    bubble.labelSize = bubble.view.labelGeometry();
   }
 
   /**
@@ -1857,6 +1874,33 @@ export class CanvasController {
   }
 
   /**
+   * Where a bubble's PAINTED face sits on screen right now (B3.1).
+   *
+   * The frame, while the frame is what is being drawn — the two rectangles are
+   * then the same numbers. Below the label threshold they are not: the frame
+   * keeps shrinking with the world while the label counter-scales to a fixed
+   * size on screen, so what a user sees down there is the label block, and the
+   * frame under it is a speck inside it. Anything that has to touch the OUTSIDE
+   * of a bubble — every tether — is built from this rectangle rather than from
+   * the frame, or it lands in the middle of the thing it was aiming at.
+   *
+   * The two are concentric, so nothing that only wants a bubble's CENTRE has to
+   * choose between them.
+   */
+  private bubblePaintedScreenRect(bubble: BubbleState): BubbleRect {
+    const frame = this.bubbleScreenRect(bubble);
+    if (!bubbleIsLabel(this.scale())) return frame;
+    const label = bubble.labelSize;
+    if (!label) return frame;
+    // The block's `max-width: 100%`, in the unit the block is painted in: its
+    // ceiling is the frame's width in FRAME px, because the counter-scale gives
+    // back exactly the factor the root's transform took. Measured unclamped
+    // (the layout scale can widen the ceiling above 1), clamped here, so a
+    // resize needs no re-measurement.
+    return bubblePaintedRect(frame, { w: Math.min(label.w, bubble.w), h: label.h });
+  }
+
+  /**
    * The screen point of a bubble's ORIGIN wedge, and the wedge's outward
    * direction — `null` when no disk renders it right now.
    *
@@ -1909,7 +1953,14 @@ export class CanvasController {
       if (bubble.origin.kind === 'bubble') continue;
       const anchor = this.bubbleAnchor(bubble);
       if (!anchor) continue;
-      const curve = bubbleTetherAnchor(this.bubbleScreenRect(bubble), anchor.point, anchor.out);
+      // The PAINTED rect, not the frame (B3.1): a zoomed-out bubble is its
+      // label, and a line that stopped at the frame's border would stop inside
+      // the block the user is looking at rather than on its edge.
+      const curve = bubbleTetherAnchor(
+        this.bubblePaintedScreenRect(bubble),
+        anchor.point,
+        anchor.out
+      );
       if (!curve) continue;
       ctx.beginPath();
       ctx.moveTo(curve.start.x, curve.start.y);
@@ -2115,7 +2166,11 @@ export class CanvasController {
   ): BubbleCallAnchorPoint {
     const presentation = bubblePresentation(this.scale());
     return bubbleCallAnchor({
-      rect: this.bubbleScreenRect(bubble),
+      // Same rectangle the origin tether leaves (B3.1). Above the threshold it
+      // IS the frame, number for number, so every regime that reads a header or
+      // a row offset out of it is untouched; below it, where the only regime is
+      // the centred one, it is the label block the thread has to reach.
+      rect: this.bubblePaintedScreenRect(bubble),
       label: presentation.label,
       // The scale the DOM composes to — the same helper the rect and `place`
       // read, so the canvas and the overlay share one number. How the frame
@@ -5700,13 +5755,55 @@ export interface BubbleTether {
 }
 
 /**
+ * The rectangle a bubble PAINTS, from the two rectangles it is made of (B3.1).
+ *
+ * A bubble's frame is drawn at `frame px × camera` (B2.3), and below the label
+ * threshold its label is drawn at a fixed size on screen — the counter-scale
+ * hands back exactly the factor the root's transform took. So the two disagree
+ * about how big a zoomed-out bubble is, by the whole of the camera's scale, and
+ * the one the eye answers with is the LARGER: the label is what a bubble looks
+ * like down there, and the frame is a speck somewhere inside it.
+ *
+ * They are concentric — the label is centred on the frame it names — so their
+ * union is exactly the per-axis maximum, and the answer keeps the frame's own
+ * centre whatever happens. `face = null`, or a face no bigger than the frame,
+ * returns the frame itself: above the threshold there is nothing else painted,
+ * which is why every screen-space consumer can be built from this one function
+ * without a second code path for the zoomed-out case.
+ *
+ * `face.w` / `face.h` are SCREEN px, like the rect. Total: a non-finite input
+ * is dropped rather than propagated, because a NaN here would blank a frame.
+ */
+export function bubblePaintedRect(
+  rect: BubbleRect,
+  face: { w: number; h: number } | null
+): BubbleRect {
+  const x = finiteOr(rect.x, 0);
+  const y = finiteOr(rect.y, 0);
+  const w = Math.max(0, finiteOr(rect.w, 0));
+  const h = Math.max(0, finiteOr(rect.h, 0));
+  const centreX = x + w / 2;
+  const centreY = y + h / 2;
+  const width = Math.max(w, Math.max(0, finiteOr(face?.w, 0)));
+  const height = Math.max(h, Math.max(0, finiteOr(face?.h, 0)));
+  // The frame itself, to the bit, when nothing else is painted: re-deriving a
+  // corner from a centre is not exact in floating point, and "above the
+  // threshold this is the frame" should be an identity rather than an
+  // approximation of one.
+  if (width === w && height === h) return { x, y, w, h };
+  return { x: centreX - width / 2, y: centreY - height / 2, w: width, h: height };
+}
+
+/**
  * The cubic from a bubble's edge to the wedge it was dragged out of.
  *
  * Everything is in SCREEN px, because a bubble is: its frame is a fixed size
  * in CSS px that the camera only ever moves, so there is no world rectangle to
- * anchor against — `rect` is the frame as it sits on screen this frame, and
- * the same arithmetic serves the source body and the centred label alike,
- * since the two occupy exactly the same rectangle.
+ * anchor against — `rect` is the bubble as it is PAINTED on screen this frame.
+ * Which face that is comes from {@link bubblePaintedRect}, not from here: B1
+ * could hand this the frame either way, since its chip occupied exactly the
+ * frame's rectangle, but a counter-scaled label (B2.1) does not, and a tether
+ * built from the frame under one ends in the middle of what the user sees.
  *
  * It leaves the bubble along the line from the bubble's CENTRE to the wedge —
  * so the curve reads as coming out of the box rather than off a corner — and
