@@ -159,15 +159,22 @@ export interface StoredDisk {
  * that no longer resolves is dropped on restore exactly like a stored disk is.
  * The source itself is never stored — it is re-fetched, because the file on
  * disk is the truth and a cached copy of it would be a stale one.
+ *
+ * Restoring reads the fields below and ignores everything else it finds, so a
+ * payload written by an older build — which described a presentation that no
+ * longer exists — loads as the bubble it always was. Nothing is migrated,
+ * because nothing needs to be: `w`/`h` are plain CSS px under B2.1's fixed
+ * frame, which is what they always effectively were.
  */
 export interface StoredBubble {
   nodeId: string;
   /** Workspace coordinates of the bubble's TOP-LEFT corner. */
   x: number;
   y: number;
-  /** Box size in CSS px at scale 1 — the user's own drag, clamped. */
+  /** Frame size in CSS px — the user's own drag, clamped. Never zoomed. */
   w: number;
   h: number;
+  /** The scrollport's offset, in the same plain CSS px the DOM reports. */
   scrollTop: number;
   /** Showing the whole file rather than the symbol's own span. */
   expanded: boolean;
@@ -694,10 +701,10 @@ interface BubbleState {
   id: string;
   /** The node whose source this shows — also the wedge its tether points at. */
   nodeId: string;
-  /** Workspace coordinates of the top-left corner. */
+  /** Workspace coordinates of the top-left corner — the only thing the camera moves. */
   x: number;
   y: number;
-  /** Box size in CSS px at scale 1. */
+  /** Frame size in CSS px, fixed in SCREEN space: the camera never scales it (B2.1). */
   w: number;
   h: number;
   /** Whole file instead of the symbol's own span. */
@@ -712,8 +719,15 @@ interface BubbleState {
   requestSeq: number;
   /** Line to scroll to once the pending fetch lands (`null` = keep `scrollTop`). */
   pendingLine: number | null;
-  /** Width of the collapsed chip, from the label it has to hold. */
-  chipWidth: number;
+  /**
+   * Text scale the body is CURRENTLY laid out at (B2.1).
+   *
+   * The applied value, not the camera's: it is the `fromScale` the centre-line
+   * rule re-anchors against, and it deliberately stops following the camera
+   * while the bubble is showing its label, since laying out type nobody can
+   * read would be a layout for nothing.
+   */
+  textScale: number;
 
   // ---- phase B2: call tracing. All of this is rebuilt on a content load, and
   // never on a frame — a frame does anchor arithmetic and drawing, nothing else.
@@ -955,8 +969,6 @@ export class CanvasController {
   private bubbles: BubbleState[] = [];
   private bubbleSeq = 0;
   private bubbleZ = 1;
-  /** Were bubbles chips on the last frame? Drives the one re-measure (phase B2). */
-  private bubblesWereChips = false;
 
   constructor(container: HTMLElement, callbacks: CanvasCallbacks) {
     this.container = container;
@@ -1408,10 +1420,11 @@ export class CanvasController {
    */
   private spawnBubble(nodeId: string, at: Point, sourceDiskId: string | null): void {
     if (!this.bubbleable(nodeId)) return;
+    // The frame is CSS px on screen and the workspace is world units, so the
+    // half-extents cross exactly one conversion — the camera's own scale.
     const scale = this.scale();
-    const presentation = bubblePresentation(scale);
-    const halfW = (BUBBLE_DEFAULT_WIDTH * presentation.scale) / 2 / scale;
-    const halfH = (BUBBLE_DEFAULT_HEIGHT * presentation.scale) / 2 / scale;
+    const halfW = BUBBLE_DEFAULT_WIDTH / 2 / scale;
+    const halfH = BUBBLE_DEFAULT_HEIGHT / 2 / scale;
     this.createBubble({
       nodeId,
       x: at.x - halfW,
@@ -1451,7 +1464,7 @@ export class CanvasController {
       onRaise: () => this.raiseBubble(id),
       onMove: (dx, dy) => this.moveBubble(id, dx, dy),
       onResize: (dx, dy) => this.resizeBubble(id, dx, dy),
-      onScroll: (scrollTop) => this.bubbleScrolled(id, scrollTop),
+      onScroll: (scrollTop, programmatic) => this.bubbleScrolled(id, scrollTop, programmatic),
       onToggleExpand: () => this.toggleBubbleExpand(id),
       onOpenInEditor: () => this.openBubbleInEditor(id),
       onOpenCallee: (line, calleeId) => this.openCallee(id, line, calleeId),
@@ -1471,7 +1484,7 @@ export class CanvasController {
       view,
       requestSeq: 0,
       pendingLine: null,
-      chipWidth: BUBBLE_CHIP_MIN_WIDTH,
+      textScale: bubbleTextScale(this.scale()),
       origin: init.origin,
       calls: [],
       callLines: new Map(),
@@ -1483,6 +1496,7 @@ export class CanvasController {
     };
     this.bubbles.push(bubble);
     view.setSize(size.w, size.h);
+    view.setTextScale(bubble.textScale);
     view.setZ(bubble.z);
     this.refreshBubbleHeader(bubble);
     this.loadBubbleSource(bubble);
@@ -1498,7 +1512,9 @@ export class CanvasController {
   }
 
   /**
-   * Re-print the header.
+   * Re-print the header — and, with it, the centred label the frame shows when
+   * the camera is too far out to read type (B2.1: they carry the same facts,
+   * from the same place, so the two faces of a bubble can never disagree).
    *
    * `loc` is the line count of what is ACTUALLY in the box — the symbol's span
    * until an "expand to file" lands, the file's own length after it — so the
@@ -1507,8 +1523,6 @@ export class CanvasController {
   private refreshBubbleHeader(bubble: BubbleState, loc?: number): void {
     const node = this.model?.get(bubble.nodeId);
     if (!node) return;
-    bubble.chipWidth = bubbleChipWidth(node.name.length + node.kind.length + 12);
-    bubble.view.setChipSize(bubble.chipWidth, BUBBLE_CHIP_HEIGHT);
     bubble.view.setHeader({
       name: node.name,
       kind: node.kind,
@@ -1598,14 +1612,16 @@ export class CanvasController {
     this.notifyWorkspace();
   }
 
-  /** Corner drag: screen px in, BOX units out — the box is scaled, not the world. */
+  /**
+   * Corner drag: screen px in, frame px out — and they are the same px.
+   *
+   * The frame is fixed in screen space (B2.1), so the grip needs no conversion
+   * at all: drag it 40px and the frame is 40px wider, at any zoom, for good.
+   */
   private resizeBubble(id: string, dx: number, dy: number): void {
     const bubble = this.bubbleById(id);
     if (!bubble) return;
-    // Screen px → box units: the box is scaled by the hybrid rule, not by the
-    // camera, so the grip has to divide by exactly what it is drawn at.
-    const scale = Math.max(0.05, bubblePresentation(this.scale()).scale);
-    const size = clampBubbleSize(bubble.w + dx / scale, bubble.h + dy / scale);
+    const size = clampBubbleSize(bubble.w + dx, bubble.h + dy);
     if (size.w === bubble.w && size.h === bubble.h) return;
     bubble.w = size.w;
     bubble.h = size.h;
@@ -1614,16 +1630,23 @@ export class CanvasController {
     this.notifyWorkspace();
   }
 
-  private bubbleScrolled(id: string, scrollTop: number): void {
+  private bubbleScrolled(id: string, scrollTop: number, programmatic: boolean): void {
     const bubble = this.bubbleById(id);
     if (!bubble || bubble.scrollTop === scrollTop) return;
+    // The DOM's answer wins either way: it has clamped the offset to a content
+    // height only it knows exactly, and state that disagreed with it would
+    // walk the threads off the line they claim.
     bubble.scrollTop = scrollTop;
+    this.notifyWorkspace();
     // Phase B2: a call thread leaves the call-site LINE, so scrolling the body
     // moves every thread that leaves this bubble. It goes through the ordinary
     // dirty path — a scroll is not a camera gesture, so it must never reuse the
     // snapshot — and the chrome pass re-derives the anchors from the new offset.
-    this.requestDraw();
-    this.notifyWorkspace();
+    //
+    // B2.1: unless this is the echo of the re-anchoring the zoom itself just
+    // did. That frame is already being drawn, and dirtying the scene from it
+    // would take a wheel gesture off the blit for its whole duration.
+    if (!programmatic) this.requestDraw();
   }
 
   /**
@@ -1667,51 +1690,79 @@ export class CanvasController {
    *
    * One transform each, from the camera the canvas is about to be (or has just
    * been) drawn under. No React, no layout read, no canvas call: bubbles are
-   * DOM and the blit never learns they exist.
+   * DOM and the blit never learns they exist. The frame's SIZE is not touched
+   * here, because it does not depend on the camera (B2.1).
    */
   private syncBubbles(): void {
     if (this.bubbles.length === 0) return;
     const origin = this.origin();
     const scale = this.scale();
-    const presentation = bubblePresentation(scale);
+    const label = bubblePresentation(scale).label;
     for (const bubble of this.bubbles) {
-      bubble.view.place(
-        origin.x + bubble.x * scale,
-        origin.y + bubble.y * scale,
-        presentation.scale,
-        presentation.chip
-      );
+      bubble.view.place(origin.x + bubble.x * scale, origin.y + bubble.y * scale, label);
     }
-    // A body inside a CHIP has no layout to measure, so a bubble whose content
-    // landed while it was collapsed is still carrying the fallback metrics.
-    // Measure those — and only those — the one frame the chip opens back into a
-    // box; on every other frame this is a boolean compare (phase B2).
-    if (this.bubblesWereChips && !presentation.chip) {
-      for (const bubble of this.bubbles) {
-        if (!bubble.measured) this.measureBubbleBody(bubble);
-      }
-    }
-    this.bubblesWereChips = presentation.chip;
   }
 
   /**
-   * What a bubble occupies on screen right now — box or chip.
+   * Zoom the text inside every bubble, and keep the reading position (B2.1).
    *
-   * Derived from the LIVE camera rather than from anything the last frame
-   * stored, so the tether cannot lag the box it leaves by a frame during a
-   * gesture: both read the same `bubblePresentation` of the same scale.
+   * Runs at the TOP of a frame, before the chrome pass, so the DOM the user
+   * sees and the arithmetic the threads are drawn from describe the same body.
+   * It is a no-op on every frame that is not a scale change — which is every
+   * pan, every hover, every selection — and while a bubble is showing its
+   * label there is nothing to lay out, so it is skipped there too and picked
+   * up on the way back in.
+   */
+  private syncBubbleText(): void {
+    if (this.bubbles.length === 0) return;
+    const presentation = bubblePresentation(this.scale());
+    if (presentation.label) return;
+    for (const bubble of this.bubbles) {
+      if (bubble.textScale === presentation.textScale) continue;
+      const from = bubble.textScale;
+      bubble.textScale = presentation.textScale;
+      bubble.view.setTextScale(presentation.textScale);
+      if (!bubble.measured) continue;
+      // The centre-line rule: whatever was in the middle of the frame stays in
+      // the middle of it. Applied AFTER the font write, so the scrollport it
+      // lands in is the one the new type made.
+      const next = bubbleScrollForTextScale({
+        scrollTop: bubble.scrollTop,
+        viewportHeight: this.bubbleViewportHeight(bubble),
+        padTop: bubble.metrics.padTop,
+        padBottom: bubble.metrics.padBottom,
+        lineHeight: bubble.metrics.lineHeight,
+        lineCount: bubble.lineCount,
+        fromScale: from,
+        toScale: presentation.textScale,
+      });
+      if (next === bubble.scrollTop) continue;
+      bubble.scrollTop = next;
+      bubble.view.setScrollTop(next);
+    }
+  }
+
+  /** The scrolling part of a frame: its height less the header and its borders. */
+  private bubbleViewportHeight(bubble: BubbleState): number {
+    return Math.max(0, bubble.h - bubble.metrics.headerHeight - BUBBLE_FRAME_BORDER_PX * 2);
+  }
+
+  /**
+   * Where a bubble's FRAME sits on screen right now.
+   *
+   * Its size is the user's own, in CSS px, at every zoom (B2.1) — the camera
+   * only moves it. The position is derived from the LIVE camera rather than
+   * from anything the last frame stored, so a tether cannot lag the frame it
+   * leaves by a frame during a gesture.
    */
   private bubbleScreenRect(bubble: BubbleState): BubbleRect {
     const origin = this.origin();
     const scale = this.scale();
-    const presentation = bubblePresentation(scale);
-    const width = presentation.chip ? bubble.chipWidth : bubble.w * presentation.scale;
-    const height = presentation.chip ? BUBBLE_CHIP_HEIGHT : bubble.h * presentation.scale;
     return {
       x: origin.x + bubble.x * scale,
       y: origin.y + bubble.y * scale,
-      w: width,
-      h: height,
+      w: bubble.w,
+      h: bubble.h,
     };
   }
 
@@ -1940,6 +1991,7 @@ export class CanvasController {
     bubble.metrics = {
       headerHeight: geometry.headerHeight,
       padTop: geometry.padTop,
+      padBottom: geometry.padBottom,
       lineHeight: geometry.lineHeight,
     };
     bubble.firstLine = geometry.firstLine;
@@ -1969,8 +2021,10 @@ export class CanvasController {
     const presentation = bubblePresentation(this.scale());
     return bubbleCallAnchor({
       rect: this.bubbleScreenRect(bubble),
-      chip: presentation.chip,
-      scale: presentation.scale,
+      label: presentation.label,
+      // The scale the DOM is laid out at, which `syncBubbleText` has already
+      // brought up to date for this frame — one number, two consumers.
+      textScale: bubble.textScale,
       metrics: bubble.metrics,
       firstLine: bubble.firstLine,
       lineCount: bubble.lineCount,
@@ -1980,7 +2034,7 @@ export class CanvasController {
     });
   }
 
-  /** The callee-side anchor: the header (or the chip), on the facing border. */
+  /** The callee-side anchor: the header (or the centred label), on the facing border. */
   private bubbleHeaderAnchor(bubble: BubbleState, towardX: number): BubbleCallAnchorPoint {
     return this.bubbleCallAnchorOf(bubble, null, towardX);
   }
@@ -2013,11 +2067,12 @@ export class CanvasController {
     const origin = this.origin();
     const rect = this.bubbleScreenRect(caller);
     const anchor = this.bubbleCallAnchorOf(caller, line, Number.POSITIVE_INFINITY);
-    const presentation = bubblePresentation(scale);
-    // Screen px back into world units: the box is scaled by the hybrid rule,
-    // the workspace by the camera, so the gap crosses both.
+    // Screen px back into world units — one conversion, the camera's, since
+    // the frame is fixed in screen space (B2.1). Its top is lifted by the
+    // header so it is the new bubble's CONTENT that lands level with the call
+    // site, which is what "level with" has to mean for the eye.
     const x = (rect.x + rect.w + CALL_OPEN_GAP_PX - origin.x) / scale;
-    const y = (anchor.y - origin.y) / scale - (caller.metrics.headerHeight * presentation.scale) / scale;
+    const y = (anchor.y - caller.metrics.headerHeight - origin.y) / scale;
 
     this.createBubble({
       nodeId: calleeId,
@@ -3055,6 +3110,12 @@ export class CanvasController {
 
   private draw(): void {
     const ratio = window.devicePixelRatio || 1;
+
+    // Before anything is painted: bring every bubble's TEXT up to the camera's
+    // scale and re-anchor its scroll (B2.1). It has to happen ahead of the
+    // chrome pass, because that pass draws threads from the very metrics this
+    // updates — and it is a no-op on any frame the scale did not change on.
+    this.syncBubbleText();
 
     // A hit test the camera's motion deferred lands here, on the first settled
     // frame, so the hover it produces is painted by the redraw below rather
@@ -4217,17 +4278,13 @@ export class CanvasController {
   }
 
   /**
-   * The bubble half of the ghost: the box, where it will be, at the size it
-   * will read at (a chip's worth of the workspace when the camera is far out).
+   * The bubble half of the ghost: the frame, where it will be, at exactly the
+   * size it will be — which under B2.1 is one pair of numbers at every zoom,
+   * so the outline under the cursor is the box the release produces.
    */
   private drawBubbleGhost(ctx: CanvasRenderingContext2D, drag: DragState): void {
-    const presentation = bubblePresentation(this.scale());
-    const width = presentation.chip
-      ? bubbleChipWidth(drag.label.length + 12)
-      : BUBBLE_DEFAULT_WIDTH * presentation.scale;
-    const height = presentation.chip
-      ? BUBBLE_CHIP_HEIGHT
-      : BUBBLE_DEFAULT_HEIGHT * presentation.scale;
+    const width = BUBBLE_DEFAULT_WIDTH;
+    const height = BUBBLE_DEFAULT_HEIGHT;
     const x = drag.x - width / 2;
     const y = drag.y - height / 2;
     const corner = Math.min(8, width / 2, height / 2);
@@ -5188,9 +5245,11 @@ const TEXT_CACHE_MAX = 4000;
 /**
  * A bubble's on-screen box, in CSS px. `x`/`y` is its top-left corner.
  *
- * A bubble is anchored to a WORLD point and sized in SCREEN px, which is the
- * whole of the hybrid-zoom idea: it travels with the disk it came out of, but
- * its text is never smaller or larger than a text is worth reading at.
+ * A bubble is anchored to a WORLD point and sized in SCREEN px, and as of
+ * B2.1 that size is FIXED: the camera moves the frame around the screen and
+ * never resizes it. Only the text inside it zooms (see
+ * {@link bubbleTextScale}), so `w`/`h` are exactly the numbers the user
+ * dragged the corner to.
  */
 export interface BubbleRect {
   x: number;
@@ -5199,16 +5258,24 @@ export interface BubbleRect {
   h: number;
 }
 
-/** Widest a bubble ever reads. Past this the world keeps zooming, the text does not. */
-export const BUBBLE_MAX_SCALE = 1.5;
-/** Under this camera scale a bubble is a title chip instead of a box. */
-export const BUBBLE_CHIP_BELOW = 0.5;
-/** The chip is fixed-size: legible at any zoom, which is its entire job. */
-export const BUBBLE_CHIP_SCALE = 1;
-/** Chip geometry — a single row, sized from the label it has to hold. */
-export const BUBBLE_CHIP_HEIGHT = 22;
-export const BUBBLE_CHIP_MIN_WIDTH = 96;
-export const BUBBLE_CHIP_MAX_WIDTH = 260;
+/** Widest the TEXT ever reads. Past this the world keeps zooming, the type does not. */
+export const BUBBLE_MAX_TEXT_SCALE = 1.5;
+/** Under this camera scale the body is replaced by a centred label (B2.1). */
+export const BUBBLE_LABEL_BELOW = 0.5;
+/**
+ * Quantisation of the text scale, in scale units.
+ *
+ * The frame never changes size, so a zoom's only effect on a bubble is a
+ * font-size write — and a font-size write on a body of a few hundred `pre`
+ * rows is a real layout. Rounding the scale to 5% steps means a wheel gesture
+ * across the whole readable range re-lays a bubble out about twenty times
+ * instead of once per frame, and — because the SAME quantised number is what
+ * the anchor maths uses — the DOM and the tether geometry can never disagree
+ * about how tall a row is.
+ */
+export const BUBBLE_TEXT_SCALE_STEP = 0.05;
+/** The frame's own 1px border, which the scrollport does not get to use. */
+export const BUBBLE_FRAME_BORDER_PX = 1;
 /** Default and clamp range for the box the user drags out and resizes. */
 export const BUBBLE_DEFAULT_WIDTH = 380;
 export const BUBBLE_DEFAULT_HEIGHT = 260;
@@ -5221,46 +5288,61 @@ export const BUBBLE_TETHER_ARM_SHARE = 0.42;
 export const BUBBLE_TETHER_MIN_ARM = 8;
 
 /**
- * How a bubble reads at a given camera scale — the hybrid-zoom rule, whole.
+ * How a bubble reads at a given camera scale — the fixed-frame rule, whole
+ * (B2.1, and it REPLACES B1's hybrid box scale plus its title chip).
  *
- * Two regimes, and the split is the point:
+ * The frame itself is not in here at all, and that is the change: its width
+ * and height are the user's own CSS px and the camera only ever moves it.
+ * What the camera does drive is what is INSIDE the frame:
  *
- *  - **at or above {@link BUBBLE_CHIP_BELOW}** the bubble scales WITH the world
- *    (so it stays glued to the wedge it came from and to its neighbours) but
- *    never past {@link BUBBLE_MAX_SCALE} — zooming in to read one wedge should
+ *  - **at or above {@link BUBBLE_LABEL_BELOW}** the body's type scales with
+ *    the world — zoom out and the same box holds more, smaller lines; zoom in
+ *    and it holds fewer, larger ones — but never past
+ *    {@link BUBBLE_MAX_TEXT_SCALE}, because reading one wedge closely should
  *    not turn a bubble into a billboard;
- *  - **below it** the box would be unreadable at any size the layout can give
- *    it, so it collapses to a title CHIP at a fixed readable size, anchored at
- *    the same world point. It is a different affordance, not a smaller one,
- *    which is why the scale jumps rather than continuing down.
+ *  - **below it** no type the body can be given is readable, so the body is
+ *    replaced by the node's NAME, KIND and LoC centred in the frame at a fixed
+ *    readable size. The frame is retained — it is the same object in the same
+ *    place, holding its space in the layout the user built, saying what it is
+ *    instead of what it says.
  *
- * Pure and total: the same camera scale always produces the same answer, so
- * crossing the threshold in either direction is idempotent and the controller
- * only has to preserve the scroll position across it.
+ * Pure and total, and the text scale is quantised
+ * ({@link BUBBLE_TEXT_SCALE_STEP}), so the same camera scale always produces
+ * exactly the same answer: crossing the threshold in either direction is
+ * idempotent, and the DOM and the anchor maths always read one number.
  */
 export interface BubblePresentation {
-  scale: number;
-  chip: boolean;
+  /** Multiplier on the body's font-size and line-height. */
+  textScale: number;
+  /** Below the readability threshold: centred label instead of source. */
+  label: boolean;
 }
 
-/** The scale a bubble's BOX is drawn at — `min(camera, 1.5)`, clamped exactly. */
-export function bubbleScale(cameraScale: number): number {
-  if (!Number.isFinite(cameraScale)) return BUBBLE_MAX_SCALE;
-  return Math.min(Math.max(cameraScale, 0), BUBBLE_MAX_SCALE);
+/** The multiplier the body's TYPE is drawn at — `min(camera, 1.5)`, quantised. */
+export function bubbleTextScale(cameraScale: number): number {
+  if (!Number.isFinite(cameraScale)) return BUBBLE_MAX_TEXT_SCALE;
+  const clamped = Math.min(Math.max(cameraScale, 0), BUBBLE_MAX_TEXT_SCALE);
+  const stepped = Math.round(clamped / BUBBLE_TEXT_SCALE_STEP) * BUBBLE_TEXT_SCALE_STEP;
+  return Math.min(BUBBLE_MAX_TEXT_SCALE, Math.max(0, stepped));
 }
 
-/** Is the camera far enough out that the box is worthless? */
-export function bubbleIsChip(cameraScale: number): boolean {
-  return Number.isFinite(cameraScale) && cameraScale < BUBBLE_CHIP_BELOW;
+/** Is the camera far enough out that no size of type in the frame is worth reading? */
+export function bubbleIsLabel(cameraScale: number): boolean {
+  return Number.isFinite(cameraScale) && cameraScale < BUBBLE_LABEL_BELOW;
 }
 
-/** {@link bubbleScale} and {@link bubbleIsChip} as the one answer a frame needs. */
+/** {@link bubbleTextScale} and {@link bubbleIsLabel} as the one answer a frame needs. */
 export function bubblePresentation(cameraScale: number): BubblePresentation {
-  const chip = bubbleIsChip(cameraScale);
-  return { chip, scale: chip ? BUBBLE_CHIP_SCALE : bubbleScale(cameraScale) };
+  return { textScale: bubbleTextScale(cameraScale), label: bubbleIsLabel(cameraScale) };
 }
 
-/** A user-dragged size, held inside the range a bubble is still usable in. */
+/**
+ * A user-dragged size, held inside the range a bubble is still usable in.
+ *
+ * Plainly CSS px, at every zoom — which is what the fixed frame buys: the
+ * number the grip produces, the number that is stored, and the number of
+ * pixels on screen are all the same number.
+ */
 export function clampBubbleSize(width: number, height: number): { w: number; h: number } {
   const w = Number.isFinite(width) ? width : BUBBLE_DEFAULT_WIDTH;
   const h = Number.isFinite(height) ? height : BUBBLE_DEFAULT_HEIGHT;
@@ -5270,10 +5352,60 @@ export function clampBubbleSize(width: number, height: number): { w: number; h: 
   };
 }
 
-/** The chip's width for a label of `length` characters — a fixed advance, no measuring. */
-export function bubbleChipWidth(length: number): number {
-  const chars = Number.isFinite(length) ? Math.max(0, Math.floor(length)) : 0;
-  return Math.min(BUBBLE_CHIP_MAX_WIDTH, Math.max(BUBBLE_CHIP_MIN_WIDTH, Math.round(chars * 6.2) + 24));
+/** Everything {@link bubbleScrollForTextScale} needs. All CSS px except the scales. */
+export interface BubbleScrollAnchorInput {
+  /** The scrollport's offset now, in plain CSS px (the frame is unscaled). */
+  scrollTop: number;
+  /** Height of the scrolling body — the frame's height less its header. */
+  viewportHeight: number;
+  /** Padding above the first row and below the last, unscaled. */
+  padTop: number;
+  padBottom: number;
+  /** One source row at text scale 1. */
+  lineHeight: number;
+  lineCount: number;
+  /** Text scale the body is laid out at now, and the one it is going to. */
+  fromScale: number;
+  toScale: number;
+}
+
+/**
+ * Where the body must be scrolled to after a text-scale change — the
+ * **centre-line rule** (B2.1).
+ *
+ * A fixed frame whose type changes size has to decide what stays still, and
+ * the only choice that survives zooming both ways is the line the eye is
+ * already on. So: **the content point at the frame's vertical centre is
+ * preserved.** Express that point as a fractional line index
+ * `u = (scrollTop + viewportHeight / 2 − padTop) / (lineHeight × fromScale)`,
+ * then put the same `u` back at the centre under `toScale`. Whatever was in
+ * the middle of the box before the zoom is in the middle of it after, and the
+ * text grows or shrinks around it.
+ *
+ * Deterministic and total, with two properties the probe pins down: the same
+ * scale in and out is the identity (to floating-point rounding) for any
+ * offset already inside the scroll range, and re-applying the rule to its own
+ * output changes nothing. The result is clamped to the range the browser
+ * itself would clamp to, so the one case the rule cannot honour — content too
+ * short to put `u` in the middle — ends at the edge rather than at a lie.
+ */
+export function bubbleScrollForTextScale(input: BubbleScrollAnchorInput): number {
+  const viewport = Math.max(0, finiteOr(input.viewportHeight, 0));
+  const padTop = Math.max(0, finiteOr(input.padTop, 0));
+  const padBottom = Math.max(0, finiteOr(input.padBottom, 0));
+  const lineHeight = Math.max(0, finiteOr(input.lineHeight, 0));
+  const count = Math.max(0, Math.floor(finiteOr(input.lineCount, 0)));
+  const from = Math.max(1e-6, finiteOr(input.fromScale, 1));
+  const to = Math.max(1e-6, finiteOr(input.toScale, 1));
+  const scrollTop = Math.max(0, finiteOr(input.scrollTop, 0));
+  const limit = Math.max(0, padTop + count * lineHeight * to + padBottom - viewport);
+  // Nothing to anchor to: there are no rows, or they have no height. The
+  // offset survives, clamped — a body with no lines has nowhere else to be.
+  if (!(lineHeight > 0) || count === 0) return Math.min(scrollTop, limit);
+  const centre = scrollTop + viewport / 2;
+  const u = (centre - padTop) / (lineHeight * from);
+  const next = padTop + u * lineHeight * to - viewport / 2;
+  return Math.min(Math.max(0, next), limit);
 }
 
 /** A bubble's tether, in the same shape `workspace.ts` gives a disk's. */
@@ -5287,10 +5419,11 @@ export interface BubbleTether {
 /**
  * The cubic from a bubble's edge to the wedge it was dragged out of.
  *
- * Everything is in SCREEN px, because a bubble is: its box is scaled by
- * {@link bubblePresentation} rather than by the camera, so there is no single
- * world rectangle to anchor against — `rect` is whatever is actually painted
- * this frame, box or chip, and the same arithmetic serves both.
+ * Everything is in SCREEN px, because a bubble is: its frame is a fixed size
+ * in CSS px that the camera only ever moves, so there is no world rectangle to
+ * anchor against — `rect` is the frame as it sits on screen this frame, and
+ * the same arithmetic serves the source body and the centred label alike,
+ * since the two occupy exactly the same rectangle.
  *
  * It leaves the bubble along the line from the bubble's CENTRE to the wedge —
  * so the curve reads as coming out of the box rather than off a corner — and
@@ -5366,8 +5499,12 @@ function finiteOr(value: number | undefined | null, fallback: number): number {
  * reflow per tether per frame.
  */
 export interface BubbleBodyMetrics {
+  /** The header row, which does NOT zoom — it is chrome, not content. */
   headerHeight: number;
+  /** Padding above the first row and below the last, both unscaled. */
   padTop: number;
+  padBottom: number;
+  /** One source row, top to top, at text scale 1. */
   lineHeight: number;
 }
 
@@ -5375,30 +5512,37 @@ export interface BubbleBodyMetrics {
  * What a bubble reads at before it has ever been measured — the CSS in
  * `bubble-view.ts` (11px text at 1.55, a 4px-padded 11px/1.2 header, 6px of
  * gutter padding). Used for the frame or two between a spawn and its content,
- * and for a bubble that is still a chip, so an anchor is always a NUMBER.
+ * so an anchor is always a NUMBER.
  */
 export const BUBBLE_METRICS_FALLBACK: BubbleBodyMetrics = {
   headerHeight: 22,
   padTop: 6,
-  lineHeight: 17,
+  padBottom: 6,
+  lineHeight: 17.05,
 };
 
-export type BubbleAnchorMode = 'line' | 'clamped' | 'header' | 'chip';
+export type BubbleAnchorMode = 'line' | 'clamped' | 'header' | 'centered';
 
 /** Everything the caller-side anchor depends on. All screen px except `metrics`/`scrollTop`. */
 export interface BubbleCallAnchorInput {
-  /** What the bubble occupies on screen this frame — box or chip. */
+  /** The bubble's FIXED frame as it sits on screen this frame. */
   rect: BubbleRect;
-  /** Collapsed: there is no body, so there is no line to point at. */
-  chip: boolean;
-  /** The BUBBLE's scale (the hybrid-zoom rule), not the camera's. */
-  scale: number;
+  /** Below the readability threshold: a centred label, so there is no line to point at. */
+  label: boolean;
+  /** The TEXT's scale, which is the only thing the camera changes inside the frame. */
+  textScale: number;
   metrics: BubbleBodyMetrics;
   /** Real file line of the first displayed row. */
   firstLine: number;
   /** Rows displayed — 0 while the fetch is in flight. */
   lineCount: number;
-  /** The body's scroll offset, in unscaled CSS px. */
+  /**
+   * The body's scroll offset, in plain CSS px.
+   *
+   * There is no second unit any more: the scrollport is part of a frame that
+   * is never scaled, so what the DOM reports, what is stored, and what this
+   * arithmetic subtracts are one number.
+   */
   scrollTop: number;
   /** The call-site line, or `null` when the edge does not carry one. */
   line: number | null;
@@ -5432,8 +5576,16 @@ export interface BubbleCallAnchorPoint {
  *  - **`header`** — the edge carries no line at all (some resolvers do not
  *    record one): the thread hangs off the header, which claims the BUBBLE and
  *    not a position in it.
- *  - **`chip`** — collapsed to a title chip: the chip is the whole affordance,
- *    so the anchor is its edge and nothing pretends there is a body.
+ *  - **`centered`** — below the readability threshold the frame holds a
+ *    centred label instead of source (B2.1, where B1 had a chip): there is no
+ *    row to point at, so the anchor is the frame's own middle and nothing
+ *    pretends otherwise.
+ *
+ * The camera is not an input. A bubble's frame is fixed in screen px, so
+ * everything the camera does to this answer it does by moving `rect` —
+ * translate the frame and the anchor translates with it, exactly. What the
+ * camera DOES change inside the frame is `textScale`, and it enters in one
+ * place: the height of a row.
  *
  * Pure and total: every branch returns finite numbers for any input, because a
  * NaN here would silently poison a bezier and blank a frame.
@@ -5447,9 +5599,9 @@ export function bubbleCallAnchor(input: BubbleCallAnchorInput): BubbleCallAnchor
   const side: 'left' | 'right' = finiteOr(input.towardX, centreX) >= centreX ? 'right' : 'left';
   const bx = side === 'right' ? x + w : x;
 
-  if (input.chip) return { x: bx, y: y + h / 2, side, clamped: false, mode: 'chip' };
+  if (input.label) return { x: bx, y: y + h / 2, side, clamped: false, mode: 'centered' };
 
-  const scale = Math.max(1e-6, finiteOr(input.scale, 1));
+  const textScale = Math.max(1e-6, finiteOr(input.textScale, 1));
   const headerHeight = Math.max(
     0,
     finiteOr(input.metrics?.headerHeight, BUBBLE_METRICS_FALLBACK.headerHeight)
@@ -5460,7 +5612,8 @@ export function bubbleCallAnchor(input: BubbleCallAnchorInput): BubbleCallAnchor
     finiteOr(input.metrics?.lineHeight, BUBBLE_METRICS_FALLBACK.lineHeight)
   );
 
-  const header = Math.min(headerHeight * scale, h);
+  // The header is chrome and does not zoom, so it is subtracted unscaled.
+  const header = Math.min(headerHeight, h);
   const top = y + header;
   const bottom = y + h;
   const count = Math.max(0, Math.floor(finiteOr(input.lineCount, 0)));
@@ -5476,9 +5629,12 @@ export function bubbleCallAnchor(input: BubbleCallAnchorInput): BubbleCallAnchor
     return { x: bx, y: line < first ? top : bottom, side, clamped: true, mode: 'clamped' };
   }
 
+  // Content space IS screen space inside a fixed frame, so the row's middle
+  // needs no outer multiplication: only the row's own height is zoomed.
   const scrollTop = Math.max(0, finiteOr(input.scrollTop, 0));
-  const offset = padTop + (line - first) * lineHeight + lineHeight / 2 - scrollTop;
-  const candidate = top + offset * scale;
+  const row = lineHeight * textScale;
+  const offset = padTop + (line - first) * row + row / 2 - scrollTop;
+  const candidate = top + offset;
   if (candidate < top) return { x: bx, y: top, side, clamped: true, mode: 'clamped' };
   if (candidate > bottom) return { x: bx, y: bottom, side, clamped: true, mode: 'clamped' };
   return { x: bx, y: candidate, side, clamped: false, mode: 'line' };

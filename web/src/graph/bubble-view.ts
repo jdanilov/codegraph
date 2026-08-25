@@ -26,10 +26,21 @@ export interface BubbleViewCallbacks {
   onRaise(): void;
   /** Header drag, in SCREEN px. The controller converts to world units. */
   onMove(dx: number, dy: number): void;
-  /** Corner drag, in SCREEN px. The controller converts to bubble units. */
+  /**
+   * Corner drag, in SCREEN px — which is also bubble px, since the frame is
+   * fixed in screen space and the camera never scales it.
+   */
   onResize(dx: number, dy: number): void;
-  /** The body scrolled — persisted, so a refresh comes back where you were. */
-  onScroll(scrollTop: number): void;
+  /**
+   * The body scrolled — persisted, so a refresh comes back where you were.
+   *
+   * `programmatic` marks the echo of a scroll the CONTROLLER just made (the
+   * centre-line rule re-anchoring the body after a text-scale change). The
+   * position is still reported, so state never drifts from the DOM, but a
+   * scroll nobody performed must not dirty the scene: doing so would take the
+   * canvas off its blit for the whole of a wheel gesture.
+   */
+  onScroll(scrollTop: number, programmatic: boolean): void;
   /** "expand to file" / "back to the symbol". */
   onToggleExpand(): void;
   /** Open the node's file at its first line in the configured editor. */
@@ -79,7 +90,16 @@ const FONT_MONO = 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace';
 const FONT_UI = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif';
 const LINE_HEIGHT = '1.55';
 const CODE_PX = 11;
+/** Padding above the first source row and below the last — fixed, never zoomed. */
+const BODY_PAD_PX = 6;
+/**
+ * How long after a programmatic scroll its own event is still recognisable as
+ * one. Scroll events are delivered in the same turn as the write that caused
+ * them, so this is an order of magnitude of slack rather than a guess.
+ */
+const SELF_SCROLL_MS = 50;
 /** The gutter call marker (phase B2): a muted dot, an accent one under the pointer. */
+const MARKER_PX = 5;
 const MARKER_COLOR = `color-mix(in oklab, ${MUTED} 70%, transparent)`;
 const MARKER_COLOR_HOT = 'var(--accent)';
 const MARKER_COLOR_DEAD = `color-mix(in oklab, ${MUTED} 32%, transparent)`;
@@ -90,11 +110,13 @@ const MARKER_COLOR_DEAD = `color-mix(in oklab, ${MUTED} 32%, transparent)`;
  * arithmetic rather than a per-frame layout read.
  */
 export interface BubbleBodyGeometry {
-  /** Top of the box to the first content pixel. */
+  /** Top of the box to the first content pixel. Never zoomed — it is chrome. */
   headerHeight: number;
   /** The first row's own top offset inside the scrolling body. */
   padTop: number;
-  /** One source row, top to top. */
+  /** Padding below the last row. */
+  padBottom: number;
+  /** One source row, top to top, **at text scale 1**. */
   lineHeight: number;
   /** Rows currently rendered. */
   lineCount: number;
@@ -105,28 +127,40 @@ export interface BubbleBodyGeometry {
 export class BubbleView {
   readonly root: HTMLDivElement;
   private readonly full: HTMLDivElement;
-  private readonly chip: HTMLDivElement;
   private readonly headerName: HTMLSpanElement;
   private readonly headerKind: HTMLSpanElement;
   private readonly headerLoc: HTMLSpanElement;
   private readonly expandButton: HTMLButtonElement;
   private readonly header: HTMLDivElement;
   private readonly body: HTMLDivElement;
-  private readonly chipLabel: HTMLSpanElement;
+  /** The zoomed-out face: name, kind and LoC centred in the SAME frame. */
+  private readonly label: HTMLDivElement;
+  private readonly labelName: HTMLSpanElement;
+  private readonly labelKind: HTMLSpanElement;
+  private readonly labelLoc: HTMLSpanElement;
   private readonly callbacks: BubbleViewCallbacks;
 
   /** Gutter rows, so "scroll to line" is an offset the layout already knows. */
   private gutter: HTMLDivElement | null = null;
+  private pre: HTMLPreElement | null = null;
   private code: HTMLElement | null = null;
   private firstLine = 1;
-  private isChip = false;
+  private isLabel = false;
   private lastTransform = '';
   private width = 0;
   private height = 0;
+  /** Multiplier the body's type is currently laid out at (B2.1). */
+  private textScale = 1;
   /** Rising per render, so a highlighter that lands late cannot paint a stale body. */
   private renderSeq = 0;
-  /** Scale the last {@link place} drew at — the picker positions in box units. */
-  private lastScale = 1;
+  /**
+   * `performance.now()` of the last scroll this view was TOLD to make.
+   *
+   * The DOM's own scroll event cannot say who caused it, so the controller's
+   * re-anchoring writes and the user's wheel are told apart by time: an event
+   * arriving in the same turn as a programmatic write is that write's echo.
+   */
+  private selfScrollAt = 0;
   /** Gutter call markers by REAL file line (phase B2). */
   private readonly markers = new Map<number, HTMLElement>();
   /** The open callee picker, and the listener that dismisses it. */
@@ -147,38 +181,10 @@ export class BubbleView {
     });
     this.root.addEventListener('pointerdown', () => this.callbacks.onRaise());
 
-    // ---- collapsed: the title chip -----------------------------------------
-    this.chip = document.createElement('div');
-    Object.assign(this.chip.style, {
-      display: 'none',
-      alignItems: 'center',
-      gap: '6px',
-      boxSizing: 'border-box',
-      padding: '0 8px',
-      borderRadius: '6px',
-      border: `1px solid ${BORDER}`,
-      background: SURFACE,
-      backdropFilter: 'blur(4px)',
-      color: 'var(--foreground)',
-      font: `500 11px/1 ${FONT_UI}`,
-      overflow: 'hidden',
-      whiteSpace: 'nowrap',
-      cursor: 'grab',
-      boxShadow: '0 6px 18px rgba(0, 0, 0, 0.35)',
-    });
-    this.chipLabel = document.createElement('span');
-    Object.assign(this.chipLabel.style, {
-      overflow: 'hidden',
-      textOverflow: 'ellipsis',
-      flex: '1 1 auto',
-    });
-    this.chip.append(this.chipLabel);
-    this.root.append(this.chip);
-    this.bindDrag(this.chip, (dx, dy) => this.callbacks.onMove(dx, dy));
-
-    // ---- expanded: header + source -----------------------------------------
+    // ---- the frame: header + source, at a size the camera never changes -----
     this.full = document.createElement('div');
     Object.assign(this.full.style, {
+      position: 'relative',
       display: 'flex',
       flexDirection: 'column',
       boxSizing: 'border-box',
@@ -258,7 +264,14 @@ export class BubbleView {
     // The wheel belongs to whatever is under the pointer. Inside a bubble that
     // is the bubble, and the canvas must not zoom underneath it.
     this.body.addEventListener('wheel', (event) => event.stopPropagation());
-    this.body.addEventListener('scroll', () => this.callbacks.onScroll(this.body.scrollTop));
+    this.body.addEventListener('scroll', () => {
+      // A programmatic write's echo lands in the same turn as the write. The
+      // window is generous by an order of magnitude and costs nothing if it is
+      // wrong: the offset is reported either way, only the redraw is skipped.
+      const programmatic = performance.now() - this.selfScrollAt < SELF_SCROLL_MS;
+      this.selfScrollAt = 0;
+      this.callbacks.onScroll(this.body.scrollTop, programmatic);
+    });
 
     const grip = document.createElement('div');
     Object.assign(grip.style, {
@@ -273,9 +286,58 @@ export class BubbleView {
     });
     this.bindDrag(grip, (dx, dy) => this.callbacks.onResize(dx, dy));
 
-    this.full.append(header, this.body, grip);
+    // ---- zoomed out: the same frame, saying what it is ----------------------
+    // Centred on the WHOLE frame rather than on the body, so the block sits in
+    // the middle of the box the user laid out. It is `pointer-events: none`,
+    // which is what lets the header underneath stay a drag handle with working
+    // buttons while it is up.
+    this.label = document.createElement('div');
+    Object.assign(this.label.style, {
+      position: 'absolute',
+      inset: '0',
+      display: 'none',
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: '5px',
+      padding: '8px 12px',
+      boxSizing: 'border-box',
+      pointerEvents: 'none',
+      textAlign: 'center',
+      overflow: 'hidden',
+    });
+    this.labelKind = document.createElement('span');
+    Object.assign(this.labelKind.style, {
+      padding: '1px 6px',
+      borderRadius: '999px',
+      border: `1px solid ${BORDER}`,
+      color: MUTED,
+      font: `500 9px/1.4 ${FONT_UI}`,
+      letterSpacing: '0.08em',
+      textTransform: 'uppercase',
+      whiteSpace: 'nowrap',
+    });
+    this.labelName = document.createElement('span');
+    Object.assign(this.labelName.style, {
+      maxWidth: '100%',
+      color: 'var(--foreground)',
+      font: `600 13px/1.25 ${FONT_UI}`,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+    });
+    this.labelLoc = document.createElement('span');
+    Object.assign(this.labelLoc.style, {
+      color: MUTED,
+      font: `10px/1.2 ${FONT_UI}`,
+      whiteSpace: 'nowrap',
+    });
+    this.label.append(this.labelKind, this.labelName, this.labelLoc);
+
+    this.full.append(header, this.body, this.label, grip);
     this.root.append(this.full);
     parent.append(this.root);
+    this.applyBoxSize();
   }
 
   private makeButton(glyph: string, title: string, onClick: () => void): HTMLButtonElement {
@@ -361,8 +423,10 @@ export class BubbleView {
     this.expandButton.style.display = header.canExpand ? 'inline-flex' : 'none';
     this.expandButton.title = header.expanded ? 'Back to the symbol' : 'Expand to the whole file';
     this.expandButton.textContent = header.expanded ? '⤡' : '⤢';
-    this.chipLabel.textContent = `${header.name} · ${header.kind} · ${header.loc} loc`;
-    this.chipLabel.title = this.chipLabel.textContent;
+    this.labelKind.textContent = header.kind;
+    this.labelName.textContent = header.name;
+    this.labelName.title = header.name;
+    this.labelLoc.textContent = `${header.loc} loc`;
   }
 
   /**
@@ -376,6 +440,7 @@ export class BubbleView {
   setContent(content: BubbleContent): void {
     const seq = ++this.renderSeq;
     this.gutter = null;
+    this.pre = null;
     this.code = null;
     this.markers.clear();
     this.closePicker();
@@ -405,7 +470,7 @@ export class BubbleView {
       padding: '6px 6px 6px 8px',
       textAlign: 'right',
       color: `color-mix(in oklab, ${MUTED} 65%, transparent)`,
-      font: `${CODE_PX}px/${LINE_HEIGHT} ${FONT_MONO}`,
+      font: this.codeFont(),
       userSelect: 'none',
       background: SURFACE,
       borderRight: `1px solid color-mix(in oklab, ${BORDER} 60%, transparent)`,
@@ -422,7 +487,7 @@ export class BubbleView {
       padding: '6px 10px',
       flex: '1 1 auto',
       whiteSpace: 'pre',
-      font: `${CODE_PX}px/${LINE_HEIGHT} ${FONT_MONO}`,
+      font: this.codeFont(),
     });
     const code = document.createElement('code');
     code.className = 'hljs-code';
@@ -437,6 +502,7 @@ export class BubbleView {
       this.body.append(cut);
     }
     this.gutter = gutter;
+    this.pre = pre;
     this.code = code;
 
     // The highlighter is a lazy chunk; the escaped text above is what shows
@@ -511,15 +577,12 @@ export class BubbleView {
       const marker = document.createElement('span');
       Object.assign(marker.style, {
         position: 'absolute',
-        left: '-7px',
         top: '50%',
-        width: '5px',
-        height: '5px',
-        marginTop: '-2.5px',
         borderRadius: '999px',
         background: openable.length > 0 ? MARKER_COLOR : MARKER_COLOR_DEAD,
         cursor: openable.length > 0 ? 'pointer' : 'default',
       });
+      this.sizeMarker(marker);
       marker.title =
         openable.length > 0
           ? `calls ${names} — click to open`
@@ -540,6 +603,22 @@ export class BubbleView {
     }
   }
 
+  /**
+   * A marker's own size, in step with the type it annotates (B2.1).
+   *
+   * It rides a row whose height is the camera's now, so a fixed dot would
+   * swallow a zoomed-out row and get lost in a zoomed-in one. The floor keeps
+   * it clickable at the smallest readable type, and the ceiling keeps it
+   * inside the gutter's own left padding, which is the only space it has.
+   */
+  private sizeMarker(marker: HTMLElement): void {
+    const size = Math.min(7, Math.max(3, MARKER_PX * this.textScale));
+    marker.style.width = `${size}px`;
+    marker.style.height = `${size}px`;
+    marker.style.marginTop = `${-size / 2}px`;
+    marker.style.left = `${-(size + 1)}px`;
+  }
+
   /** One callee opens straight away; several ask which one. */
   private onMarkerClick(line: number, callees: BubbleCallSite[], marker: HTMLElement): void {
     const openable = callees.filter((callee) => callee.available);
@@ -557,13 +636,12 @@ export class BubbleView {
    * The app's own popover lives in React and this overlay is imperative, so
    * this is hand-rolled to the same rules the rest of the bubble follows —
    * inline styles against the app's CSS variables, no transition, dismissed by
-   * the next press anywhere. It positions in BOX units (screen offsets divided
-   * by the scale the bubble is drawn at), so it lands beside its marker at any
-   * zoom without knowing anything about the camera.
+   * the next press anywhere. Its offsets are plain CSS px against the frame,
+   * which is the whole benefit of a frame that never scales: screen px and box
+   * px are the same px, so it lands beside its marker at any zoom.
    */
   private showPicker(line: number, callees: BubbleCallSite[], marker: HTMLElement): void {
     this.closePicker();
-    const scale = this.lastScale > 0 ? this.lastScale : 1;
     const markerBox = marker.getBoundingClientRect();
     const rootBox = this.root.getBoundingClientRect();
 
@@ -582,8 +660,8 @@ export class BubbleView {
       boxShadow: '0 10px 30px rgba(0, 0, 0, 0.45)',
       font: `500 11px/1.3 ${FONT_UI}`,
     });
-    const left = Math.max(0, (markerBox.left - rootBox.left) / scale + 12);
-    const top = Math.max(0, (markerBox.bottom - rootBox.top) / scale + 4);
+    const left = Math.max(0, markerBox.left - rootBox.left + 12);
+    const top = Math.max(0, markerBox.bottom - rootBox.top + 4);
     picker.style.left = `${Math.min(left, Math.max(0, this.width - 130))}px`;
     picker.style.top = `${Math.min(top, Math.max(0, this.height - 40))}px`;
 
@@ -659,15 +737,24 @@ export class BubbleView {
     const first = gutter.children[0];
     if (!(first instanceof HTMLElement)) return null;
     const second = gutter.children[1];
-    const lineHeight =
-      second instanceof HTMLElement && second.offsetTop > first.offsetTop
-        ? second.offsetTop - first.offsetTop
-        : first.offsetHeight;
-    if (!(lineHeight > 0)) return null;
+    // Sub-pixel on purpose: `offsetTop` is rounded to whole px, and dividing a
+    // rounded row height by the scale it was measured at is how a base metric
+    // picks up a few percent of error that then multiplies by the line number.
+    const firstRect = first.getBoundingClientRect();
+    const measured =
+      second instanceof HTMLElement
+        ? second.getBoundingClientRect().top - firstRect.top
+        : firstRect.height;
+    if (!(measured > 0)) return null;
+    const scale = this.textScale > 0 ? this.textScale : 1;
     return {
       headerHeight: this.header.offsetHeight,
       padTop: first.offsetTop,
-      lineHeight,
+      padBottom: BODY_PAD_PX,
+      // Reported at text scale 1: the anchor maths multiplies it back up by
+      // whatever the text is being drawn at, so there is one row height in the
+      // system rather than one per zoom level.
+      lineHeight: measured / scale,
       lineCount: gutter.childElementCount,
       firstLine: this.firstLine,
     };
@@ -675,11 +762,17 @@ export class BubbleView {
 
   // -------------------------------------------------------------- geometry ---
 
-  /** The size of the EXPANDED box, in unscaled CSS px. */
+  /**
+   * The size of the frame, in CSS px — fixed in SCREEN space (B2.1).
+   *
+   * The camera does not appear here and never will: zooming moves a bubble,
+   * it does not resize it. What the user dragged the corner to is what is on
+   * screen at every zoom level.
+   */
   setSize(width: number, height: number): void {
     this.width = width;
     this.height = height;
-    if (!this.isChip) this.applyBoxSize();
+    this.applyBoxSize();
   }
 
   private applyBoxSize(): void {
@@ -687,40 +780,51 @@ export class BubbleView {
     this.root.style.height = `${this.height}px`;
   }
 
-  /** The chip's own size — it is fixed, not a scaled-down bubble. */
-  setChipSize(width: number, height: number): void {
-    this.chip.style.width = `${width}px`;
-    this.chip.style.height = `${height}px`;
+  private codeFont(): string {
+    return `${CODE_PX * this.textScale}px/${LINE_HEIGHT} ${FONT_MONO}`;
   }
 
   /**
-   * The per-frame call: where the bubble sits and how big it reads.
+   * Zoom the TEXT — the only thing the camera changes inside the frame.
+   *
+   * Applied as a font size rather than as a transform, so the body reflows
+   * into a scrollport that has not moved: zoomed out, the same box holds more
+   * and smaller lines; zoomed in, fewer and larger ones. It is written only
+   * when the quantised scale actually changes, because every write is a real
+   * layout of every row.
+   */
+  setTextScale(scale: number): void {
+    if (!(scale > 0) || scale === this.textScale) return;
+    this.textScale = scale;
+    const font = this.codeFont();
+    if (this.gutter) this.gutter.style.font = font;
+    if (this.pre) this.pre.style.font = font;
+    // The gutter's call markers are body content too: they ride the rows.
+    for (const marker of this.markers.values()) this.sizeMarker(marker);
+  }
+
+  /**
+   * The per-frame call: where the bubble sits, and which face it is showing.
    *
    * This is deliberately the ONLY thing that happens to a bubble on a normal
    * frame — one string compare and (at most) one style write, no React, no
-   * layout read, and nothing that touches the canvas or its snapshot.
+   * layout read, and nothing that touches the canvas or its snapshot. The
+   * frame's own size is not in here at all, because it does not depend on the
+   * camera.
    */
-  place(x: number, y: number, scale: number, chip: boolean): void {
-    this.lastScale = scale;
-    if (chip !== this.isChip) {
-      this.isChip = chip;
-      // A chip has no gutter on screen, so a picker hanging off one would be a
-      // menu attached to nothing.
-      if (chip) this.closePicker();
-      this.chip.style.display = chip ? 'flex' : 'none';
-      this.full.style.display = chip ? 'none' : 'flex';
-      // The chip carries its own size; the root must stop claiming the box's
-      // dimensions while it is collapsed, and take them back on the way out.
-      // The BODY is never re-created either way, so its scroll position — and
-      // any selection in it — survives a round trip across the threshold.
-      if (chip) {
-        this.root.style.width = 'auto';
-        this.root.style.height = 'auto';
-      } else {
-        this.applyBoxSize();
-      }
+  place(x: number, y: number, label: boolean): void {
+    if (label !== this.isLabel) {
+      this.isLabel = label;
+      // Under a label there is no gutter on screen, so a picker hanging off
+      // one would be a menu attached to nothing.
+      if (label) this.closePicker();
+      this.label.style.display = label ? 'flex' : 'none';
+      // `visibility`, not `display`: the body keeps its layout box, so its
+      // scroll offset, any selection in it and its measured geometry all
+      // survive a round trip across the threshold untouched.
+      this.body.style.visibility = label ? 'hidden' : 'visible';
     }
-    const transform = `translate3d(${x}px, ${y}px, 0) scale(${scale})`;
+    const transform = `translate3d(${x}px, ${y}px, 0)`;
     if (transform !== this.lastTransform) {
       this.lastTransform = transform;
       this.root.style.transform = transform;
@@ -737,10 +841,18 @@ export class BubbleView {
     if (!gutter) return;
     const index = Math.max(0, Math.min(gutter.childElementCount - 1, line - this.firstLine));
     const row = gutter.children[index];
-    if (row instanceof HTMLElement) this.body.scrollTop = row.offsetTop;
+    if (row instanceof HTMLElement) this.setScrollTop(row.offsetTop);
   }
 
+  /**
+   * Scroll the body from code rather than from a gesture.
+   *
+   * Marked, so the scroll event it provokes is reported as the echo it is —
+   * see {@link BubbleViewCallbacks.onScroll}.
+   */
   setScrollTop(value: number): void {
+    if (!Number.isFinite(value)) return;
+    this.selfScrollAt = performance.now();
     this.body.scrollTop = value;
   }
 

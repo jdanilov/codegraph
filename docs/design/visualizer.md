@@ -1780,6 +1780,124 @@ and the marker that turns the second into the first.
   a traced chain would move boxes the user put somewhere on purpose. No
   editing, still: the read path goes first (B1's note stands).
 
+### Code bubbles (B2.1) — fixed-frame presentation (additive; SUPERSEDES B1's hybrid scale and its chip)
+
+B1 gave a bubble a world ANCHOR and a screen SIZE, then scaled that size with
+the camera (`min(camera, 1.5)`) and collapsed it to a title chip below
+`camera = 0.5`. This round replaces that presentation whole. Everything else
+in B1 and B2 stands — the spawn gesture, the content, the tether rules, the
+call threads, the gutter markers, the dedupe, the persistence story — and each
+of them now runs against the model below. **The chip is gone as a code path,
+not merely as a default**: there is no chip geometry, no chip width, no chip
+anchor mode and no second rectangle a frame has to choose between.
+
+- **The frame is FIXED in screen space.** A bubble's width and height are the
+  user's own CSS px, and the camera only ever moves the frame around the
+  screen — it never resizes it. Drag the corner 40px and the box is 40px
+  wider, at every zoom, for good. The grip therefore needs no conversion at
+  all (screen px *are* frame px), the drag-away ghost is drawn at exactly the
+  size the release produces, and a spawn converts its half-extents through
+  one number, the camera's scale, rather than through two.
+- **Only the TEXT zooms.** The body's font-size and line-height are multiplied
+  by the camera scale, keeping B1's upper clamp of **1.5×**: zoom out and the
+  same box holds more, smaller lines; zoom in and it holds fewer, larger ones.
+  It is applied as a font size rather than as a transform, so the text reflows
+  inside a scrollport that has not moved. The header is chrome, not content,
+  and does not zoom. The scale is **quantised to 5% steps**
+  (`BUBBLE_TEXT_SCALE_STEP`) for one reason and with one consequence: a
+  font-size write is a real layout of every row, so a wheel gesture re-lays a
+  bubble out about twenty times across the whole range instead of once per
+  frame — and because the SAME quantised number feeds the DOM and the anchor
+  maths, the two can never disagree about how tall a row is.
+- **The scroll-anchor rule is the CENTRE LINE.** A frame whose type changes
+  size has to decide what stays still, and the only choice that survives
+  zooming both ways is the line the eye is already on. So the content point at
+  the frame's vertical centre is preserved: express it as a fractional line
+  index `u = (scrollTop + viewportHeight / 2 − padTop) / (lineHeight ×
+  fromScale)`, then put the same `u` back at the centre under `toScale`. Whatever
+  was in the middle of the box before the zoom is in the middle of it after, and
+  the text grows or shrinks around it. It is one exported pure function
+  (`bubbleScrollForTextScale`), clamped to the range the browser itself would
+  clamp to, so the one case it cannot honour — content too short to put `u` in
+  the middle — ends at the edge rather than at a lie. The same scale in and out
+  is the identity for any offset already in range, and re-applying the rule to
+  its own output changes nothing.
+- **Below the threshold the frame is RETAINED.** `camera < 0.5` (B1's number,
+  unchanged) no longer shrinks anything: the full-size frame stays exactly
+  where it is and the BODY is replaced by the node's **name, kind badge and
+  LoC, centred in the middle of the frame** at a fixed readable size. The
+  bubble keeps the space it holds in the layout the user built and says what it
+  is instead of what it says. **The header row stays** — it is the drag handle
+  and it carries close / expand / open-in-editor, and a box you cannot close or
+  move at low zoom would be a trap — so the centred block is positioned over
+  the whole frame and is `pointer-events: none`, which leaves the header under
+  it fully live. The body is hidden with `visibility`, not `display`, so its
+  scroll offset, any selection in it and its measured geometry all survive a
+  round trip across the threshold untouched; B1's "re-measure the frame the
+  chip opens back into a box" dance is therefore deleted rather than ported.
+- **Anchors, restated against a fixed frame.** B1's origin tether
+  (`bubbleTetherAnchor`) is unchanged in code and changed in meaning: the rect
+  it is fed is now the frame, which is the same rectangle whichever face the
+  bubble is showing, so the "box or chip" fork it used to serve is gone. B2's
+  `bubbleCallAnchor` keeps its four regimes, with the fourth renamed and
+  re-pointed: `line`, `clamped` and `header` keep their exact semantics, and
+  `chip` becomes **`centered`** — the frame's own middle, on the border facing
+  the other end, because there is no row to point at. The call-site formula
+  becomes `content top + padTop + (line − firstLine) × lineHeight × textScale +
+  half a row − scrollTop`, with no outer multiplication anywhere: **content
+  space IS screen space inside an unscaled frame**, which is the single source
+  of truth the whole round buys. `scrollTop` is plain CSS px of a fixed-size
+  scrollport — what the DOM reports, what is stored and what the arithmetic
+  subtracts are one number — and `lineHeight` is the row at text scale 1,
+  measured sub-pixel (`getBoundingClientRect`, divided by the scale it was
+  measured at) so a rounded `offsetTop` cannot put a few percent of error into
+  a metric that then multiplies by the line number. **The camera is not an
+  input**: everything it does to an anchor it does by moving the frame.
+- **Everything downstream keeps working, and one thing is placed differently.**
+  Gutter markers, the multi-callee picker (which now positions in plain frame
+  px), the thread flash, bubble→wedge threads, the containment rule and the
+  dedupe are all untouched. Click-to-open still lands the callee to the right
+  of its caller and level with the call site, now in fixed-frame coordinates:
+  the new frame's top is lifted by one header height so that its CONTENT, not
+  its border, is level with the line that opened it.
+- **Persistence is unchanged and needs no migration.** `w`/`h` are plainly CSS
+  px, which is what they effectively already were; there was never a stored
+  chip field to drop. Restore reads the fields it knows and ignores anything
+  else it finds, so a layout written by an older build — describing a
+  presentation that no longer exists — loads as the bubble it always was.
+- **The blit is untouched, again.** Bubbles are still DOM in a
+  `pointer-events: none` overlay, still never painted into the canvas, still
+  drawn-around rather than drawn: threads and tethers remain chrome (after
+  `captureSnapshot`, in screen space, from the live camera), snapshots are
+  still viewport-sized, and there are still **exactly two** `requestCameraDraw`
+  sites. The one new hazard the round introduced is closed explicitly: the
+  centre-line rule writes `scrollTop` from code, the DOM answers with a scroll
+  event, and a scroll event dirties the scene — which would take a wheel
+  gesture off the blit for its whole duration. Such an echo is therefore
+  reported as programmatic and updates state (the DOM's clamped answer always
+  wins) **without** requesting a draw; the frame that caused it is already
+  being drawn. Per-frame text work is a scale compare and nothing else.
+- Probed with throwaway numeric probes over the real exported helpers, bundled
+  with esbuild. **Anchors:** 20,000 random camera × frame × metrics × scroll ×
+  range × line cases — **0 violations** across totality, the side/border
+  choice, the anchor never leaving the frame, the closed-form recheck of every
+  in-range row under that case's own text scale and scroll offset, the top /
+  bottom edge of every clamped one, the centred-label collapse, monotonicity in
+  `line` (4,652 checks), and **frame-position-only dependence on the camera** —
+  14,484 pan cases where the anchor moved by exactly the frame's screen offset,
+  plus 7,353 cases at two DIFFERENT camera scales that agree on the text scale,
+  where it did the same. Every branch was exercised (5,010 `line`, 5,516
+  `clamped`, 3,704 `header`, 5,770 `centered`). **Scroll anchor:** 15,000
+  random (content, scrollTop, fromScale → toScale) cases — **0 violations**
+  over 13,136 centre-line preservations, 1,158 clamped ones landing exactly on
+  their boundary, 15,000 same-scale identities and 15,000 idempotence checks.
+  **Mutation controls**, each the real bundle with one operator changed:
+  dropping the scroll term is caught on 5,663 anchor cases, dropping the text
+  scale from the row height on 5,100, and scaling the header (B1's rule, which
+  is now wrong) on 10,230; re-projecting the scroll under the OLD scale is
+  caught on 10,546 scroll cases and anchoring the top line instead of the
+  centre one on 40,216 — so the zeroes above are results, not tautologies.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all
