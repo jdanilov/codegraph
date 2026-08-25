@@ -93,6 +93,20 @@
  * into the app. These few rules cover every token class `lib/common` emits and
  * stay inside the surface's own hues.
  */
+/**
+ * The code bubbles' loading spinner (phase B1).
+ *
+ * A bubble's DOM is built in TypeScript rather than by a component, so its one
+ * animation is declared here rather than depending on a utility class the CSS
+ * pipeline happens to have emitted for somebody else. Animations are untouched
+ * by the transition-free rule above — spinners still spin.
+ */
+@keyframes codegraph-bubble-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @layer components {
   .hljs-code {
     color: color-mix(in oklab, var(--foreground) 88%, transparent);

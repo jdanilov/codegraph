@@ -33,8 +33,10 @@
  * ends live in the same disk, and as one bowed curve (`workspace.ts`) when they
  * do not.
  */
+import { fetchSource, openInEditor } from '@/lib/api';
 import { formatNumber } from '@/lib/utils';
 
+import { BubbleView } from './bubble-view';
 import {
   bundleControlPoints,
   bundleCurve,
@@ -151,6 +153,27 @@ export interface StoredDisk {
 }
 
 /**
+ * One code bubble, as the workspace is written down and read back (phase B1).
+ *
+ * The node id is the model's own, so a stored bubble survives a re-index; one
+ * that no longer resolves is dropped on restore exactly like a stored disk is.
+ * The source itself is never stored — it is re-fetched, because the file on
+ * disk is the truth and a cached copy of it would be a stale one.
+ */
+export interface StoredBubble {
+  nodeId: string;
+  /** Workspace coordinates of the bubble's TOP-LEFT corner. */
+  x: number;
+  y: number;
+  /** Box size in CSS px at scale 1 — the user's own drag, clamped. */
+  w: number;
+  h: number;
+  scrollTop: number;
+  /** Showing the whole file rather than the symbol's own span. */
+  expanded: boolean;
+}
+
+/**
  * The part of the workspace that is NOT in the URL: which disks are open and
  * where everything sits.
  *
@@ -161,6 +184,11 @@ export interface StoredWorkspace {
   primaryX: number;
   primaryY: number;
   disks: StoredDisk[];
+  /**
+   * Optional so a workspace stored before phase B1 still restores: an older
+   * payload simply has no bubbles, which is exactly what it described.
+   */
+  bubbles?: StoredBubble[];
 }
 
 export interface CanvasCallbacks {
@@ -597,6 +625,40 @@ interface DiskState {
   rootChangedAt: number;
 }
 
+/**
+ * One code bubble on the canvas (phase B1).
+ *
+ * A bubble is a scrollable slice of SOURCE pinned to the workspace: DOM in an
+ * overlay above the canvas, never painted into it. The controller owns its
+ * geometry and its lifecycle; {@link BubbleView} owns its elements. The only
+ * per-frame work is one CSS transform each.
+ */
+interface BubbleState {
+  id: string;
+  /** The node whose source this shows — also the wedge its tether points at. */
+  nodeId: string;
+  /** Workspace coordinates of the top-left corner. */
+  x: number;
+  y: number;
+  /** Box size in CSS px at scale 1. */
+  w: number;
+  h: number;
+  /** Whole file instead of the symbol's own span. */
+  expanded: boolean;
+  scrollTop: number;
+  /** Stacking order among bubbles — a press raises one to the top. */
+  z: number;
+  /** Disk the drag-away started in; the tether prefers it. */
+  sourceDiskId: string | null;
+  view: BubbleView;
+  /** Rising per fetch, so a slow response cannot overwrite a newer one. */
+  requestSeq: number;
+  /** Line to scroll to once the pending fetch lands (`null` = keep `scrollTop`). */
+  pendingLine: number | null;
+  /** Width of the collapsed chip, from the label it has to hold. */
+  chipWidth: number;
+}
+
 /** What a pointer gesture turned out to be. See {@link CanvasController}. */
 type DragMode = 'pan' | 'move-disk' | 'wedge' | 'close';
 
@@ -620,6 +682,17 @@ interface DragState {
   outside: boolean;
   /** Layout the ghost previews, computed once when it first appears. */
   preview: SunburstLayout | null;
+  /** Is ⌥ down right now? It FLIPS what the release will create, live. */
+  alt: boolean;
+  /**
+   * What the release would spawn, recomputed whenever ⌥ or the node changes.
+   *
+   * The default is the node's own shape — a LEAF has no subtree to draw, so a
+   * disk of it is an empty centre circle and a bubble of it is its source;
+   * anything with children is a disk. ⌥ flips it in both directions, and the
+   * ghost follows so the gesture never lies about its outcome.
+   */
+  spawn: 'disk' | 'bubble';
 }
 
 export class CanvasController {
@@ -766,6 +839,20 @@ export class CanvasController {
   private drag: DragState | null = null;
   private suppressClick = false;
 
+  /**
+   * The bubble overlay (phase B1) — a DOM layer over the canvas.
+   *
+   * It is `pointer-events: none` and each bubble re-enables them, so the canvas
+   * keeps every gesture that does not land on a bubble. Nothing in here is ever
+   * painted into the canvas, so bubbles are invisible to the incremental blit:
+   * they cannot dirty the scene by existing, and they cannot be baked into a
+   * snapshot.
+   */
+  private readonly bubbleLayer: HTMLDivElement;
+  private bubbles: BubbleState[] = [];
+  private bubbleSeq = 0;
+  private bubbleZ = 1;
+
   constructor(container: HTMLElement, callbacks: CanvasCallbacks) {
     this.container = container;
     this.callbacks = callbacks;
@@ -781,6 +868,17 @@ export class CanvasController {
     const ctx = this.canvas.getContext('2d');
     if (!ctx) throw new Error('2D canvas context unavailable');
     this.ctx = ctx;
+
+    // Above the canvas, below the shell's panels (which are later siblings of
+    // this whole container in the document).
+    this.bubbleLayer = document.createElement('div');
+    Object.assign(this.bubbleLayer.style, {
+      position: 'absolute',
+      inset: '0',
+      overflow: 'hidden',
+      pointerEvents: 'none',
+    });
+    container.appendChild(this.bubbleLayer);
 
     this.disks = [makeDisk(PRIMARY_DISK_ID, ROOT_ID, 0, 0, true, null)];
 
@@ -808,6 +906,7 @@ export class CanvasController {
     this.arcFills.clear();
 
     if (!previous || !sameProject) {
+      this.clearBubbles();
       this.disks = [makeDisk(PRIMARY_DISK_ID, initialRoot(model), 0, 0, true, null)];
       this.focusedDiskId = PRIMARY_DISK_ID;
       this.expandedNodes.clear();
@@ -834,9 +933,13 @@ export class CanvasController {
       for (const kind of model.edgeKinds) if (!known.has(kind)) this.enabledKinds.add(kind);
       this.enabledKinds = new Set([...this.enabledKinds].filter((k) => model.edgeKinds.includes(k)));
       if (this.selected && !model.nodes.has(this.selected)) this.selected = null;
+      const bubblesBefore = this.bubbles.length;
+      this.refreshBubbles();
       // A re-index that removed a disk's root removed the disk with it — the
-      // stored workspace has to lose it too.
-      if (this.disks.length !== before) this.notifyWorkspace();
+      // stored workspace has to lose it too, and the same goes for a bubble.
+      if (this.disks.length !== before || this.bubbles.length !== bubblesBefore) {
+        this.notifyWorkspace();
+      }
     }
     this.rebuildAllLayouts();
   }
@@ -982,6 +1085,17 @@ export class CanvasController {
           x: disk.x,
           y: disk.y,
         })),
+      // `scrollTop` is the cached value the scroll handler keeps, never a live
+      // DOM read: this runs on the pointer's cadence while a disk is dragged.
+      bubbles: this.bubbles.map((bubble) => ({
+        nodeId: bubble.nodeId,
+        x: bubble.x,
+        y: bubble.y,
+        w: bubble.w,
+        h: bubble.h,
+        scrollTop: bubble.scrollTop,
+        expanded: bubble.expanded,
+      })),
     };
   }
 
@@ -1025,6 +1139,24 @@ export class CanvasController {
         )
       );
     }
+    // Bubbles come back the same way: a stale node id is dropped in silence,
+    // and whatever survives re-fetches its source (the file is the truth; a
+    // stored copy of it would be a stale one).
+    for (const stored of workspace.bubbles ?? []) {
+      if (!stored || !model.nodes.has(stored.nodeId)) continue;
+      if (!Number.isFinite(stored.x) || !Number.isFinite(stored.y)) continue;
+      this.createBubble({
+        nodeId: stored.nodeId,
+        x: stored.x,
+        y: stored.y,
+        w: stored.w,
+        h: stored.h,
+        scrollTop: Number.isFinite(stored.scrollTop) ? stored.scrollTop : 0,
+        expanded: Boolean(stored.expanded),
+        sourceDiskId: null,
+      });
+    }
+
     this.rebuildExpandedNodes();
     this.rebuildAllLayouts();
     this.notifyWorkspace();
@@ -1108,6 +1240,424 @@ export class CanvasController {
       this.expandedNodes.set(disk.source, (this.expandedNodes.get(disk.source) ?? 0) + 1);
     }
     this.collapsedSignature = [...this.expandedNodes.keys()].sort().join('\u0000');
+  }
+
+  // ------------------------------------------------------- code bubbles ---
+
+  /**
+   * Can this node be shown as a bubble at all?
+   *
+   * A directory has no source, and neither has a node the model knows only by
+   * name. Everything else does — a file bubble is the whole file, a symbol
+   * bubble its own span.
+   */
+  private bubbleable(nodeId: string): boolean {
+    const node = this.model?.get(nodeId);
+    return Boolean(node && node.kind !== DIRECTORY_KIND && node.file);
+  }
+
+  /**
+   * What a drag-away of this node would spawn, given ⌥.
+   *
+   * The default is the node's own shape: a **leaf** has no subtree, so a disk
+   * of it is a lone centre circle while a bubble of it is the thing the user
+   * was actually reaching for — its code. Anything with children keeps phase
+   * G's disk. ⌥ flips it in both directions (⌥-drag a file for its source,
+   * ⌥-drag a leaf for a one-node disk), because the default is a good guess
+   * and a good guess needs an override, not an argument.
+   */
+  private spawnKindFor(nodeId: string, alt: boolean): 'disk' | 'bubble' {
+    const model = this.model;
+    if (!model) return 'disk';
+    const leaf = model.childrenOf(nodeId).length === 0;
+    const wantsBubble = leaf !== alt;
+    return wantsBubble && this.bubbleable(nodeId) ? 'bubble' : 'disk';
+  }
+
+  /**
+   * Spawn a bubble — the drop half of a leaf drag-away.
+   *
+   * `at` is the pointer's workspace position; the box is centred on it, which
+   * is where the ghost was, so the bubble lands exactly where it was promised.
+   */
+  private spawnBubble(nodeId: string, at: Point, sourceDiskId: string | null): void {
+    if (!this.bubbleable(nodeId)) return;
+    const scale = this.scale();
+    const presentation = bubblePresentation(scale);
+    const halfW = (BUBBLE_DEFAULT_WIDTH * presentation.scale) / 2 / scale;
+    const halfH = (BUBBLE_DEFAULT_HEIGHT * presentation.scale) / 2 / scale;
+    this.createBubble({
+      nodeId,
+      x: at.x - halfW,
+      y: at.y - halfH,
+      w: BUBBLE_DEFAULT_WIDTH,
+      h: BUBBLE_DEFAULT_HEIGHT,
+      scrollTop: 0,
+      expanded: false,
+      sourceDiskId,
+    });
+    this.notifyWorkspace();
+  }
+
+  /** Build one bubble's state and DOM, and start its fetch. Shared with restore. */
+  private createBubble(init: {
+    nodeId: string;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    scrollTop: number;
+    expanded: boolean;
+    sourceDiskId: string | null;
+  }): BubbleState | null {
+    const model = this.model;
+    const node = model?.get(init.nodeId);
+    if (!model || !node) return null;
+    const size = clampBubbleSize(init.w, init.h);
+    this.bubbleSeq += 1;
+    this.bubbleZ += 1;
+    const id = `bubble:${this.bubbleSeq}`;
+
+    const view = new BubbleView(this.bubbleLayer, {
+      onClose: () => this.closeBubble(id),
+      onRaise: () => this.raiseBubble(id),
+      onMove: (dx, dy) => this.moveBubble(id, dx, dy),
+      onResize: (dx, dy) => this.resizeBubble(id, dx, dy),
+      onScroll: (scrollTop) => this.bubbleScrolled(id, scrollTop),
+      onToggleExpand: () => this.toggleBubbleExpand(id),
+      onOpenInEditor: () => this.openBubbleInEditor(id),
+    });
+
+    const bubble: BubbleState = {
+      id,
+      nodeId: init.nodeId,
+      x: init.x,
+      y: init.y,
+      w: size.w,
+      h: size.h,
+      expanded: init.expanded,
+      scrollTop: Math.max(0, init.scrollTop),
+      z: this.bubbleZ,
+      sourceDiskId: init.sourceDiskId,
+      view,
+      requestSeq: 0,
+      pendingLine: null,
+      chipWidth: BUBBLE_CHIP_MIN_WIDTH,
+    };
+    this.bubbles.push(bubble);
+    view.setSize(size.w, size.h);
+    view.setZ(bubble.z);
+    this.refreshBubbleHeader(bubble);
+    this.loadBubbleSource(bubble);
+    this.syncBubbles();
+    // The tether is canvas chrome, so a new bubble needs a frame — and a frame
+    // through the DIRTY path, never the camera one.
+    this.requestDraw();
+    return bubble;
+  }
+
+  private bubbleById(id: string): BubbleState | null {
+    return this.bubbles.find((bubble) => bubble.id === id) ?? null;
+  }
+
+  /**
+   * Re-print the header.
+   *
+   * `loc` is the line count of what is ACTUALLY in the box — the symbol's span
+   * until an "expand to file" lands, the file's own length after it — so the
+   * number never disagrees with the line numbers beside the code.
+   */
+  private refreshBubbleHeader(bubble: BubbleState, loc?: number): void {
+    const node = this.model?.get(bubble.nodeId);
+    if (!node) return;
+    bubble.chipWidth = bubbleChipWidth(node.name.length + node.kind.length + 12);
+    bubble.view.setChipSize(bubble.chipWidth, BUBBLE_CHIP_HEIGHT);
+    bubble.view.setHeader({
+      name: node.name,
+      kind: node.kind,
+      loc: loc ?? Math.max(1, node.endLine - node.startLine + 1),
+      canExpand: node.kind !== 'file',
+      expanded: bubble.expanded,
+    });
+  }
+
+  /**
+   * Fetch a bubble's source.
+   *
+   * A failure prints inside the bubble and nowhere else: the canvas is not
+   * involved, the other bubbles are not involved, and the user can close the
+   * one box that could not read its file. `requestSeq` is the race guard — a
+   * slow "expand to file" must never land on top of a newer collapse.
+   */
+  private loadBubbleSource(bubble: BubbleState): void {
+    const node = this.model?.get(bubble.nodeId);
+    if (!node) return;
+    const seq = ++bubble.requestSeq;
+    bubble.view.setContent({ status: 'loading' });
+    const request = bubble.expanded
+      ? fetchSource(node.file)
+      : fetchSource(node.file, node.startLine, node.endLine);
+    void request
+      .then((span) => {
+        if (seq !== bubble.requestSeq || !this.bubbles.includes(bubble)) return;
+        bubble.view.setContent({
+          status: 'ready',
+          file: span.file,
+          startLine: span.startLine,
+          text: span.content,
+          truncated: span.truncated,
+        });
+        this.refreshBubbleHeader(bubble, Math.max(1, span.endLine - span.startLine + 1));
+        if (bubble.pendingLine !== null) {
+          bubble.view.scrollToLine(bubble.pendingLine);
+          bubble.pendingLine = null;
+        } else if (bubble.scrollTop > 0) {
+          bubble.view.setScrollTop(bubble.scrollTop);
+        }
+      })
+      .catch((error: unknown) => {
+        if (seq !== bubble.requestSeq || !this.bubbles.includes(bubble)) return;
+        bubble.view.setContent({
+          status: 'error',
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }
+
+  private closeBubble(id: string): void {
+    const bubble = this.bubbleById(id);
+    if (!bubble) return;
+    bubble.requestSeq++;
+    bubble.view.destroy();
+    this.bubbles = this.bubbles.filter((entry) => entry.id !== id);
+    this.requestDraw();
+    this.notifyWorkspace();
+  }
+
+  /** A press anywhere in a bubble puts it on top of its siblings. */
+  private raiseBubble(id: string): void {
+    const bubble = this.bubbleById(id);
+    if (!bubble || bubble.z === this.bubbleZ) return;
+    this.bubbleZ += 1;
+    bubble.z = this.bubbleZ;
+    bubble.view.setZ(bubble.z);
+  }
+
+  /** Header drag: screen px in, WORLD units out — the anchor is a world point. */
+  private moveBubble(id: string, dx: number, dy: number): void {
+    const bubble = this.bubbleById(id);
+    if (!bubble) return;
+    const scale = this.scale();
+    bubble.x += dx / scale;
+    bubble.y += dy / scale;
+    this.syncBubbles();
+    this.requestDraw();
+    this.notifyWorkspace();
+  }
+
+  /** Corner drag: screen px in, BOX units out — the box is scaled, not the world. */
+  private resizeBubble(id: string, dx: number, dy: number): void {
+    const bubble = this.bubbleById(id);
+    if (!bubble) return;
+    // Screen px → box units: the box is scaled by the hybrid rule, not by the
+    // camera, so the grip has to divide by exactly what it is drawn at.
+    const scale = Math.max(0.05, bubblePresentation(this.scale()).scale);
+    const size = clampBubbleSize(bubble.w + dx / scale, bubble.h + dy / scale);
+    if (size.w === bubble.w && size.h === bubble.h) return;
+    bubble.w = size.w;
+    bubble.h = size.h;
+    bubble.view.setSize(size.w, size.h);
+    this.requestDraw();
+    this.notifyWorkspace();
+  }
+
+  private bubbleScrolled(id: string, scrollTop: number): void {
+    const bubble = this.bubbleById(id);
+    if (!bubble || bubble.scrollTop === scrollTop) return;
+    bubble.scrollTop = scrollTop;
+    // No redraw: scrolling a bubble changes nothing on the canvas.
+    this.notifyWorkspace();
+  }
+
+  /**
+   * Grow a symbol bubble into its whole file, or shrink it back.
+   *
+   * Expanding keeps the SYMBOL in view — the file is context for the thing the
+   * user dragged out, not a replacement for it — so the fetch lands scrolled to
+   * the symbol's first line rather than at the top of the file.
+   */
+  private toggleBubbleExpand(id: string): void {
+    const bubble = this.bubbleById(id);
+    const node = this.model?.get(bubble?.nodeId ?? '');
+    if (!bubble || !node) return;
+    bubble.expanded = !bubble.expanded;
+    bubble.pendingLine = bubble.expanded ? node.startLine : null;
+    if (!bubble.expanded) bubble.scrollTop = 0;
+    this.refreshBubbleHeader(bubble);
+    this.loadBubbleSource(bubble);
+    this.notifyWorkspace();
+  }
+
+  /** The header's jump. Same order the node panel uses: configured command wins. */
+  private openBubbleInEditor(id: string): void {
+    const bubble = this.bubbleById(id);
+    const node = this.model?.get(bubble?.nodeId ?? '');
+    if (!bubble || !node) return;
+    void openInEditor(node.file, node.startLine).then((result) => {
+      if (result.ok || result.reason !== 'unconfigured') return;
+      // Nothing configured server-side: hand the OS the URL scheme instead,
+      // exactly as the node panel does.
+      const base = (this.model?.root ?? '').replace(/[\\/]+$/, '');
+      const joined = base ? `${base}/${node.file}` : node.file;
+      const absolute = joined.replace(/\\/g, '/');
+      const path = absolute.startsWith('/') ? absolute : `/${absolute}`;
+      window.location.href = `vscode://file${path}:${node.startLine}`;
+    });
+  }
+
+  /**
+   * Place every bubble for this frame — the ONLY per-frame bubble work.
+   *
+   * One transform each, from the camera the canvas is about to be (or has just
+   * been) drawn under. No React, no layout read, no canvas call: bubbles are
+   * DOM and the blit never learns they exist.
+   */
+  private syncBubbles(): void {
+    if (this.bubbles.length === 0) return;
+    const origin = this.origin();
+    const scale = this.scale();
+    const presentation = bubblePresentation(scale);
+    for (const bubble of this.bubbles) {
+      bubble.view.place(
+        origin.x + bubble.x * scale,
+        origin.y + bubble.y * scale,
+        presentation.scale,
+        presentation.chip
+      );
+    }
+  }
+
+  /**
+   * What a bubble occupies on screen right now — box or chip.
+   *
+   * Derived from the LIVE camera rather than from anything the last frame
+   * stored, so the tether cannot lag the box it leaves by a frame during a
+   * gesture: both read the same `bubblePresentation` of the same scale.
+   */
+  private bubbleScreenRect(bubble: BubbleState): BubbleRect {
+    const origin = this.origin();
+    const scale = this.scale();
+    const presentation = bubblePresentation(scale);
+    const width = presentation.chip ? bubble.chipWidth : bubble.w * presentation.scale;
+    const height = presentation.chip ? BUBBLE_CHIP_HEIGHT : bubble.h * presentation.scale;
+    return {
+      x: origin.x + bubble.x * scale,
+      y: origin.y + bubble.y * scale,
+      w: width,
+      h: height,
+    };
+  }
+
+  /**
+   * The screen point of a bubble's ORIGIN wedge, and the wedge's outward
+   * direction — `null` when no disk renders it right now.
+   *
+   * A disk that was closed or re-rooted away, or a legend filter that made the
+   * wedge invisible, all end the same way: the tether is simply not drawn. It
+   * is deliberately NOT re-attached to the disk's root or its centre — a line
+   * to a wedge that is not the one the bubble came from would be a false claim
+   * about where the code is.
+   */
+  private bubbleAnchor(bubble: BubbleState): { point: Point; out: Point } | null {
+    const preferred = this.diskById(bubble.sourceDiskId);
+    const candidates = preferred ? [preferred, ...this.disks] : this.disks;
+    const scale = this.scale();
+    const origin = this.origin();
+    for (const disk of candidates) {
+      const arc = disk.layout?.byNode.get(bubble.nodeId);
+      if (!arc || this.isHiddenArc(arc)) continue;
+      const centroid = arcCentroid(arc);
+      const mid = (arc.a0 + arc.a1) / 2;
+      return {
+        point: {
+          x: origin.x + (disk.x + centroid.x) * scale,
+          y: origin.y + (disk.y + centroid.y) * scale,
+        },
+        out: { x: Math.cos(mid), y: Math.sin(mid) },
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Bubble tethers, in SCREEN space, in the chrome pass.
+   *
+   * Chrome for the same reason the disk `×` is: it is drawn AFTER the snapshot
+   * is captured, so it can never be baked into a blitted frame — and because it
+   * is re-computed from the live camera every frame, it follows a pan or a zoom
+   * gesture exactly, while the picture under it is being stamped.
+   */
+  private drawBubbleTethers(ctx: CanvasRenderingContext2D): void {
+    if (this.bubbles.length === 0) return;
+    ctx.lineCap = 'round';
+    ctx.setLineDash([]);
+    ctx.strokeStyle = TETHER_COLOR;
+    ctx.lineWidth = TETHER_WIDTH_PX;
+    for (const bubble of this.bubbles) {
+      const anchor = this.bubbleAnchor(bubble);
+      if (!anchor) continue;
+      const curve = bubbleTetherAnchor(this.bubbleScreenRect(bubble), anchor.point, anchor.out);
+      if (!curve) continue;
+      ctx.beginPath();
+      ctx.moveTo(curve.start.x, curve.start.y);
+      ctx.bezierCurveTo(
+        curve.control1.x,
+        curve.control1.y,
+        curve.control2.x,
+        curve.control2.y,
+        curve.end.x,
+        curve.end.y
+      );
+      ctx.stroke();
+
+      // The same direction dot the disk tether wears, at the end that is the
+      // code: this line means "that wedge is what is in this box".
+      ctx.beginPath();
+      ctx.arc(curve.end.x, curve.end.y, TETHER_DOT_PX, 0, Math.PI * 2);
+      ctx.fillStyle = BACKGROUND;
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
+  /** Drop every bubble — a different project has different nodes. */
+  private clearBubbles(): void {
+    for (const bubble of this.bubbles) {
+      bubble.requestSeq++;
+      bubble.view.destroy();
+    }
+    this.bubbles = [];
+  }
+
+  /**
+   * A re-index: a bubble whose node went away goes with it, and the survivors
+   * re-fetch, since a file's lines move under a node that kept its id.
+   */
+  private refreshBubbles(): void {
+    const model = this.model;
+    if (!model) return;
+    const gone = this.bubbles.filter((bubble) => !model.nodes.has(bubble.nodeId));
+    for (const bubble of gone) {
+      bubble.requestSeq++;
+      bubble.view.destroy();
+    }
+    if (gone.length > 0) {
+      this.bubbles = this.bubbles.filter((bubble) => model.nodes.has(bubble.nodeId));
+    }
+    for (const bubble of this.bubbles) {
+      this.refreshBubbleHeader(bubble);
+      this.loadBubbleSource(bubble);
+    }
   }
 
   // ---------------------------------------------------------- navigation ---
@@ -1529,6 +2079,10 @@ export class CanvasController {
     this.disposed = true;
     if (this.frame !== null) cancelAnimationFrame(this.frame);
     this.resizeObserver.disconnect();
+    window.removeEventListener('keydown', this.onModifierChange);
+    window.removeEventListener('keyup', this.onModifierChange);
+    this.clearBubbles();
+    this.bubbleLayer.remove();
     this.canvas.remove();
     // The snapshot is a second backing store the size of the canvas — let it go
     // with the canvas it mirrors.
@@ -1887,8 +2441,15 @@ export class CanvasController {
 
     // Mid-gesture, with nothing but the camera changed: stamp the last exact
     // frame back through the camera delta and paint only what the move exposed.
-    if (this.drawGesture(ratio)) return;
+    if (this.drawGesture(ratio)) {
+      this.syncBubbles();
+      return;
+    }
     this.drawFull(ratio);
+    // Bubbles are DOM: they ride the same camera the frame was painted under,
+    // but they are placed AFTER it and never touch the canvas — so a bubble can
+    // neither dirty the scene nor end up inside a snapshot.
+    this.syncBubbles();
   }
 
   /**
@@ -1934,6 +2495,7 @@ export class CanvasController {
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.globalAlpha = 1;
     this.drawDiskChrome(ctx);
+    this.drawBubbleTethers(ctx);
     this.drawGhost(ctx);
 
     // Two things keep the frame loop alive on their own: the ⌘P pulse, and the
@@ -2027,6 +2589,7 @@ export class CanvasController {
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.globalAlpha = 1;
     this.drawDiskChrome(ctx);
+    this.drawBubbleTethers(ctx);
     this.drawGhost(ctx);
 
     if (this.pulseNodeId !== null || this.cameraSettling()) this.scheduleFrame();
@@ -2994,6 +3557,13 @@ export class CanvasController {
   private drawGhost(ctx: CanvasRenderingContext2D): void {
     const drag = this.drag;
     if (!drag || drag.mode !== 'wedge' || !drag.outside) return;
+    // Two outcomes, two ghosts. The shape IS the promise: a rounded rectangle
+    // the size the bubble will actually be, or the disk's own circle. ⌥ swaps
+    // them mid-drag, so what the release does is never a surprise.
+    if (drag.spawn === 'bubble') {
+      this.drawBubbleGhost(ctx, drag);
+      return;
+    }
     const radius = drag.preview
       ? Math.max(24, Math.min(GHOST_RADIUS_PX * 3, drag.preview.maxRadius * this.scale()))
       : GHOST_RADIUS_PX;
@@ -3012,6 +3582,47 @@ export class CanvasController {
     ctx.textBaseline = 'middle';
     ctx.fillStyle = '#dbe4f2';
     ctx.fillText(fitText(ctx, drag.label, radius * 1.9), drag.x, drag.y);
+  }
+
+  /**
+   * The bubble half of the ghost: the box, where it will be, at the size it
+   * will read at (a chip's worth of the workspace when the camera is far out).
+   */
+  private drawBubbleGhost(ctx: CanvasRenderingContext2D, drag: DragState): void {
+    const presentation = bubblePresentation(this.scale());
+    const width = presentation.chip
+      ? bubbleChipWidth(drag.label.length + 12)
+      : BUBBLE_DEFAULT_WIDTH * presentation.scale;
+    const height = presentation.chip
+      ? BUBBLE_CHIP_HEIGHT
+      : BUBBLE_DEFAULT_HEIGHT * presentation.scale;
+    const x = drag.x - width / 2;
+    const y = drag.y - height / 2;
+    const corner = Math.min(8, width / 2, height / 2);
+
+    ctx.beginPath();
+    ctx.roundRect(x, y, width, height, corner);
+    ctx.fillStyle = GHOST_FILL;
+    ctx.fill();
+    ctx.strokeStyle = GHOST_STROKE;
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([5, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // A hairline where the header will be, so the shape reads as a panel
+    // rather than as a plain rectangle.
+    const headerHeight = Math.min(20, height * 0.28);
+    ctx.beginPath();
+    ctx.moveTo(x, y + headerHeight);
+    ctx.lineTo(x + width, y + headerHeight);
+    ctx.stroke();
+
+    ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#dbe4f2';
+    ctx.fillText(fitText(ctx, drag.label, width - 12), x + width / 2, y + headerHeight / 2);
   }
 
   // ---------------------------------------------------------------- edges ---
@@ -3282,6 +3893,37 @@ export class CanvasController {
     this.canvas.addEventListener('click', this.onClick);
     this.canvas.addEventListener('dblclick', this.onDoubleClick);
     this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
+    // ⌥ flips what a drag-away spawns, and it has to flip WHILE the pointer is
+    // held still — a pointer event would not arrive. Read-only and scoped to a
+    // wedge drag: nothing here consumes a key the shell routes.
+    window.addEventListener('keydown', this.onModifierChange);
+    window.addEventListener('keyup', this.onModifierChange);
+  }
+
+  /** ⌥ went down or up during a wedge drag — re-decide what the release makes. */
+  private readonly onModifierChange = (event: KeyboardEvent): void => {
+    const drag = this.drag;
+    if (!drag || drag.mode !== 'wedge' || !drag.nodeId) return;
+    if (event.altKey === drag.alt) return;
+    drag.alt = event.altKey;
+    this.applySpawnKind(drag);
+    this.requestDraw();
+  };
+
+  /**
+   * Decide (again) what this wedge drag would spawn, and make sure the ghost
+   * has what it needs to preview it.
+   *
+   * The disk ghost needs the prospective disk's real radius, which costs one
+   * layout — computed the first time it is actually needed and then cached on
+   * the drag, so flipping ⌥ back and forth is free and the drop itself is too.
+   */
+  private applySpawnKind(drag: DragState): void {
+    if (!drag.nodeId) return;
+    drag.spawn = this.spawnKindFor(drag.nodeId, drag.alt);
+    if (drag.spawn === 'disk' && drag.outside && !drag.preview && this.model) {
+      drag.preview = this.layoutFor(drag.nodeId);
+    }
   }
 
   /**
@@ -3394,7 +4036,7 @@ export class CanvasController {
         return;
       }
       if (drag.mode === 'wedge') {
-        this.updateWedgeDrag(drag, position);
+        this.updateWedgeDrag(drag, position, event.altKey);
         return;
       }
       return;
@@ -3428,19 +4070,19 @@ export class CanvasController {
    * user sees the disk end. Coming back inside cancels it again, so the gesture
    * is reversible right up to the release.
    */
-  private updateWedgeDrag(drag: DragState, position: Point): void {
+  private updateWedgeDrag(drag: DragState, position: Point, alt: boolean): void {
     const disk = this.diskById(drag.diskId);
     if (!disk) return;
     const workspace = this.toWorkspace(position.x, position.y);
     const radius = disk.layout?.maxRadius ?? MAX_RADIUS;
     const distance = Math.hypot(workspace.x - disk.x, workspace.y - disk.y);
     const outside = distance > radius;
-    if (outside && !drag.preview && drag.nodeId && this.model) {
-      // One layout, computed the moment the ghost appears (and cached, so the
-      // drop itself is free) — the preview circle is then the disk's real size.
-      drag.preview = this.layoutFor(drag.nodeId);
-    }
     drag.outside = outside;
+    drag.alt = alt;
+    // The kind is re-decided every move (⌥ may have changed) and the disk
+    // ghost's one layout is computed the moment it is first needed — once, and
+    // cached, so the drop itself is free.
+    this.applySpawnKind(drag);
     this.canvas.style.cursor = outside ? 'copy' : 'grabbing';
     this.requestDraw();
   }
@@ -3484,6 +4126,8 @@ export class CanvasController {
       label: '',
       outside: false,
       preview: null,
+      alt: event.altKey,
+      spawn: 'disk',
     };
 
     const closing = this.closeButtonUnder(position);
@@ -3507,6 +4151,7 @@ export class CanvasController {
             nodeId: arc.nodeId,
             label: this.model?.get(arc.nodeId)?.name ?? arc.label,
           };
+          this.applySpawnKind(this.drag);
         } else {
           this.drag = { ...base, mode: 'move-disk', diskId: hit.disk.id };
         }
@@ -3544,12 +4189,12 @@ export class CanvasController {
 
     if (drag.mode === 'wedge') {
       if (drag.moved && drag.outside && drag.nodeId) {
-        this.spawnDisk(
-          drag.nodeId,
-          this.toWorkspace(position.x, position.y),
-          drag.diskId,
-          drag.preview
-        );
+        const at = this.toWorkspace(position.x, position.y);
+        if (drag.spawn === 'bubble') {
+          this.spawnBubble(drag.nodeId, at, drag.diskId);
+        } else {
+          this.spawnDisk(drag.nodeId, at, drag.diskId, drag.preview);
+        }
         this.suppressClick = true;
         return;
       }
@@ -3905,6 +4550,174 @@ function fontSpec(fontPx: number, k: number): string {
 
 /** Entries the text-metrics cache holds before it stops growing. */
 const TEXT_CACHE_MAX = 4000;
+
+// --------------------------------------------------------- code bubbles ---
+
+/**
+ * A bubble's on-screen box, in CSS px. `x`/`y` is its top-left corner.
+ *
+ * A bubble is anchored to a WORLD point and sized in SCREEN px, which is the
+ * whole of the hybrid-zoom idea: it travels with the disk it came out of, but
+ * its text is never smaller or larger than a text is worth reading at.
+ */
+export interface BubbleRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** Widest a bubble ever reads. Past this the world keeps zooming, the text does not. */
+export const BUBBLE_MAX_SCALE = 1.5;
+/** Under this camera scale a bubble is a title chip instead of a box. */
+export const BUBBLE_CHIP_BELOW = 0.5;
+/** The chip is fixed-size: legible at any zoom, which is its entire job. */
+export const BUBBLE_CHIP_SCALE = 1;
+/** Chip geometry — a single row, sized from the label it has to hold. */
+export const BUBBLE_CHIP_HEIGHT = 22;
+export const BUBBLE_CHIP_MIN_WIDTH = 96;
+export const BUBBLE_CHIP_MAX_WIDTH = 260;
+/** Default and clamp range for the box the user drags out and resizes. */
+export const BUBBLE_DEFAULT_WIDTH = 380;
+export const BUBBLE_DEFAULT_HEIGHT = 260;
+export const BUBBLE_MIN_WIDTH = 200;
+export const BUBBLE_MIN_HEIGHT = 96;
+export const BUBBLE_MAX_WIDTH = 1200;
+export const BUBBLE_MAX_HEIGHT = 1000;
+/** Tether arms, mirroring the disk tether's own shape (`workspace.ts`). */
+export const BUBBLE_TETHER_ARM_SHARE = 0.42;
+export const BUBBLE_TETHER_MIN_ARM = 8;
+
+/**
+ * How a bubble reads at a given camera scale — the hybrid-zoom rule, whole.
+ *
+ * Two regimes, and the split is the point:
+ *
+ *  - **at or above {@link BUBBLE_CHIP_BELOW}** the bubble scales WITH the world
+ *    (so it stays glued to the wedge it came from and to its neighbours) but
+ *    never past {@link BUBBLE_MAX_SCALE} — zooming in to read one wedge should
+ *    not turn a bubble into a billboard;
+ *  - **below it** the box would be unreadable at any size the layout can give
+ *    it, so it collapses to a title CHIP at a fixed readable size, anchored at
+ *    the same world point. It is a different affordance, not a smaller one,
+ *    which is why the scale jumps rather than continuing down.
+ *
+ * Pure and total: the same camera scale always produces the same answer, so
+ * crossing the threshold in either direction is idempotent and the controller
+ * only has to preserve the scroll position across it.
+ */
+export interface BubblePresentation {
+  scale: number;
+  chip: boolean;
+}
+
+/** The scale a bubble's BOX is drawn at — `min(camera, 1.5)`, clamped exactly. */
+export function bubbleScale(cameraScale: number): number {
+  if (!Number.isFinite(cameraScale)) return BUBBLE_MAX_SCALE;
+  return Math.min(Math.max(cameraScale, 0), BUBBLE_MAX_SCALE);
+}
+
+/** Is the camera far enough out that the box is worthless? */
+export function bubbleIsChip(cameraScale: number): boolean {
+  return Number.isFinite(cameraScale) && cameraScale < BUBBLE_CHIP_BELOW;
+}
+
+/** {@link bubbleScale} and {@link bubbleIsChip} as the one answer a frame needs. */
+export function bubblePresentation(cameraScale: number): BubblePresentation {
+  const chip = bubbleIsChip(cameraScale);
+  return { chip, scale: chip ? BUBBLE_CHIP_SCALE : bubbleScale(cameraScale) };
+}
+
+/** A user-dragged size, held inside the range a bubble is still usable in. */
+export function clampBubbleSize(width: number, height: number): { w: number; h: number } {
+  const w = Number.isFinite(width) ? width : BUBBLE_DEFAULT_WIDTH;
+  const h = Number.isFinite(height) ? height : BUBBLE_DEFAULT_HEIGHT;
+  return {
+    w: Math.min(BUBBLE_MAX_WIDTH, Math.max(BUBBLE_MIN_WIDTH, w)),
+    h: Math.min(BUBBLE_MAX_HEIGHT, Math.max(BUBBLE_MIN_HEIGHT, h)),
+  };
+}
+
+/** The chip's width for a label of `length` characters — a fixed advance, no measuring. */
+export function bubbleChipWidth(length: number): number {
+  const chars = Number.isFinite(length) ? Math.max(0, Math.floor(length)) : 0;
+  return Math.min(BUBBLE_CHIP_MAX_WIDTH, Math.max(BUBBLE_CHIP_MIN_WIDTH, Math.round(chars * 6.2) + 24));
+}
+
+/** A bubble's tether, in the same shape `workspace.ts` gives a disk's. */
+export interface BubbleTether {
+  start: Point;
+  control1: Point;
+  control2: Point;
+  end: Point;
+}
+
+/**
+ * The cubic from a bubble's edge to the wedge it was dragged out of.
+ *
+ * Everything is in SCREEN px, because a bubble is: its box is scaled by
+ * {@link bubblePresentation} rather than by the camera, so there is no single
+ * world rectangle to anchor against — `rect` is whatever is actually painted
+ * this frame, box or chip, and the same arithmetic serves both.
+ *
+ * It leaves the bubble along the line from the bubble's CENTRE to the wedge —
+ * so the curve reads as coming out of the box rather than off a corner — and
+ * arrives RADIALLY at the wedge (`wedgeOut` is the wedge's outward direction,
+ * i.e. its mid angle), which is the same convention the disk tether uses.
+ *
+ * `null` — draw nothing — when the wedge is inside the bubble, when the two
+ * coincide, or when any input is not a number. Same refusal as `tetherCurve`:
+ * a line that points the wrong way is worse than no line.
+ */
+export function bubbleTetherAnchor(
+  rect: BubbleRect,
+  wedge: Point,
+  wedgeOut: Point
+): BubbleTether | null {
+  const hw = rect.w / 2;
+  const hh = rect.h / 2;
+  if (!(hw > 0) || !(hh > 0)) return null;
+  const cx = rect.x + hw;
+  const cy = rect.y + hh;
+  if (!Number.isFinite(cx) || !Number.isFinite(cy)) return null;
+  if (!Number.isFinite(wedge.x) || !Number.isFinite(wedge.y)) return null;
+
+  const dx = wedge.x - cx;
+  const dy = wedge.y - cy;
+  // Inside the box: there is no edge point between the two, so nothing honest
+  // to draw — the bubble is already sitting on top of its own origin.
+  if (Math.abs(dx) <= hw && Math.abs(dy) <= hh) return null;
+  const distance = Math.hypot(dx, dy);
+  if (!(distance > 1e-9)) return null;
+  const ux = dx / distance;
+  const uy = dy / distance;
+
+  // The ray's first crossing of the box: whichever axis it leaves through
+  // first. One of the two coordinates lands exactly on the border by
+  // construction, and neither can exceed it.
+  const tx = Math.abs(ux) > 1e-12 ? hw / Math.abs(ux) : Infinity;
+  const ty = Math.abs(uy) > 1e-12 ? hh / Math.abs(uy) : Infinity;
+  const t = Math.min(tx, ty);
+  if (!Number.isFinite(t)) return null;
+  const start = { x: cx + ux * t, y: cy + uy * t };
+
+  const gap = Math.hypot(wedge.x - start.x, wedge.y - start.y);
+  if (!(gap > 1e-9)) return null;
+  const arm = Math.min(Math.max(BUBBLE_TETHER_MIN_ARM, gap * BUBBLE_TETHER_ARM_SHARE), gap / 2);
+
+  const outLength = Math.hypot(wedgeOut.x, wedgeOut.y);
+  // A wedge with no honest outward direction (the centre of a disk) still gets
+  // a symmetric curve: it arrives back along the line it left on.
+  const ox = outLength > 1e-9 ? wedgeOut.x / outLength : -ux;
+  const oy = outLength > 1e-9 ? wedgeOut.y / outLength : -uy;
+
+  return {
+    start,
+    control1: { x: start.x + ux * arm, y: start.y + uy * arm },
+    control2: { x: wedge.x + ox * arm, y: wedge.y + oy * arm },
+    end: { x: wedge.x, y: wedge.y },
+  };
+}
 
 // ------------------------------------------------------------------ blit ---
 

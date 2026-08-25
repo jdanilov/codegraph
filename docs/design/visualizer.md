@@ -1568,6 +1568,98 @@ shape that broke G5.1 nor the black edge that broke G5.
   a gap on **2,000 of 2,000** cases — so the zeroes above are results, not
   tautologies.
 
+### Code bubbles (B1) — source pinned to the workspace (additive; no contract item changed)
+
+A disk answers *where* something is. A **bubble** answers *what it says*: a
+scrollable, selectable, syntax-highlighted slice of source, pinned to the
+workspace next to the wedge it came out of. It is the first thing on this canvas
+that is **DOM rather than canvas**, and that is deliberate — text selection,
+native scrolling and a highlighter are all things a 2D context does badly.
+
+- **The model.** A bubble is `{ node, world x/y (its top-left), box w/h in CSS
+  px, scrollTop, expanded }` plus the disk it was dragged from. Its ANCHOR is a
+  world point (so it travels with the disk) while its SIZE is screen px (so its
+  text is legible at any zoom) — that split is the whole of the hybrid-zoom rule
+  below. There is no collision handling and no snapping: bubbles are placed
+  where the user drops them, and overlapping two of them is a thing a user is
+  allowed to do.
+- **Spawn is the phase-G drag-away, forked by KIND.** A drag that starts on a
+  wedge and crosses its disk's rim spawns a **bubble** when the node is a LEAF
+  (nothing inside it, so a disk of it would be an empty centre circle and the
+  code is what the user was reaching for) and a **disk** when it has children —
+  phase G's behaviour, unchanged. **⌥ flips it in both directions**, live: hold
+  it over a file or a class and the release makes a bubble of its source;
+  hold it over a leaf and the release makes a one-node disk. The ghost follows
+  the decision — the disk's dashed circle, or a rounded rectangle at exactly the
+  size the bubble will read at — and swaps the instant ⌥ goes down or up, even
+  with the pointer standing still (the controller listens for the modifier for
+  the duration of the drag). A node with no source of its own (a directory)
+  always spawns a disk, whatever ⌥ says.
+- **Content.** `GET /api/source` for the node's `[startLine, endLine]`, rendered
+  with a line-number gutter carrying the REAL file line numbers, highlighted
+  through the same lazy `loadHighlighter()` the source panel uses and coloured by
+  the same `hljs-code` theme — the two views must not disagree about what a
+  keyword looks like. A `file` node's bubble is the whole file. A symbol
+  bubble's header carries an **expand to file** toggle, which re-fetches the
+  file and lands scrolled to the symbol's own first line (the file is context
+  for the thing you dragged out, not a replacement for it). Loading is a muted
+  spinner line, a failed fetch is muted red text **inside the bubble** — a file
+  that cannot be read is one box's problem, never the canvas's.
+- **Hybrid zoom, and the chip.** Screen scale is `min(camera.scale, 1.5)`: a
+  bubble grows with the world until text stops being worth enlarging. Below
+  `camera.scale = 0.5` the box would be unreadable at any size, so it collapses
+  to a **title chip** (name · kind · loc) at a FIXED readable size, anchored at
+  the same world point. The scale jumps at that threshold on purpose — the chip
+  is a different affordance, not a smaller box. The maths is pure and exported
+  (`bubbleScale` / `bubbleIsChip` / `bubblePresentation` / `clampBubbleSize` /
+  `bubbleChipWidth` in `canvas-controller.ts`), so crossing the threshold is
+  idempotent by construction; the body element is never rebuilt, so the scroll
+  position and any selection in it survive a round trip.
+- **The overlay does not exist as far as the renderer is concerned.** One
+  `pointer-events: none` div over the canvas, one `pointer-events: auto` element
+  per bubble, and the controller's only per-frame bubble work is **one CSS
+  transform each** (`syncBubbles`, after the frame is painted). Nothing about a
+  bubble is ever drawn into the canvas, so the G5.3 incremental blit is
+  untouched: a bubble cannot dirty the scene by existing, cannot be baked into a
+  snapshot, and adds no third `requestCameraDraw` call site. Its state changes
+  (spawn, move, resize, close) go through the ordinary dirty path, exactly like
+  a disk being moved. The wheel over a bubble's body scrolls the bubble
+  (`stopPropagation` + `overscroll-behavior: contain`); dragging its header
+  moves it in world units; a corner grip resizes it inside a clamped range; a
+  press raises it above its siblings.
+- **The tether is CHROME.** Each bubble draws a quiet cubic from its own edge to
+  the centroid of the wedge it came from, in SCREEN space, in the chrome pass —
+  after `captureSnapshot`, like the disk `×` and the tether dot — so it is never
+  stamped into a blitted frame and follows a pan or zoom gesture live. It leaves
+  the box along the line from the box's centre to the wedge and **arrives
+  radially** at the wedge, the same convention the disk tether uses, and it
+  wears the same direction dot at the code end. The geometry is one exported
+  pure function (`bubbleTetherAnchor`), fed the rect that is actually painted
+  this frame — box or chip — so the chip case needs no second code path. **If no
+  disk renders the origin wedge** (the disk was closed, re-rooted away, or the
+  legend made the wedge invisible) **nothing is drawn**: falling back to the
+  disk's root would be a false claim about where the code is. Closing a disk
+  therefore never closes a bubble; it only takes the thread away.
+- **Persistence.** `StoredWorkspace` gains `bubbles: [{ nodeId, x, y, w, h,
+  scrollTop, expanded }]`, riding the existing 300ms debounce and the same
+  per-project `localStorage` key. The field is optional so a workspace stored
+  before this phase restores unchanged. A stored bubble whose node id no longer
+  resolves is dropped silently (the disks' rule), and every survivor **re-fetches
+  its source** — the file on disk is the truth and a stored copy of it would be
+  a stale one. A re-index does the same for the bubbles already on screen.
+- **Interaction coherence.** Bubbles capture no keyboard: Escape keeps its
+  single owner and its existing priority list, the arrows still drive the disk,
+  and ⌘P is untouched. The canvas's own hit testing never sees a pointer event
+  that landed on a bubble, so no gesture is ambiguous.
+- **Explicit non-goals this phase.** No **call tethers between bubbles** (a
+  bubble ties to its origin wedge and to nothing else — relations between two
+  bubbles are a later round, and drawing half of them would be worse than
+  drawing none). No collision, packing or auto-layout. No diff mode inside a
+  bubble. And no **editing**: the recorded future direction is click-to-convert
+  a bubble's body into editable text, written back through the editor jump the
+  header already has — deliberately not attempted before the read path has been
+  used in anger.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all
