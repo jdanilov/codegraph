@@ -29,8 +29,27 @@ export interface UiStatus {
   watcherDegraded: boolean;
 }
 
+/**
+ * A short, stable, opaque token for one project root.
+ *
+ * It exists so that two different projects served on the SAME loopback origin
+ * can never be mistaken for each other by anything that caches per URL. The
+ * absolute path is the identity, but it is long and full of separators, so it
+ * is hashed (FNV-1a, base36) — the token is not a secret, only a discriminator.
+ */
+export function projectToken(projectRoot: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < projectRoot.length; i++) {
+    hash ^= projectRoot.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
 export class UiServerState {
   readonly projectRoot: string;
+  /** Identity of this root, for anything keyed per project. See {@link projectToken}. */
+  readonly projectToken: string;
   private graph: CodeGraphType | null = null;
   private version = 1;
   private signature: string | null = null;
@@ -40,6 +59,7 @@ export class UiServerState {
 
   constructor(projectRoot: string) {
     this.projectRoot = path.resolve(projectRoot);
+    this.projectToken = projectToken(this.projectRoot);
   }
 
   /** Absolute path of the project's SQLite database (may not exist yet). */

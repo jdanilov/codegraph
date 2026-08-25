@@ -144,7 +144,7 @@ describe('GET /api/graph', () => {
     expect(root.loc).toBeGreaterThan(0);
   });
 
-  it('answers 304 for a matching ETag', async () => {
+  it('answers 304 for a matching ETag, and never across projects', async () => {
     const first = await fetch(`${server.url}/api/graph`);
     const etag = first.headers.get('etag');
     expect(etag).toBeTruthy();
@@ -160,6 +160,22 @@ describe('GET /api/graph', () => {
     });
     expect(stale.status).toBe(200);
     await stale.text();
+
+    // Two roots, same loopback origin, same URL, and both start their version
+    // counter at 1 — so a version-only ETag would let a browser holding this
+    // project's graph revalidate it against the other one and take a 304,
+    // redrawing the previous project on a server that has never served it.
+    const other = await fetch(`${emptyServer.url}/api/graph`);
+    const otherEtag = other.headers.get('etag');
+    await other.text();
+    expect(otherEtag).not.toBe(etag);
+
+    const crossed = await fetch(`${emptyServer.url}/api/graph`, {
+      headers: { 'If-None-Match': etag as string },
+    });
+    expect(crossed.status).toBe(200);
+    const crossedBody = JSON.parse(await crossed.text()) as { root: string };
+    expect(crossedBody.root).toBe(emptyServer.projectRoot);
   });
 
   it('serves an empty payload for an un-indexed root', async () => {

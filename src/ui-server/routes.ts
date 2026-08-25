@@ -139,7 +139,16 @@ export class ApiRouter {
 
   private async graph(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const version = this.state.dataVersion();
-    const etag = `W/"v${version}"`;
+    // The PROJECT is part of the validator, not just the version.
+    //
+    // `dataVersion` is a per-process counter that starts at 1 for every root,
+    // and every project is served from the same loopback origin at the same
+    // URL — so a browser that cached `/api/graph` for one project would
+    // revalidate it against the next one, match `W/"v1"`, take the 304 and
+    // redraw the PREVIOUS project's graph (with paths that do not exist in
+    // this one). Naming the root in the tag makes that impossible, and it
+    // self-heals a browser that is already holding the stale entry.
+    const etag = `W/"${this.state.projectToken}v${version}"`;
 
     // The graph only changes when dataVersion does, so a matching ETag is a
     // guaranteed-correct 304 — that is what makes polling cheap.

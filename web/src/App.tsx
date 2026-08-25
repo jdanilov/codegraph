@@ -923,6 +923,15 @@ const WORKSPACE_WRITE_MS = 300;
  * is what `/api/graph` reports), but it is not a key: it is long and full of
  * separators. It is hashed instead, so the key is short, stable and opaque —
  * and two projects can never collide into one arrangement.
+ *
+ * This is the whole reason `codegraph ui` can be stopped in one folder and
+ * started in another on the same port without the second project inheriting
+ * the first one's disks and bubbles: every project has its own key, and a
+ * stored arrangement that names nodes this project does not have is dropped
+ * disk by disk and bubble by bubble on restore (`restoreWorkspace`) rather
+ * than restored broken. What made the swap look broken anyway was the graph
+ * itself being served out of the browser's cache — fixed on the server, where
+ * the `/api/graph` validator now names the project as well as its version.
  */
 function workspaceKey(root: string): string {
   let hash = 0x811c9dc5;

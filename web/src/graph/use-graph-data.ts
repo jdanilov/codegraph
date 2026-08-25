@@ -46,7 +46,17 @@ export function useGraphData(): GraphData {
         setStatus(next);
         setError(null);
         if (next.indexed && loadedVersion.current !== next.dataVersion) {
-          const payload = await fetchGraph();
+          let payload = await fetchGraph();
+          // Belt and braces on the project's identity. `/api/status` is
+          // `no-store` and therefore always the live server's answer, while
+          // `/api/graph` revalidates against an ETag — so a graph whose root
+          // disagrees with the status's root is a cached copy of a DIFFERENT
+          // project being replayed on this origin. Ask again, bypassing the
+          // browser's cache, rather than drawing the wrong project.
+          if (payload.root !== next.root) {
+            payload = await fetchGraph(true);
+            if (cancelled) return;
+          }
           if (cancelled) return;
           loadedVersion.current = payload.dataVersion;
           setModel(new GraphModel(payload));

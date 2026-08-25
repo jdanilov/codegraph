@@ -240,8 +240,15 @@ export interface ChangesPayload {
   truncated: boolean;
 }
 
-async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(path, { headers: { Accept: 'application/json' }, signal });
+async function getJson<T>(
+  path: string,
+  signal?: AbortSignal,
+  cache?: RequestCache
+): Promise<T> {
+  const init: RequestInit = { headers: { Accept: 'application/json' } };
+  if (signal) init.signal = signal;
+  if (cache) init.cache = cache;
+  const response = await fetch(path, init);
   if (!response.ok) {
     throw new Error(`${path} failed: ${response.status}`);
   }
@@ -252,8 +259,16 @@ export function fetchStatus(): Promise<Status> {
   return getJson<Status>('/api/status');
 }
 
-export function fetchGraph(): Promise<GraphPayload> {
-  return getJson<GraphPayload>('/api/graph');
+/**
+ * The graph.
+ *
+ * `/api/graph` is the one route that is allowed to be cached (it revalidates
+ * against an ETag, which is what makes the poll cheap). `fresh` bypasses that
+ * cache: the caller has evidence the stored copy describes a DIFFERENT project
+ * and wants the bytes from the server, not from the browser.
+ */
+export function fetchGraph(fresh = false): Promise<GraphPayload> {
+  return getJson<GraphPayload>('/api/graph', undefined, fresh ? 'reload' : undefined);
 }
 
 export function fetchNode(id: string, signal?: AbortSignal): Promise<NodeDetail> {
