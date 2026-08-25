@@ -29,16 +29,18 @@ export interface BubbleViewCallbacks {
   /**
    * Corner drag, in SCREEN px.
    *
-   * Screen px are FRAME px only while the frame scale is 1 (B2.2: zooming out
-   * shrinks the frame with the world). The controller divides by that scale,
-   * so the box always grows under the cursor at exactly the cursor's speed.
+   * Screen px are FRAME px only at camera 1 (B2.3: the frame is a world object
+   * and is drawn at the camera's own scale in both directions). The controller
+   * divides by that scale, so the box always grows under the cursor at exactly
+   * the cursor's speed.
    */
   onResize(dx: number, dy: number): void;
   /**
-   * The body scrolled — persisted, so a refresh comes back where you were.
+   * The body scrolled, in FRAME px — persisted, so a refresh comes back where
+   * you were.
    *
    * `programmatic` marks the echo of a scroll the CONTROLLER just made (the
-   * centre-line rule re-anchoring the body after a text-scale change). The
+   * centre-line rule re-anchoring the body after a font re-write). The
    * position is still reported, so state never drifts from the DOM, but a
    * scroll nobody performed must not dirty the scene: doing so would take the
    * canvas off its blit for the whole of a wheel gesture.
@@ -93,8 +95,68 @@ const FONT_MONO = 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace';
 const FONT_UI = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif';
 const LINE_HEIGHT = '1.55';
 const CODE_PX = 11;
-/** Padding above the first source row and below the last — fixed, never zoomed. */
+/** Padding above the first source row and below the last, in FRAME px. */
 const BODY_PAD_PX = 6;
+
+/**
+ * The frame's LAYOUT scale, as a custom property every length in the frame is
+ * written through (B2.3).
+ *
+ * A bubble is drawn at the camera's scale in both directions now, and above
+ * camera 1 a composited `scale()` would upscale a raster made at 1× — legible
+ * geometry, blurred type. So the frame is LAID OUT larger instead (`font-size`
+ * and every other length multiplied by this) and the root transform is divided
+ * by exactly the same number: the picture on screen is unchanged and the text
+ * is rasterised at the size it is actually being read at.
+ *
+ * It is one custom property rather than forty style writes on purpose. Every
+ * length inside the frame is authored once, at construction, as
+ * `calc(Npx * var(--cg-bubble-layout))`; a re-layout is then a SINGLE property
+ * write on the root and the whole subtree follows it — header, gutter, type,
+ * markers, paddings, borders and the grip together, so the frame stays exactly
+ * self-similar at every scale.
+ */
+const LAYOUT_VAR = '--cg-bubble-layout';
+
+/**
+ * `n` FRAME px, as the CSS length the DOM is laid out at.
+ *
+ * The fallback in the `var()` is load-bearing: some of these lengths sit
+ * inside shorthands (`border`, `box-shadow`), and a shorthand whose
+ * substitution fails drops the whole declaration — a frame with no border at
+ * all. With the fallback the worst case is a frame laid out at 1, which is
+ * exactly what it was before this round.
+ */
+function layoutPx(n: number): string {
+  return `calc(${n}px * var(${LAYOUT_VAR}, 1))`;
+}
+
+/**
+ * Type, as LONGHANDS rather than as the `font` shorthand.
+ *
+ * Deliberate: a shorthand carrying a `var()` is substituted and re-parsed at
+ * computed-value time, and a substitution that fails takes every font property
+ * with it — while `font: <calc>/<line-height>` is exactly the corner of the
+ * shorthand grammar engines have historically disagreed about. Longhands have
+ * neither problem: each one stands or falls alone, and there is no `/` to
+ * parse.
+ */
+function typeStyle(
+  weight: string | null,
+  sizePx: number,
+  lineHeight: string,
+  family: string,
+  scaled = true
+): Record<string, string> {
+  const style: Record<string, string> = {
+    fontSize: scaled ? layoutPx(sizePx) : `${sizePx}px`,
+    lineHeight,
+    fontFamily: family,
+  };
+  if (weight) style.fontWeight = weight;
+  return style;
+}
+
 /**
  * How long after a programmatic scroll its own event is still recognisable as
  * one. Scroll events are delivered in the same turn as the write that caused
@@ -103,23 +165,31 @@ const BODY_PAD_PX = 6;
 const SELF_SCROLL_MS = 50;
 /** The gutter call marker (phase B2): a muted dot, an accent one under the pointer. */
 const MARKER_PX = 5;
+/** The gap between a marker and the gutter's own text, in FRAME px. */
+const MARKER_GAP_PX = 1;
 const MARKER_COLOR = `color-mix(in oklab, ${MUTED} 70%, transparent)`;
 const MARKER_COLOR_HOT = 'var(--accent)';
 const MARKER_COLOR_DEAD = `color-mix(in oklab, ${MUTED} 32%, transparent)`;
 
 /**
- * What the body's geometry is, in UNSCALED CSS px — measured from the DOM, once
- * per content load, and handed to the controller so the call-tether anchor is
+ * What the body's geometry is, in FRAME px — measured from the DOM, once per
+ * content load, and handed to the controller so the call-tether anchor is
  * arithmetic rather than a per-frame layout read.
+ *
+ * FRAME px is the unit of everything that crosses this class's boundary (the
+ * one exception is a pointer delta, which is screen px because a pointer is).
+ * The DOM inside is laid out at frame px × the layout scale and drawn at
+ * frame px × the camera, so every read here divides by whichever of the two
+ * the number it read is in.
  */
 export interface BubbleBodyGeometry {
-  /** Top of the box to the first content pixel. Never zoomed — it is chrome. */
+  /** Top of the box to the first content pixel. */
   headerHeight: number;
   /** The first row's own top offset inside the scrolling body. */
   padTop: number;
   /** Padding below the last row. */
   padBottom: number;
-  /** One source row, top to top, **at text scale 1**. */
+  /** One source row, top to top, in frame px — the same number at every zoom. */
   lineHeight: number;
   /** Rows currently rendered. */
   lineCount: number;
@@ -147,26 +217,42 @@ export class BubbleView {
 
   /** Gutter rows, so "scroll to line" is an offset the layout already knows. */
   private gutter: HTMLDivElement | null = null;
-  private pre: HTMLPreElement | null = null;
   private code: HTMLElement | null = null;
   private firstLine = 1;
   private isLabel = false;
   private lastTransform = '';
+  /**
+   * The scale the root's transform currently carries (`frameScale / fontScale`).
+   *
+   * Also the gate on the label's counter-scale, which is `1 / this`: the two
+   * are written together or not at all, so the label can never be cancelling a
+   * transform the root is no longer wearing.
+   */
+  private currentRootScale = 1;
   private width = 0;
   private height = 0;
   /**
-   * What the camera is scaling the whole frame by right now (B2.2).
+   * What the camera is drawing the whole frame at right now — `camera.scale`
+   * itself (B2.3).
    *
-   * `min(camera, 1)`: zoom out and the frame shrinks with the world like a
-   * disk does; zoom in and it holds its size. It is a CSS transform on the
-   * root, so nothing inside the frame reflows — but it does mean a screen px
-   * and a frame px are no longer the same px, and everything here that reads
-   * the DOM in screen units (a measured row, a marker's position) divides by
-   * it to get back to frame units.
+   * A bubble is a world object: on screen it is its frame px times this, at
+   * every zoom, exactly like a disk. So a screen px and a frame px are the
+   * same px only at camera 1, and everything here that reads the DOM in SCREEN
+   * units (a measured row, a marker's position) divides by it to get back to
+   * frame units.
    */
   private frameScale = 1;
-  /** Multiplier the body's type is currently laid out at (B2.1). */
-  private textScale = 1;
+  /**
+   * What the frame is LAID OUT at (B2.3) — 1 at and below camera 1, and the
+   * camera's own scale (quantised, capped) above it.
+   *
+   * Invisible in the picture: the root transform is divided by exactly this,
+   * so the composed on-screen size is `frame px × frameScale` whatever it is.
+   * All it decides is the size the type is RASTERISED at. It also means the
+   * DOM's own layout px are frame px × this, so every read of `offsetTop` /
+   * `offsetHeight` / `scrollTop` divides by it and every write multiplies.
+   */
+  private fontScale = 1;
   /** Rising per render, so a highlighter that lands late cannot paint a stale body. */
   private renderSeq = 0;
   /**
@@ -195,9 +281,13 @@ export class BubbleView {
       pointerEvents: 'auto',
       willChange: 'transform',
     });
+    // Defined before anything under it is styled: every length in the frame is
+    // written through this property, and one that resolved to nothing would
+    // take its whole shorthand with it.
+    this.root.style.setProperty(LAYOUT_VAR, '1');
     this.root.addEventListener('pointerdown', () => this.callbacks.onRaise());
 
-    // ---- the frame: header + source, at a size the camera never changes -----
+    // ---- the frame: header + source, at the size the user dragged it to -----
     this.full = document.createElement('div');
     Object.assign(this.full.style, {
       position: 'relative',
@@ -206,23 +296,23 @@ export class BubbleView {
       boxSizing: 'border-box',
       width: '100%',
       height: '100%',
-      borderRadius: '8px',
-      border: `1px solid ${BORDER}`,
+      borderRadius: layoutPx(8),
+      border: `${layoutPx(1)} solid ${BORDER}`,
       background: SURFACE,
-      backdropFilter: 'blur(6px)',
+      backdropFilter: `blur(${layoutPx(6)})`,
       color: 'var(--foreground)',
       overflow: 'hidden',
-      boxShadow: '0 10px 30px rgba(0, 0, 0, 0.45)',
+      boxShadow: `0 ${layoutPx(10)} ${layoutPx(30)} rgba(0, 0, 0, 0.45)`,
     });
 
     const header = (this.header = document.createElement('div'));
     Object.assign(header.style, {
       display: 'flex',
       alignItems: 'center',
-      gap: '6px',
-      padding: '4px 6px',
-      borderBottom: `1px solid ${BORDER}`,
-      font: `500 11px/1.2 ${FONT_UI}`,
+      gap: layoutPx(6),
+      padding: `${layoutPx(4)} ${layoutPx(6)}`,
+      borderBottom: `${layoutPx(1)} solid ${BORDER}`,
+      ...typeStyle('500', 11, '1.2', FONT_UI),
       cursor: 'grab',
       userSelect: 'none',
       flex: '0 0 auto',
@@ -230,11 +320,11 @@ export class BubbleView {
 
     this.headerKind = document.createElement('span');
     Object.assign(this.headerKind.style, {
-      padding: '1px 5px',
+      padding: `${layoutPx(1)} ${layoutPx(5)}`,
       borderRadius: '999px',
-      border: `1px solid ${BORDER}`,
+      border: `${layoutPx(1)} solid ${BORDER}`,
       color: MUTED,
-      fontSize: '9px',
+      fontSize: layoutPx(9),
       letterSpacing: '0.08em',
       textTransform: 'uppercase',
       whiteSpace: 'nowrap',
@@ -249,7 +339,11 @@ export class BubbleView {
     });
 
     this.headerLoc = document.createElement('span');
-    Object.assign(this.headerLoc.style, { color: MUTED, fontSize: '10px', whiteSpace: 'nowrap' });
+    Object.assign(this.headerLoc.style, {
+      color: MUTED,
+      fontSize: layoutPx(10),
+      whiteSpace: 'nowrap',
+    });
 
     this.expandButton = this.makeButton('⤢', 'Expand to the whole file', () =>
       this.callbacks.onToggleExpand()
@@ -286,7 +380,8 @@ export class BubbleView {
       // wrong: the offset is reported either way, only the redraw is skipped.
       const programmatic = performance.now() - this.selfScrollAt < SELF_SCROLL_MS;
       this.selfScrollAt = 0;
-      this.callbacks.onScroll(this.body.scrollTop, programmatic);
+      // `scrollTop` is layout px; everything outside this class is frame px.
+      this.callbacks.onScroll(this.body.scrollTop / this.fontScale, programmatic);
     });
 
     const grip = document.createElement('div');
@@ -294,8 +389,8 @@ export class BubbleView {
       position: 'absolute',
       right: '0',
       bottom: '0',
-      width: '14px',
-      height: '14px',
+      width: layoutPx(14),
+      height: layoutPx(14),
       cursor: 'nwse-resize',
       background:
         'linear-gradient(135deg, transparent 45%, color-mix(in oklab, var(--muted) 70%, transparent) 45%, color-mix(in oklab, var(--muted) 70%, transparent) 55%, transparent 55%)',
@@ -309,10 +404,15 @@ export class BubbleView {
     // B2.2: it is a child of the ROOT rather than of the frame, and it
     // counter-scales — the frame shrinks with the world now, and a name that
     // shrank with it would be exactly the thing the label exists to avoid. The
-    // `1 / frameScale` here cancels the root's own scale, so the label reads at
-    // a fixed screen size at every zoom; the frame's `overflow: hidden` is not
-    // above it any more, so at deep zoom-out it is allowed to be bigger than
-    // the box it names, the way a disk's label is.
+    // `1 / rootScale` here cancels the root's own transform, so the label reads
+    // at a fixed screen size at every zoom; the frame's `overflow: hidden` is
+    // not above it any more, so at deep zoom-out it is allowed to be bigger
+    // than the box it names, the way a disk's label is.
+    //
+    // Its own lengths are deliberately NOT written through the layout scale
+    // (B2.3): they are already fixed on screen by the counter-scale, and
+    // laying them out larger would only cancel out again. The label is only
+    // ever shown below camera 0.5, where the layout scale is 1 regardless.
     this.label = document.createElement('div');
     Object.assign(this.label.style, {
       position: 'absolute',
@@ -378,7 +478,12 @@ export class BubbleView {
       font: `10px/1.2 ${FONT_UI}`,
       whiteSpace: 'nowrap',
     });
-    const labelClose = this.makeButton('×', 'Close this bubble', () => this.callbacks.onClose());
+    const labelClose = this.makeButton(
+      '×',
+      'Close this bubble',
+      () => this.callbacks.onClose(),
+      false
+    );
     this.labelInner.append(this.labelKind, this.labelName, this.labelLoc, labelClose);
     this.label.append(this.labelInner);
     this.bindDrag(this.labelInner, (dx, dy) => this.callbacks.onMove(dx, dy));
@@ -389,7 +494,17 @@ export class BubbleView {
     this.applyBoxSize();
   }
 
-  private makeButton(glyph: string, title: string, onClick: () => void): HTMLButtonElement {
+  /**
+   * A header button — `scaled` for the ones inside the frame, plain for the
+   * label's own close, which is fixed on screen like the rest of the label.
+   */
+  private makeButton(
+    glyph: string,
+    title: string,
+    onClick: () => void,
+    scaled = true
+  ): HTMLButtonElement {
+    const px = (n: number): string => (scaled ? layoutPx(n) : `${n}px`);
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = glyph;
@@ -397,17 +512,17 @@ export class BubbleView {
     button.setAttribute('aria-label', title);
     Object.assign(button.style, {
       flex: '0 0 auto',
-      width: '16px',
-      height: '16px',
+      width: px(16),
+      height: px(16),
       display: 'inline-flex',
       alignItems: 'center',
       justifyContent: 'center',
       padding: '0',
       border: 'none',
-      borderRadius: '4px',
+      borderRadius: px(4),
       background: 'transparent',
       color: MUTED,
-      font: `500 12px/1 ${FONT_UI}`,
+      ...typeStyle('500', 12, '1', FONT_UI, scaled),
       cursor: 'pointer',
     });
     button.addEventListener('pointerenter', () => {
@@ -489,7 +604,6 @@ export class BubbleView {
   setContent(content: BubbleContent): void {
     const seq = ++this.renderSeq;
     this.gutter = null;
-    this.pre = null;
     this.code = null;
     this.markers.clear();
     this.closePicker();
@@ -516,13 +630,13 @@ export class BubbleView {
       left: '0',
       zIndex: '1',
       flex: '0 0 auto',
-      padding: '6px 6px 6px 8px',
+      padding: `${layoutPx(BODY_PAD_PX)} ${layoutPx(6)} ${layoutPx(BODY_PAD_PX)} ${layoutPx(8)}`,
       textAlign: 'right',
       color: `color-mix(in oklab, ${MUTED} 65%, transparent)`,
-      font: this.codeFont(),
+      ...this.codeFont(),
       userSelect: 'none',
       background: SURFACE,
-      borderRight: `1px solid color-mix(in oklab, ${BORDER} 60%, transparent)`,
+      borderRight: `${layoutPx(1)} solid color-mix(in oklab, ${BORDER} 60%, transparent)`,
     });
     for (let i = 0; i < lines.length; i++) {
       const number = document.createElement('div');
@@ -533,10 +647,10 @@ export class BubbleView {
     const pre = document.createElement('pre');
     Object.assign(pre.style, {
       margin: '0',
-      padding: '6px 10px',
+      padding: `${layoutPx(BODY_PAD_PX)} ${layoutPx(10)}`,
       flex: '1 1 auto',
       whiteSpace: 'pre',
-      font: this.codeFont(),
+      ...this.codeFont(),
     });
     const code = document.createElement('code');
     code.className = 'hljs-code';
@@ -547,11 +661,10 @@ export class BubbleView {
     this.body.append(row);
     if (content.truncated) {
       const cut = this.notice('truncated', 'var(--accent)', false);
-      cut.style.padding = '0 10px 6px';
+      cut.style.padding = `0 ${layoutPx(10)} ${layoutPx(6)}`;
       this.body.append(cut);
     }
     this.gutter = gutter;
-    this.pre = pre;
     this.code = code;
 
     // The highlighter is a lazy chunk; the escaped text above is what shows
@@ -569,19 +682,19 @@ export class BubbleView {
     Object.assign(paragraph.style, {
       display: 'flex',
       alignItems: 'center',
-      gap: '6px',
+      gap: layoutPx(6),
       margin: '0',
-      padding: '10px',
+      padding: layoutPx(10),
       color,
-      font: `11px/1.4 ${FONT_UI}`,
+      ...typeStyle(null, 11, '1.4', FONT_UI),
     });
     if (spinner) {
       const dot = document.createElement('span');
       Object.assign(dot.style, {
-        width: '9px',
-        height: '9px',
+        width: layoutPx(9),
+        height: layoutPx(9),
         borderRadius: '999px',
-        border: `1.5px solid color-mix(in oklab, ${MUTED} 55%, transparent)`,
+        border: `${layoutPx(1.5)} solid color-mix(in oklab, ${MUTED} 55%, transparent)`,
         borderTopColor: 'var(--accent)',
         // Animations are untouched by the app's transition-free rule: spinners
         // still spin (phase F).
@@ -653,19 +766,20 @@ export class BubbleView {
   }
 
   /**
-   * A marker's own size, in step with the type it annotates (B2.1).
+   * A marker's own size — a constant number of FRAME px (B2.3).
    *
-   * It rides a row whose height is the camera's now, so a fixed dot would
-   * swallow a zoomed-out row and get lost in a zoomed-in one. The floor keeps
-   * it clickable at the smallest readable type, and the ceiling keeps it
-   * inside the gutter's own left padding, which is the only space it has.
+   * It rides a row, and a row is now a fixed number of frame px at every zoom
+   * (the whole frame scales as one thing), so the dot that annotates it is
+   * fixed too. B2.1's floor and ceiling were there because the type changed
+   * size INSIDE a frame that did not; nothing does that any more, so they are
+   * gone rather than ported. Written through the layout scale like every other
+   * length in the frame, which is why nothing has to re-write it on a zoom.
    */
   private sizeMarker(marker: HTMLElement): void {
-    const size = Math.min(7, Math.max(3, MARKER_PX * this.textScale));
-    marker.style.width = `${size}px`;
-    marker.style.height = `${size}px`;
-    marker.style.marginTop = `${-size / 2}px`;
-    marker.style.left = `${-(size + 1)}px`;
+    marker.style.width = layoutPx(MARKER_PX);
+    marker.style.height = layoutPx(MARKER_PX);
+    marker.style.marginTop = layoutPx(-MARKER_PX / 2);
+    marker.style.left = layoutPx(-(MARKER_PX + MARKER_GAP_PX));
   }
 
   /** One callee opens straight away; several ask which one. */
@@ -685,14 +799,16 @@ export class BubbleView {
    * The app's own popover lives in React and this overlay is imperative, so
    * this is hand-rolled to the same rules the rest of the bubble follows —
    * inline styles against the app's CSS variables, no transition, dismissed by
-   * the next press anywhere. Its offsets are plain FRAME px, because it is a
-   * child of the frame and rides the frame's own scale — so the two screen
-   * measurements it starts from are divided back into frame px first (B2.2),
-   * and it lands beside its marker at any zoom.
+   * the next press anywhere. It is a child of the frame, so it positions in
+   * LAYOUT px: its own lengths go through the layout scale like the rest of
+   * the frame, and the two SCREEN measurements it starts from are divided by
+   * the root's transform (B2.3) rather than by the camera, because that is the
+   * factor standing between a client rect and a layout offset.
    */
   private showPicker(line: number, callees: BubbleCallSite[], marker: HTMLElement): void {
     this.closePicker();
-    const frame = this.frameScale > 0 ? this.frameScale : 1;
+    const font = this.fontScale;
+    const root = this.rootScale();
     const markerBox = marker.getBoundingClientRect();
     const rootBox = this.root.getBoundingClientRect();
 
@@ -700,21 +816,21 @@ export class BubbleView {
     Object.assign(picker.style, {
       position: 'absolute',
       zIndex: '2',
-      minWidth: '120px',
-      maxWidth: '240px',
-      maxHeight: '160px',
+      minWidth: layoutPx(120),
+      maxWidth: layoutPx(240),
+      maxHeight: layoutPx(160),
       overflowY: 'auto',
-      padding: '3px',
-      borderRadius: '6px',
-      border: `1px solid ${BORDER}`,
+      padding: layoutPx(3),
+      borderRadius: layoutPx(6),
+      border: `${layoutPx(1)} solid ${BORDER}`,
       background: 'var(--surface)',
-      boxShadow: '0 10px 30px rgba(0, 0, 0, 0.45)',
-      font: `500 11px/1.3 ${FONT_UI}`,
+      boxShadow: `0 ${layoutPx(10)} ${layoutPx(30)} rgba(0, 0, 0, 0.45)`,
+      ...typeStyle('500', 11, '1.3', FONT_UI),
     });
-    const left = Math.max(0, (markerBox.left - rootBox.left) / frame + 12);
-    const top = Math.max(0, (markerBox.bottom - rootBox.top) / frame + 4);
-    picker.style.left = `${Math.min(left, Math.max(0, this.width - 130))}px`;
-    picker.style.top = `${Math.min(top, Math.max(0, this.height - 40))}px`;
+    const left = Math.max(0, (markerBox.left - rootBox.left) / root + 12 * font);
+    const top = Math.max(0, (markerBox.bottom - rootBox.top) / root + 4 * font);
+    picker.style.left = `${Math.min(left, Math.max(0, (this.width - 130) * font))}px`;
+    picker.style.top = `${Math.min(top, Math.max(0, (this.height - 40) * font))}px`;
 
     for (const callee of callees) {
       const entry = document.createElement('button');
@@ -726,9 +842,9 @@ export class BubbleView {
       Object.assign(entry.style, {
         display: 'block',
         width: '100%',
-        padding: '3px 6px',
+        padding: `${layoutPx(3)} ${layoutPx(6)}`,
         border: 'none',
-        borderRadius: '4px',
+        borderRadius: layoutPx(4),
         background: 'transparent',
         color: callee.available ? 'var(--foreground)' : MUTED,
         font: 'inherit',
@@ -797,21 +913,22 @@ export class BubbleView {
         ? second.getBoundingClientRect().top - firstRect.top
         : firstRect.height;
     if (!(measured > 0)) return null;
-    const scale = this.textScale > 0 ? this.textScale : 1;
-    // `getBoundingClientRect` answers in SCREEN px, and since B2.2 the root
-    // carries a `scale()` — so the frame scale has to come back out of the
-    // measurement, or a row measured while zoomed out would be reported short
-    // by exactly that factor. `offsetHeight` / `offsetTop` below are layout px
-    // and a transform does not touch them, so they are read as they are.
+    // Two DOM units, two divisors, and which one applies is decided by what
+    // the property answers in (B2.3). `getBoundingClientRect` is SCREEN px —
+    // frame px through BOTH the layout scale and the root's transform, whose
+    // product is exactly the frame scale — so a row divides by that one
+    // number. `offsetHeight` / `offsetTop` are LAYOUT px, which a transform
+    // does not touch, so they divide by the layout scale alone.
     const frame = this.frameScale > 0 ? this.frameScale : 1;
+    const font = this.fontScale > 0 ? this.fontScale : 1;
     return {
-      headerHeight: this.header.offsetHeight,
-      padTop: first.offsetTop,
+      headerHeight: this.header.offsetHeight / font,
+      padTop: first.offsetTop / font,
       padBottom: BODY_PAD_PX,
-      // Reported at text scale 1: the anchor maths multiplies it back up by
-      // whatever the text is being drawn at, so there is one row height in the
-      // system rather than one per zoom level.
-      lineHeight: measured / scale / frame,
+      // In frame px, which is the same number at every zoom: the whole frame
+      // scales as one thing, so a row is a fixed share of the box that holds
+      // it and there is one row height in the system rather than one per zoom.
+      lineHeight: measured / frame,
       lineCount: gutter.childElementCount,
       firstLine: this.firstLine,
     };
@@ -820,13 +937,13 @@ export class BubbleView {
   // -------------------------------------------------------------- geometry ---
 
   /**
-   * The size of the frame, in FRAME px — the user's own number (B2.1), drawn
-   * through the camera's frame scale (B2.2).
+   * The size of the frame, in FRAME px — the user's own number, drawn through
+   * the camera's scale (B2.3).
    *
    * The camera does not appear here: it is a transform on the root, applied in
-   * {@link place}. What the user dragged the corner to is what the box is at
-   * camera 1 and above; below it the same box is drawn smaller, with every
-   * proportion inside it untouched.
+   * {@link place}. What the user dragged the corner to is the box's size in
+   * the WORLD; on screen it is that times the camera, in both directions, the
+   * way a disk is.
    */
   setSize(width: number, height: number): void {
     this.width = width;
@@ -834,32 +951,52 @@ export class BubbleView {
     this.applyBoxSize();
   }
 
+  /**
+   * The root's own box, in the LAYOUT px the frame is currently laid out at.
+   *
+   * Frame px × the layout scale — the other half of the deal the root
+   * transform (`frameScale / fontScale`) makes: multiply the two and the box
+   * on screen is frame px × frameScale, whatever the layout scale happens to
+   * be.
+   */
   private applyBoxSize(): void {
-    this.root.style.width = `${this.width}px`;
-    this.root.style.height = `${this.height}px`;
+    this.root.style.width = `${this.width * this.fontScale}px`;
+    this.root.style.height = `${this.height * this.fontScale}px`;
   }
 
-  private codeFont(): string {
-    return `${CODE_PX * this.textScale}px/${LINE_HEIGHT} ${FONT_MONO}`;
+  /** The source's own type. Frame px, so it scales with everything around it. */
+  private codeFont(): Record<string, string> {
+    return typeStyle(null, CODE_PX, LINE_HEIGHT, FONT_MONO);
+  }
+
+  /** What the root's transform scales by, as the controller last computed it. */
+  private rootScale(): number {
+    return this.currentRootScale;
   }
 
   /**
-   * Zoom the TEXT — the only thing the camera changes inside the frame.
+   * Re-lay the frame at a new size of type — the crisp half of B2.3's zoom.
    *
-   * Applied as a font size rather than as a transform, so the body reflows
-   * into a scrollport that has not moved: zoomed out, the same box holds more
-   * and smaller lines; zoomed in, fewer and larger ones. It is written only
-   * when the quantised scale actually changes, because every write is a real
-   * layout of every row.
+   * The transform is what zooms a bubble frame by frame, and a composited
+   * transform upscales a raster made at the old scale: smooth, and above
+   * camera 1 visibly soft. So when the camera SETTLES the controller hands the
+   * frame the scale it is actually being read at, the whole subtree is laid
+   * out that much larger through one custom property — type, chrome, paddings,
+   * borders and markers together — and the root's transform is divided by the
+   * same number. Nothing moves on screen; the glyphs are simply rasterised at
+   * the size they are being read at.
+   *
+   * A real layout of every row, so it is written only when the quantised scale
+   * changes, and only on a settled camera: a wheel gesture pays none of it.
    */
-  setTextScale(scale: number): void {
-    if (!(scale > 0) || scale === this.textScale) return;
-    this.textScale = scale;
-    const font = this.codeFont();
-    if (this.gutter) this.gutter.style.font = font;
-    if (this.pre) this.pre.style.font = font;
-    // The gutter's call markers are body content too: they ride the rows.
-    for (const marker of this.markers.values()) this.sizeMarker(marker);
+  setFontScale(scale: number): void {
+    if (!(scale > 0) || scale === this.fontScale) return;
+    this.fontScale = scale;
+    this.root.style.setProperty(LAYOUT_VAR, String(scale));
+    // The box is in frame px and the DOM is in layout px, so the two writes
+    // that bridge them go together: a size that lagged the property by a frame
+    // would draw the frame at the wrong aspect for that frame.
+    this.applyBoxSize();
   }
 
   /**
@@ -869,18 +1006,22 @@ export class BubbleView {
    * This is deliberately the ONLY thing that happens to a bubble on a normal
    * frame — one string compare and (at most) one style write, no React, no
    * layout read, and nothing that touches the canvas or its snapshot. The
-   * frame's own `width`/`height` are still not in here, because they are the
-   * user's own CSS px and only a resize changes them: what the camera changes
-   * is the `scale()` those px are drawn through (B2.2), which is a composited
-   * transform and reflows nothing.
+   * frame's own `width`/`height` are still not in here, because they change
+   * only on a resize or a re-layout: what the camera changes is the `scale()`
+   * those px are drawn through (B2.3), which is a composited transform and
+   * reflows nothing.
    */
-  place(x: number, y: number, label: boolean, frameScale: number): void {
-    const scale = Number.isFinite(frameScale) && frameScale > 0 ? frameScale : 1;
-    if (scale !== this.frameScale) {
-      this.frameScale = scale;
-      // Cancel the root's scale for the label only, so the one thing on a
+  place(x: number, y: number, label: boolean, frameScale: number, rootScale: number): void {
+    this.frameScale = Number.isFinite(frameScale) && frameScale > 0 ? frameScale : 1;
+    // What the camera asks for, less what this frame's layout has already
+    // taken — computed by the controller, from the same helper the canvas
+    // reasons about, so there is exactly one division in the system.
+    const root = Number.isFinite(rootScale) && rootScale > 0 ? rootScale : 1;
+    if (root !== this.currentRootScale) {
+      this.currentRootScale = root;
+      // Cancel the root's transform for the label only, so the one thing on a
       // zoomed-out bubble that has to stay readable does.
-      this.label.style.transform = scale === 1 ? 'none' : `scale(${1 / scale})`;
+      this.label.style.transform = root === 1 ? 'none' : `scale(${1 / root})`;
     }
     if (label !== this.isLabel) {
       this.isLabel = label;
@@ -894,9 +1035,9 @@ export class BubbleView {
       this.body.style.visibility = label ? 'hidden' : 'visible';
     }
     const transform =
-      scale === 1
+      root === 1
         ? `translate3d(${x}px, ${y}px, 0)`
-        : `translate3d(${x}px, ${y}px, 0) scale(${scale})`;
+        : `translate3d(${x}px, ${y}px, 0) scale(${root})`;
     if (transform !== this.lastTransform) {
       this.lastTransform = transform;
       this.root.style.transform = transform;
@@ -913,11 +1054,12 @@ export class BubbleView {
     if (!gutter) return;
     const index = Math.max(0, Math.min(gutter.childElementCount - 1, line - this.firstLine));
     const row = gutter.children[index];
-    if (row instanceof HTMLElement) this.setScrollTop(row.offsetTop);
+    // `offsetTop` is layout px, and this class hands out frame px.
+    if (row instanceof HTMLElement) this.setScrollTop(row.offsetTop / this.fontScale);
   }
 
   /**
-   * Scroll the body from code rather than from a gesture.
+   * Scroll the body from code rather than from a gesture, in FRAME px.
    *
    * Marked, so the scroll event it provokes is reported as the echo it is —
    * see {@link BubbleViewCallbacks.onScroll}.
@@ -925,7 +1067,7 @@ export class BubbleView {
   setScrollTop(value: number): void {
     if (!Number.isFinite(value)) return;
     this.selfScrollAt = performance.now();
-    this.body.scrollTop = value;
+    this.body.scrollTop = value * this.fontScale;
   }
 
   destroy(): void {
