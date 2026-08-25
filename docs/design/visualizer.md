@@ -1660,6 +1660,126 @@ native scrolling and a highlighter are all things a 2D context does badly.
   header already has — deliberately not attempted before the read path has been
   used in anger.
 
+### Code bubbles (B2) — call tracing (additive; no contract item changed)
+
+B1 pinned source to the workspace and tied each box to the wedge it came from.
+B2 ties the boxes to **each other**, along the calls between them: a thread
+leaves the exact line that makes the call, a marker in that line's gutter opens
+the callee as the next bubble, and the workspace becomes something you can walk
+a flow through rather than a set of quotations. B1's explicit non-goal ("no call
+tethers between bubbles… drawing half of them would be worse than drawing none")
+is retired here by drawing all three cases at once — bubble→bubble, bubble→wedge,
+and the marker that turns the second into the first.
+
+- **The caller anchor is a LINE, not a box.** A thread leaves the border facing
+  the callee at the vertical centre of its call-site row: `content top + (line −
+  first displayed line) × line-height × scale − scrollTop × scale`. Four
+  regimes, each an honest answer rather than a degenerate case of the first —
+  `line` (the row is displayed and on screen), `clamped` (the row is scrolled
+  out of view or outside the displayed range: the anchor slides to the content's
+  top or bottom edge and reports that it did), `header` (the edge carries no
+  line — some resolvers do not record one — so the thread claims the BUBBLE and
+  no position in it), and `chip` (collapsed: the chip is the whole affordance).
+  The callee end is always the callee's header (or chip), and the direction dot
+  sits there, so a thread is directed the way B1's tether already is. It is one
+  exported pure function (`bubbleCallAnchor`), total over every input, because a
+  NaN in a bezier blanks a frame.
+- **The geometry it runs on is measured ONCE.** `BubbleView.bodyGeometry()`
+  reads header height, gutter padding, row height, row count and first line out
+  of the DOM on a content load, and the controller caches it. A frame does
+  arithmetic over those numbers and nothing else: twenty threads on screen cost
+  zero layout reads. A body that was a chip when its content landed has nothing
+  to measure, so the one frame the chip opens back into a box re-measures the
+  bubbles that still carry the fallback metrics.
+- **The gutter marker plan is a pure mapping.** `mapBubbleCallSites(edges,
+  spans, scope)` → `Map<displayed line, callee ids>`, built once per content
+  load or expand and never per frame. Only `calls` edges: a marker that
+  sometimes meant "this line mentions that" would make the whole column
+  untrustworthy. The **containment rule** is what makes an expanded FILE bubble
+  work — a file bubble displays many symbols and the outgoing calls belong to
+  those symbols, not to the file node — so an edge counts when its source is the
+  bubble's own node **or** a node whose file is this file and whose WHOLE span
+  falls inside the displayed range. Partial overlap is excluded deliberately: a
+  symbol half of which is off the top is a symbol whose call sites this bubble
+  cannot honestly claim to be showing. The tethers apply the same rule through
+  the same exported predicate (`bubbleCallSiteInScope`), so the marker column and
+  the threads can never disagree about which edges a bubble owns.
+- **Dedupe: by (caller bubble, callee bubble, kind, line).** Two call sites on
+  different lines are two threads — that is the phase's whole claim — while the
+  same relation recorded twice is one. Kind stays in the key because a `calls`
+  and a `references` between the same pair are two relations, and the legend can
+  switch one of them off independently. Threads are drawn for `calls` and
+  `references` only: `references` earns its place because that is what the
+  framework resolvers emit for a route reaching its handler, the flow developers
+  trace most and the one with no `calls` edge to ride. Imports, extends and
+  instantiates are structure rather than flow and stay with the disks.
+- **Click a marker to open the callee.** It lands to the RIGHT of its caller,
+  level with the call site, so a traced chain reads left to right the way the
+  calls do. A callee that is already open is never duplicated — it is raised and
+  its thread **flashes** for 900ms, which answers "where did that go" without
+  putting a second copy of the same code on the canvas. Several callees on one
+  line get a minimal picker (hand-rolled to the overlay's own rules: inline
+  styles, no transition, dismissed by the next press anywhere), one callee opens
+  straight away. A callee with **no source** — external, unresolved — is listed
+  dim and inert, and its marker's title says why: a no-op with a reason, never
+  an error.
+- **The origin model gains a second case.** B1 knew one origin, the WEDGE a
+  bubble was dragged out of. A bubble opened from a marker has a different one —
+  the caller's own call site — and pointing it at a wedge would claim the disk
+  sent it. Such a bubble therefore draws no wedge tether at all; its thread IS
+  the call tether, which is drawn while both boxes are open and simply stops
+  existing when the caller is closed. The caller is remembered by NODE id (with
+  the line), so the link survives being written down and read back, where bubble
+  ids do not; both fields are optional, so a pre-B2 workspace restores unchanged
+  and a stored caller that no longer resolves demotes the bubble to an ordinary
+  one instead of dropping it.
+- **Bubble→wedge threads are SUBORDINATE, and capped.** A call whose callee is
+  not open as a bubble but IS visible as a wedge (the legend-aware notion ⌘P
+  uses; nearest wedge on screen when several disks show it) gets the same thread
+  in a fainter, thinner amber, so the workspace reads as one system without the
+  disk threads competing with the bubble-to-bubble ones. **At most 24 are drawn
+  per frame, nearest first, chosen from at most 400 candidates per bubble**: a
+  file bubble with eight hundred calls must not be able to wallpaper the canvas,
+  and both bounds keep the per-frame cost independent of the file's size.
+- **Still chrome, still invisible to the blit.** Every thread is drawn in the
+  chrome pass, after `captureSnapshot`, in screen space, from the live camera —
+  so it cannot be baked into a blitted frame and it tracks a pan, a zoom, a
+  bubble drag and a bubble SCROLL live. Scrolling a body now marks the scene
+  dirty (it did not in B1, where nothing on the canvas depended on the scroll
+  offset): a scroll is not a camera gesture, so it must never reuse the
+  snapshot. No third `requestCameraDraw` site, and the flash keeps the frame
+  loop alive the way the ⌘P pulse does without ever blocking the blit.
+- **Colour is the relation vocabulary, not the workspace one.** Unlike the
+  expansion tether — which is the workspace saying "that subtree is over there"
+  — a call thread IS a relation in the code, so it borrows the direction
+  palette's OUTGOING amber (it leaves the caller) and the provenance rule that
+  goes with it: a synthesized hop is **dashed** and carries its `synthesizedBy`
+  name at the curve's midpoint, which is the one fact a dashed line cannot say
+  on its own.
+- Probed with throwaway numeric probes over the real exported helpers, bundled
+  with esbuild. **Anchors:** 20,000 random rect × scale × metrics × scroll ×
+  range × line cases — **0 violations** across finiteness, the side/border
+  choice, the closed-form recheck of every in-range line, the top/bottom edge of
+  every clamped one, the chip collapse and monotonicity in `line` (7,002 `line`,
+  8,157 `clamped`, 2,500 `chip`, 2,341 `header` — every branch exercised).
+  **Mapping:** 12,000 random synthetic edge/node sets against a brute-force
+  oracle — **0 violations** over 68,020 marked lines and 71,038 callee entries,
+  with no line outside the displayed range and no callee set differing from the
+  oracle's. **Mutation controls**, each the real bundle with one operator
+  changed: dropping the scroll term is caught on 7,434 of 20,000 anchor cases,
+  clamping to the box top instead of the content top on 1,958, and counting the
+  line the wrong way round on 8,999 (plus 123 monotonicity failures); loosening
+  containment to overlap is caught on 7,093 of 12,000 mapping cases, dropping
+  the kind filter on 10,823, and dropping the range filter on 5,430 — so the
+  zeroes above are results, not tautologies.
+- **Explicit non-goals this phase.** No **incoming** threads (a disk wedge
+  calling into an open bubble draws nothing — outgoing only, so the direction
+  the picture claims is always the direction it means). No **auto-layout of
+  chains**: an opened callee is placed once, beside its caller, and is a normal
+  bubble from that moment on — draggable, closable, persisted — because packing
+  a traced chain would move boxes the user put somewhere on purpose. No
+  editing, still: the read path goes first (B1's note stands).
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all

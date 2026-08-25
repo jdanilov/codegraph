@@ -34,6 +34,26 @@ export interface BubbleViewCallbacks {
   onToggleExpand(): void;
   /** Open the node's file at its first line in the configured editor. */
   onOpenInEditor(): void;
+  /**
+   * A gutter call marker was used: open this callee as a bubble of its own
+   * (phase B2). The line is a REAL file line, the same one the gutter prints.
+   */
+  onOpenCallee(line: number, calleeId: string): void;
+}
+
+/**
+ * One callee reachable from a displayed line (phase B2).
+ *
+ * `available` is false for a node the index knows by name but has no source
+ * for — an unresolved or external target. Such an entry is still LISTED, dim
+ * and inert: "this line calls that, and there is nothing to open" is an answer,
+ * where hiding it would silently under-report what the line does.
+ */
+export interface BubbleCallSite {
+  id: string;
+  name: string;
+  kind: string;
+  available: boolean;
 }
 
 /** The header's fixed facts. `loc` is the span's own line count. */
@@ -59,6 +79,28 @@ const FONT_MONO = 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace';
 const FONT_UI = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif';
 const LINE_HEIGHT = '1.55';
 const CODE_PX = 11;
+/** The gutter call marker (phase B2): a muted dot, an accent one under the pointer. */
+const MARKER_COLOR = `color-mix(in oklab, ${MUTED} 70%, transparent)`;
+const MARKER_COLOR_HOT = 'var(--accent)';
+const MARKER_COLOR_DEAD = `color-mix(in oklab, ${MUTED} 32%, transparent)`;
+
+/**
+ * What the body's geometry is, in UNSCALED CSS px — measured from the DOM, once
+ * per content load, and handed to the controller so the call-tether anchor is
+ * arithmetic rather than a per-frame layout read.
+ */
+export interface BubbleBodyGeometry {
+  /** Top of the box to the first content pixel. */
+  headerHeight: number;
+  /** The first row's own top offset inside the scrolling body. */
+  padTop: number;
+  /** One source row, top to top. */
+  lineHeight: number;
+  /** Rows currently rendered. */
+  lineCount: number;
+  /** Real file line of the first row. */
+  firstLine: number;
+}
 
 export class BubbleView {
   readonly root: HTMLDivElement;
@@ -68,6 +110,7 @@ export class BubbleView {
   private readonly headerKind: HTMLSpanElement;
   private readonly headerLoc: HTMLSpanElement;
   private readonly expandButton: HTMLButtonElement;
+  private readonly header: HTMLDivElement;
   private readonly body: HTMLDivElement;
   private readonly chipLabel: HTMLSpanElement;
   private readonly callbacks: BubbleViewCallbacks;
@@ -82,6 +125,13 @@ export class BubbleView {
   private height = 0;
   /** Rising per render, so a highlighter that lands late cannot paint a stale body. */
   private renderSeq = 0;
+  /** Scale the last {@link place} drew at — the picker positions in box units. */
+  private lastScale = 1;
+  /** Gutter call markers by REAL file line (phase B2). */
+  private readonly markers = new Map<number, HTMLElement>();
+  /** The open callee picker, and the listener that dismisses it. */
+  private picker: HTMLDivElement | null = null;
+  private dismissPicker: ((event: PointerEvent) => void) | null = null;
 
   constructor(parent: HTMLElement, callbacks: BubbleViewCallbacks) {
     this.callbacks = callbacks;
@@ -143,7 +193,7 @@ export class BubbleView {
       boxShadow: '0 10px 30px rgba(0, 0, 0, 0.45)',
     });
 
-    const header = document.createElement('div');
+    const header = (this.header = document.createElement('div'));
     Object.assign(header.style, {
       display: 'flex',
       alignItems: 'center',
@@ -327,6 +377,8 @@ export class BubbleView {
     const seq = ++this.renderSeq;
     this.gutter = null;
     this.code = null;
+    this.markers.clear();
+    this.closePicker();
     this.body.replaceChildren();
 
     if (content.status === 'loading') {
@@ -426,6 +478,201 @@ export class BubbleView {
     return paragraph;
   }
 
+  // ------------------------------------------------------- call markers ---
+
+  /**
+   * Put a marker in the gutter of every displayed line that calls something
+   * (phase B2) — the tracing loop's entry point.
+   *
+   * Deliberately the quietest affordance the view has: a 5px dot in the
+   * gutter's own padding, muted like the line numbers it sits beside, brighter
+   * under the pointer. The callees are on its `title`, which is the same
+   * hover idiom the header's buttons use, so nothing new has to be learnt and
+   * nothing is painted that the eye has to skip over while reading code.
+   *
+   * The whole map is applied at once, after a content load: the gutter rows are
+   * the layout the marker rides, so a marker cannot exist before them and must
+   * be rebuilt whenever they are.
+   */
+  setCallSites(sites: ReadonlyMap<number, BubbleCallSite[]>): void {
+    this.closePicker();
+    for (const marker of this.markers.values()) marker.remove();
+    this.markers.clear();
+    const gutter = this.gutter;
+    if (!gutter || sites.size === 0) return;
+
+    for (const [line, callees] of sites) {
+      if (callees.length === 0) continue;
+      const row = gutter.children[line - this.firstLine];
+      if (!(row instanceof HTMLElement)) continue;
+      const openable = callees.filter((callee) => callee.available);
+      const names = callees.map((callee) => callee.name).join(', ');
+
+      const marker = document.createElement('span');
+      Object.assign(marker.style, {
+        position: 'absolute',
+        left: '-7px',
+        top: '50%',
+        width: '5px',
+        height: '5px',
+        marginTop: '-2.5px',
+        borderRadius: '999px',
+        background: openable.length > 0 ? MARKER_COLOR : MARKER_COLOR_DEAD,
+        cursor: openable.length > 0 ? 'pointer' : 'default',
+      });
+      marker.title =
+        openable.length > 0
+          ? `calls ${names} — click to open`
+          : `calls ${names} — no source in the index`;
+      marker.addEventListener('pointerenter', () => {
+        if (openable.length > 0) marker.style.background = MARKER_COLOR_HOT;
+      });
+      marker.addEventListener('pointerleave', () => {
+        marker.style.background = openable.length > 0 ? MARKER_COLOR : MARKER_COLOR_DEAD;
+      });
+      marker.addEventListener('click', (event) => {
+        event.stopPropagation();
+        this.onMarkerClick(line, callees, marker);
+      });
+      row.style.position = 'relative';
+      row.append(marker);
+      this.markers.set(line, marker);
+    }
+  }
+
+  /** One callee opens straight away; several ask which one. */
+  private onMarkerClick(line: number, callees: BubbleCallSite[], marker: HTMLElement): void {
+    const openable = callees.filter((callee) => callee.available);
+    if (openable.length === 0) return; // The title already says why. Never an error.
+    if (openable.length === 1) {
+      this.callbacks.onOpenCallee(line, openable[0]!.id);
+      return;
+    }
+    this.showPicker(line, callees, marker);
+  }
+
+  /**
+   * The multi-callee picker: a minimal list beside the marker.
+   *
+   * The app's own popover lives in React and this overlay is imperative, so
+   * this is hand-rolled to the same rules the rest of the bubble follows —
+   * inline styles against the app's CSS variables, no transition, dismissed by
+   * the next press anywhere. It positions in BOX units (screen offsets divided
+   * by the scale the bubble is drawn at), so it lands beside its marker at any
+   * zoom without knowing anything about the camera.
+   */
+  private showPicker(line: number, callees: BubbleCallSite[], marker: HTMLElement): void {
+    this.closePicker();
+    const scale = this.lastScale > 0 ? this.lastScale : 1;
+    const markerBox = marker.getBoundingClientRect();
+    const rootBox = this.root.getBoundingClientRect();
+
+    const picker = document.createElement('div');
+    Object.assign(picker.style, {
+      position: 'absolute',
+      zIndex: '2',
+      minWidth: '120px',
+      maxWidth: '240px',
+      maxHeight: '160px',
+      overflowY: 'auto',
+      padding: '3px',
+      borderRadius: '6px',
+      border: `1px solid ${BORDER}`,
+      background: 'var(--surface)',
+      boxShadow: '0 10px 30px rgba(0, 0, 0, 0.45)',
+      font: `500 11px/1.3 ${FONT_UI}`,
+    });
+    const left = Math.max(0, (markerBox.left - rootBox.left) / scale + 12);
+    const top = Math.max(0, (markerBox.bottom - rootBox.top) / scale + 4);
+    picker.style.left = `${Math.min(left, Math.max(0, this.width - 130))}px`;
+    picker.style.top = `${Math.min(top, Math.max(0, this.height - 40))}px`;
+
+    for (const callee of callees) {
+      const entry = document.createElement('button');
+      entry.type = 'button';
+      entry.textContent = callee.name;
+      entry.title = callee.available
+        ? `${callee.kind} — open as a bubble`
+        : `${callee.kind} — no source in the index`;
+      Object.assign(entry.style, {
+        display: 'block',
+        width: '100%',
+        padding: '3px 6px',
+        border: 'none',
+        borderRadius: '4px',
+        background: 'transparent',
+        color: callee.available ? 'var(--foreground)' : MUTED,
+        font: 'inherit',
+        textAlign: 'left',
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        cursor: callee.available ? 'pointer' : 'default',
+      });
+      if (callee.available) {
+        entry.addEventListener('pointerenter', () => {
+          entry.style.background = 'color-mix(in oklab, var(--border) 60%, transparent)';
+        });
+        entry.addEventListener('pointerleave', () => {
+          entry.style.background = 'transparent';
+        });
+        entry.addEventListener('click', (event) => {
+          event.stopPropagation();
+          this.closePicker();
+          this.callbacks.onOpenCallee(line, callee.id);
+        });
+      }
+      picker.append(entry);
+    }
+
+    this.root.append(picker);
+    this.picker = picker;
+    const dismiss = (event: PointerEvent): void => {
+      if (event.target instanceof Node && picker.contains(event.target)) return;
+      this.closePicker();
+    };
+    this.dismissPicker = dismiss;
+    // Capture, so a press that the canvas or another bubble swallows still
+    // closes this: a menu that outlives the gesture that left it is a bug.
+    document.addEventListener('pointerdown', dismiss, true);
+  }
+
+  private closePicker(): void {
+    if (this.dismissPicker) {
+      document.removeEventListener('pointerdown', this.dismissPicker, true);
+      this.dismissPicker = null;
+    }
+    this.picker?.remove();
+    this.picker = null;
+  }
+
+  /**
+   * The body's measured geometry, or `null` while there is no source in it.
+   *
+   * Read ONCE per content load (the controller caches it): a call tether's
+   * anchor is then pure arithmetic over these numbers, and a frame never
+   * touches the DOM to find out where a line is.
+   */
+  bodyGeometry(): BubbleBodyGeometry | null {
+    const gutter = this.gutter;
+    if (!gutter || gutter.childElementCount === 0) return null;
+    const first = gutter.children[0];
+    if (!(first instanceof HTMLElement)) return null;
+    const second = gutter.children[1];
+    const lineHeight =
+      second instanceof HTMLElement && second.offsetTop > first.offsetTop
+        ? second.offsetTop - first.offsetTop
+        : first.offsetHeight;
+    if (!(lineHeight > 0)) return null;
+    return {
+      headerHeight: this.header.offsetHeight,
+      padTop: first.offsetTop,
+      lineHeight,
+      lineCount: gutter.childElementCount,
+      firstLine: this.firstLine,
+    };
+  }
+
   // -------------------------------------------------------------- geometry ---
 
   /** The size of the EXPANDED box, in unscaled CSS px. */
@@ -454,8 +701,12 @@ export class BubbleView {
    * layout read, and nothing that touches the canvas or its snapshot.
    */
   place(x: number, y: number, scale: number, chip: boolean): void {
+    this.lastScale = scale;
     if (chip !== this.isChip) {
       this.isChip = chip;
+      // A chip has no gutter on screen, so a picker hanging off one would be a
+      // menu attached to nothing.
+      if (chip) this.closePicker();
       this.chip.style.display = chip ? 'flex' : 'none';
       this.full.style.display = chip ? 'none' : 'flex';
       // The chip carries its own size; the root must stop claiming the box's
@@ -495,6 +746,8 @@ export class BubbleView {
 
   destroy(): void {
     this.renderSeq++;
+    this.closePicker();
+    this.markers.clear();
     this.root.remove();
   }
 }

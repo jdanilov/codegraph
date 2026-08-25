@@ -36,7 +36,7 @@
 import { fetchSource, openInEditor } from '@/lib/api';
 import { formatNumber } from '@/lib/utils';
 
-import { BubbleView } from './bubble-view';
+import { BubbleView, type BubbleCallSite } from './bubble-view';
 import {
   bundleControlPoints,
   bundleCurve,
@@ -171,6 +171,13 @@ export interface StoredBubble {
   scrollTop: number;
   /** Showing the whole file rather than the symbol's own span. */
   expanded: boolean;
+  /**
+   * Phase B2, both optional so a pre-B2 workspace restores unchanged: the NODE
+   * whose call site opened this bubble, and the line it was called on. The
+   * caller is re-found by node id on restore, since bubble ids are per-session.
+   */
+  originNodeId?: string;
+  originLine?: number;
 }
 
 /**
@@ -425,6 +432,56 @@ const TETHER_HIT_PX = 6;
 /** Ring around the focused disk's centre, drawn only once there are several. */
 const FOCUS_RING = 'rgba(125, 211, 252, 0.55)';
 
+/**
+ * Phase B2 — the call thread between two bubbles.
+ *
+ * Unlike the workspace tether above, this one IS a relation in the code, so it
+ * borrows the vocabulary relations already have: the OUTGOING amber of the
+ * direction palette (it leaves the caller), dashed when the hop was synthesized
+ * rather than parsed. What it adds is where it leaves FROM — the call-site line
+ * itself, not the box — which is the whole point of the phase.
+ */
+const CALL_TETHER_COLOR = 'rgba(245, 165, 36, 0.66)';
+/**
+ * Relations that draw a thread between bubbles.
+ *
+ * `calls` is the phase's subject. `references` earns its place because that is
+ * the kind the framework resolvers emit for a route reaching its handler — the
+ * flow a developer traces most often and the one that has no `calls` edge to
+ * ride. Everything else (imports, extends, instantiates…) is structure rather
+ * than flow, and belongs to the disks that already draw it.
+ */
+const CALL_TETHER_KINDS = new Set(['calls', 'references']);
+/** A bubble that was raised instead of re-opened flashes its thread, briefly. */
+const CALL_TETHER_COLOR_HOT = 'rgba(250, 204, 21, 0.95)';
+/**
+ * The same thread when the callee is only a WEDGE: deliberately subordinate —
+ * thinner and much fainter — so a workspace of bubbles reads as one system
+ * without the disk threads competing with the bubble-to-bubble ones.
+ */
+const CALL_DISK_TETHER_COLOR = 'rgba(245, 165, 36, 0.26)';
+const CALL_TETHER_WIDTH_PX = 1.4;
+const CALL_DISK_TETHER_WIDTH_PX = 0.9;
+const CALL_TETHER_DOT_PX = 2.8;
+/** Bezier arm as a share of the gap, the shape the bubble tether already uses. */
+const CALL_TETHER_ARM_SHARE = 0.45;
+const CALL_TETHER_MIN_ARM = 10;
+/** How long a re-raised bubble's thread stays hot. */
+const CALL_FLASH_MS = 900;
+/**
+ * Cap on bubble→WEDGE threads per frame, nearest first.
+ *
+ * A file bubble can carry hundreds of outgoing calls, and drawing every one of
+ * them to a wedge would wallpaper the canvas with exactly the noise the disks
+ * avoid by hiding edges at rest. Two bounds: at most this many are DRAWN, and
+ * at most {@link CALL_DISK_TETHER_SCAN} are examined to find them, so the
+ * per-frame cost has a ceiling that does not depend on the file's size.
+ */
+const CALL_DISK_TETHER_MAX = 24;
+const CALL_DISK_TETHER_SCAN = 400;
+/** Where a callee bubble lands: this far right of the caller's box, in SCREEN px. */
+const CALL_OPEN_GAP_PX = 28;
+
 interface DrawnEdge {
   edge: ModelEdge;
   points: Point[];
@@ -657,6 +714,52 @@ interface BubbleState {
   pendingLine: number | null;
   /** Width of the collapsed chip, from the label it has to hold. */
   chipWidth: number;
+
+  // ---- phase B2: call tracing. All of this is rebuilt on a content load, and
+  // never on a frame — a frame does anchor arithmetic and drawing, nothing else.
+  /** Where this bubble came from. A wedge (B1) or another bubble's call site. */
+  origin: BubbleOrigin;
+  /** Outgoing relations of everything this bubble displays, cached. */
+  calls: BubbleCall[];
+  /** Displayed line → callee node ids, the gutter's marker plan. */
+  callLines: Map<number, string[]>;
+  /** Measured body geometry, or the fallback until there is a body to measure. */
+  metrics: BubbleBodyMetrics;
+  /** Has {@link BubbleView.bodyGeometry} answered for the CURRENT content yet? */
+  measured: boolean;
+  /** Real file line of the first displayed row, and how many rows there are. */
+  firstLine: number;
+  lineCount: number;
+  /** `performance.now()` this bubble's threads stop flashing at (0 = not). */
+  flashUntil: number;
+}
+
+/**
+ * Where a bubble's thread goes back to (phase B2 extends B1's single case).
+ *
+ * B1 knew one origin: the WEDGE the bubble was dragged out of. A bubble opened
+ * from a gutter call marker has a different one — the caller's own call site —
+ * and pointing it at a wedge instead would claim the disk sent it, which is not
+ * what happened. The caller is held by NODE id rather than by bubble id so the
+ * link survives being written down and read back, where bubble ids do not.
+ */
+export type BubbleOrigin =
+  | { kind: 'wedge' }
+  | { kind: 'bubble'; callerNodeId: string; line: number | null };
+
+/**
+ * One outgoing relation of a bubble, cached at content-load time.
+ *
+ * `line` is the call site in the CALLER's file, 1-indexed, and is absent on
+ * edges whose resolver did not record one — which the anchor maths treats as
+ * "this bubble calls it" rather than "this line does".
+ */
+interface BubbleCall {
+  targetId: string;
+  line: number | null;
+  kind: string;
+  heuristic: boolean;
+  synthesizedBy?: string;
 }
 
 /** What a pointer gesture turned out to be. See {@link CanvasController}. */
@@ -852,6 +955,8 @@ export class CanvasController {
   private bubbles: BubbleState[] = [];
   private bubbleSeq = 0;
   private bubbleZ = 1;
+  /** Were bubbles chips on the last frame? Drives the one re-measure (phase B2). */
+  private bubblesWereChips = false;
 
   constructor(container: HTMLElement, callbacks: CanvasCallbacks) {
     this.container = container;
@@ -1087,15 +1192,24 @@ export class CanvasController {
         })),
       // `scrollTop` is the cached value the scroll handler keeps, never a live
       // DOM read: this runs on the pointer's cadence while a disk is dragged.
-      bubbles: this.bubbles.map((bubble) => ({
-        nodeId: bubble.nodeId,
-        x: bubble.x,
-        y: bubble.y,
-        w: bubble.w,
-        h: bubble.h,
-        scrollTop: bubble.scrollTop,
-        expanded: bubble.expanded,
-      })),
+      bubbles: this.bubbles.map((bubble) => {
+        const stored: StoredBubble = {
+          nodeId: bubble.nodeId,
+          x: bubble.x,
+          y: bubble.y,
+          w: bubble.w,
+          h: bubble.h,
+          scrollTop: bubble.scrollTop,
+          expanded: bubble.expanded,
+        };
+        // Phase B2: a bubble opened from a call marker remembers WHICH call
+        // opened it, by node id — bubble ids are per-session, node ids are not.
+        if (bubble.origin.kind === 'bubble') {
+          stored.originNodeId = bubble.origin.callerNodeId;
+          if (bubble.origin.line !== null) stored.originLine = bubble.origin.line;
+        }
+        return stored;
+      }),
     };
   }
 
@@ -1145,6 +1259,17 @@ export class CanvasController {
     for (const stored of workspace.bubbles ?? []) {
       if (!stored || !model.nodes.has(stored.nodeId)) continue;
       if (!Number.isFinite(stored.x) || !Number.isFinite(stored.y)) continue;
+      // A stored caller that no longer resolves demotes the bubble to an
+      // ordinary one (origin `wedge`) rather than dropping it: the code it
+      // shows is still worth showing, it just has nothing to hang a thread on.
+      const origin: BubbleOrigin =
+        stored.originNodeId && model.nodes.has(stored.originNodeId)
+          ? {
+              kind: 'bubble',
+              callerNodeId: stored.originNodeId,
+              line: Number.isFinite(stored.originLine) ? stored.originLine! : null,
+            }
+          : { kind: 'wedge' };
       this.createBubble({
         nodeId: stored.nodeId,
         x: stored.x,
@@ -1154,6 +1279,7 @@ export class CanvasController {
         scrollTop: Number.isFinite(stored.scrollTop) ? stored.scrollTop : 0,
         expanded: Boolean(stored.expanded),
         sourceDiskId: null,
+        origin,
       });
     }
 
@@ -1295,6 +1421,7 @@ export class CanvasController {
       scrollTop: 0,
       expanded: false,
       sourceDiskId,
+      origin: { kind: 'wedge' },
     });
     this.notifyWorkspace();
   }
@@ -1309,6 +1436,7 @@ export class CanvasController {
     scrollTop: number;
     expanded: boolean;
     sourceDiskId: string | null;
+    origin: BubbleOrigin;
   }): BubbleState | null {
     const model = this.model;
     const node = model?.get(init.nodeId);
@@ -1326,6 +1454,7 @@ export class CanvasController {
       onScroll: (scrollTop) => this.bubbleScrolled(id, scrollTop),
       onToggleExpand: () => this.toggleBubbleExpand(id),
       onOpenInEditor: () => this.openBubbleInEditor(id),
+      onOpenCallee: (line, calleeId) => this.openCallee(id, line, calleeId),
     });
 
     const bubble: BubbleState = {
@@ -1343,6 +1472,14 @@ export class CanvasController {
       requestSeq: 0,
       pendingLine: null,
       chipWidth: BUBBLE_CHIP_MIN_WIDTH,
+      origin: init.origin,
+      calls: [],
+      callLines: new Map(),
+      metrics: BUBBLE_METRICS_FALLBACK,
+      measured: false,
+      firstLine: node.startLine,
+      lineCount: 0,
+      flashUntil: 0,
     };
     this.bubbles.push(bubble);
     view.setSize(size.w, size.h);
@@ -1408,12 +1545,18 @@ export class CanvasController {
           truncated: span.truncated,
         });
         this.refreshBubbleHeader(bubble, Math.max(1, span.endLine - span.startLine + 1));
+        // The call cache is rebuilt HERE and only here: what a bubble displays
+        // is what decides which edges are its own, and that changes exactly
+        // when the text does (a load, an expand, a re-index).
+        this.rebuildBubbleCalls(bubble, span.startLine, span.endLine, span.file);
         if (bubble.pendingLine !== null) {
           bubble.view.scrollToLine(bubble.pendingLine);
           bubble.pendingLine = null;
         } else if (bubble.scrollTop > 0) {
           bubble.view.setScrollTop(bubble.scrollTop);
         }
+        // The tethers are chrome and their anchors just changed under them.
+        this.requestDraw();
       })
       .catch((error: unknown) => {
         if (seq !== bubble.requestSeq || !this.bubbles.includes(bubble)) return;
@@ -1475,7 +1618,11 @@ export class CanvasController {
     const bubble = this.bubbleById(id);
     if (!bubble || bubble.scrollTop === scrollTop) return;
     bubble.scrollTop = scrollTop;
-    // No redraw: scrolling a bubble changes nothing on the canvas.
+    // Phase B2: a call thread leaves the call-site LINE, so scrolling the body
+    // moves every thread that leaves this bubble. It goes through the ordinary
+    // dirty path — a scroll is not a camera gesture, so it must never reuse the
+    // snapshot — and the chrome pass re-derives the anchors from the new offset.
+    this.requestDraw();
     this.notifyWorkspace();
   }
 
@@ -1535,6 +1682,16 @@ export class CanvasController {
         presentation.chip
       );
     }
+    // A body inside a CHIP has no layout to measure, so a bubble whose content
+    // landed while it was collapsed is still carrying the fallback metrics.
+    // Measure those — and only those — the one frame the chip opens back into a
+    // box; on every other frame this is a boolean compare (phase B2).
+    if (this.bubblesWereChips && !presentation.chip) {
+      for (const bubble of this.bubbles) {
+        if (!bubble.measured) this.measureBubbleBody(bubble);
+      }
+    }
+    this.bubblesWereChips = presentation.chip;
   }
 
   /**
@@ -1604,6 +1761,11 @@ export class CanvasController {
     ctx.strokeStyle = TETHER_COLOR;
     ctx.lineWidth = TETHER_WIDTH_PX;
     for (const bubble of this.bubbles) {
+      // A bubble opened from a call marker has a CALLER, not a wedge, for an
+      // origin (phase B2): its thread is the call tether, drawn separately and
+      // leaving the exact line that opened it. Drawing a wedge tether as well
+      // would give it two origins, only one of which is true.
+      if (bubble.origin.kind === 'bubble') continue;
       const anchor = this.bubbleAnchor(bubble);
       if (!anchor) continue;
       const curve = bubbleTetherAnchor(this.bubbleScreenRect(bubble), anchor.point, anchor.out);
@@ -1628,6 +1790,470 @@ export class CanvasController {
       ctx.fill();
       ctx.stroke();
     }
+  }
+
+  // -------------------------------------------- code bubbles: call tracing ---
+
+  /**
+   * Rebuild everything a bubble knows about its outgoing relations (phase B2).
+   *
+   * Called on a content load and nowhere else. Two products, both cached:
+   *
+   *  - `calls` — the outgoing `calls`/`references` edges of everything the
+   *    bubble DISPLAYS, each with the call-site line the tether will leave by;
+   *  - `callLines` — the gutter's marker plan, `mapBubbleCallSites`.
+   *
+   * The edge lookup rides the model's existing per-node adjacency index, so
+   * this is O(the displayed subtree's edges) once, never a scan of the graph
+   * and never per frame. A frame does anchor arithmetic over `calls` and
+   * nothing else.
+   */
+  private rebuildBubbleCalls(
+    bubble: BubbleState,
+    firstLine: number,
+    lastLine: number,
+    file: string
+  ): void {
+    bubble.firstLine = firstLine;
+    bubble.lineCount = Math.max(0, lastLine - firstLine + 1);
+    bubble.measured = false;
+    this.measureBubbleBody(bubble);
+
+    bubble.calls = [];
+    bubble.callLines = new Map();
+    const model = this.model;
+    if (!model) {
+      bubble.view.setCallSites(new Map());
+      return;
+    }
+
+    // What this bubble displays: its own node and everything under it, plus —
+    // once it has been expanded to the whole file — that file's own subtree,
+    // which is where a file bubble's calls actually come from.
+    const scopeIds = new Set<string>([bubble.nodeId, ...model.descendants(bubble.nodeId)]);
+    if (bubble.expanded) {
+      const fileId = this.fileNodeOf(bubble.nodeId);
+      if (fileId) {
+        scopeIds.add(fileId);
+        for (const id of model.descendants(fileId)) scopeIds.add(id);
+      }
+    }
+
+    const scope: BubbleCallSiteScope = {
+      ownerId: bubble.nodeId,
+      file,
+      firstLine: bubble.firstLine,
+      lastLine: bubble.firstLine + Math.max(0, bubble.lineCount - 1),
+    };
+    const spans = new Map<string, BubbleCallSiteSpan>();
+    const candidates: BubbleCallSiteEdge[] = [];
+    const outgoing: ModelEdge[] = [];
+    for (const id of scopeIds) {
+      const node = model.get(id);
+      if (node) spans.set(id, { file: node.file, startLine: node.startLine, endLine: node.endLine });
+      for (const edge of model.edgesOf(id)) {
+        if (edge.source !== id) continue;
+        if (!CALL_TETHER_KINDS.has(edge.kind)) continue;
+        outgoing.push(edge);
+        const candidate: BubbleCallSiteEdge = {
+          source: edge.source,
+          target: edge.target,
+          kind: edge.kind,
+        };
+        if (edge.line !== undefined) candidate.line = edge.line;
+        candidates.push(candidate);
+      }
+    }
+
+    bubble.callLines = mapBubbleCallSites(candidates, spans, scope);
+
+    // The tether list. Same containment rule as the gutter (they must never
+    // disagree about which edges a bubble owns), and the same dedupe: two
+    // identical relations recorded twice are one thread, while two call sites
+    // on different lines are two — that is the phase's whole claim.
+    const seen = new Set<string>();
+    for (const edge of outgoing) {
+      if (!bubbleCallSiteInScope(spans, scope, edge.source)) continue;
+      const line =
+        edge.line !== undefined && edge.line >= scope.firstLine && edge.line <= scope.lastLine
+          ? Math.floor(edge.line)
+          : null;
+      const key = `${edge.target}|${edge.kind}|${line ?? ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const call: BubbleCall = {
+        targetId: edge.target,
+        line,
+        kind: edge.kind,
+        heuristic: edge.heuristic,
+      };
+      if (edge.synthesizedBy) call.synthesizedBy = edge.synthesizedBy;
+      bubble.calls.push(call);
+    }
+
+    this.publishCallSites(bubble);
+  }
+
+  /** Hand the view its marker plan, with the names and openability the gutter shows. */
+  private publishCallSites(bubble: BubbleState): void {
+    const model = this.model;
+    const sites = new Map<number, BubbleCallSite[]>();
+    for (const [line, targets] of model ? bubble.callLines : new Map<number, string[]>()) {
+      const entries: BubbleCallSite[] = [];
+      for (const id of targets) {
+        const node = model?.get(id);
+        if (!node) continue;
+        entries.push({
+          id,
+          name: node.name,
+          kind: node.kind,
+          available: this.bubbleable(id),
+        });
+      }
+      if (entries.length > 0) sites.set(line, entries);
+    }
+    bubble.view.setCallSites(sites);
+  }
+
+  /** The `file` node a bubble's node belongs to — itself, or the nearest ancestor. */
+  private fileNodeOf(nodeId: string): string | null {
+    const model = this.model;
+    if (!model) return null;
+    if (model.get(nodeId)?.kind === 'file') return nodeId;
+    for (const ancestor of model.ancestors(nodeId)) {
+      if (model.get(ancestor)?.kind === 'file') return ancestor;
+    }
+    return null;
+  }
+
+  /**
+   * Read the body's geometry back out of the DOM — once per content load.
+   *
+   * The one layout read a bubble ever costs. Everything the tethers do
+   * afterwards is arithmetic over these three numbers, so a frame with twenty
+   * threads on it still touches the DOM exactly zero times.
+   */
+  private measureBubbleBody(bubble: BubbleState): boolean {
+    const geometry = bubble.view.bodyGeometry();
+    if (!geometry) return false;
+    bubble.measured = true;
+    bubble.metrics = {
+      headerHeight: geometry.headerHeight,
+      padTop: geometry.padTop,
+      lineHeight: geometry.lineHeight,
+    };
+    bubble.firstLine = geometry.firstLine;
+    bubble.lineCount = geometry.lineCount;
+    return true;
+  }
+
+  /** The bubble showing `nodeId`, if one is open — the topmost, so a raise wins. */
+  private bubbleForNode(nodeId: string): BubbleState | null {
+    let best: BubbleState | null = null;
+    for (const bubble of this.bubbles) {
+      if (bubble.nodeId !== nodeId) continue;
+      if (!best || bubble.z > best.z) best = bubble;
+    }
+    return best;
+  }
+
+  /**
+   * The caller-side anchor of one thread: the call-site line, on the border
+   * that faces the other end.
+   */
+  private bubbleCallAnchorOf(
+    bubble: BubbleState,
+    line: number | null,
+    towardX: number
+  ): BubbleCallAnchorPoint {
+    const presentation = bubblePresentation(this.scale());
+    return bubbleCallAnchor({
+      rect: this.bubbleScreenRect(bubble),
+      chip: presentation.chip,
+      scale: presentation.scale,
+      metrics: bubble.metrics,
+      firstLine: bubble.firstLine,
+      lineCount: bubble.lineCount,
+      scrollTop: bubble.scrollTop,
+      line,
+      towardX,
+    });
+  }
+
+  /** The callee-side anchor: the header (or the chip), on the facing border. */
+  private bubbleHeaderAnchor(bubble: BubbleState, towardX: number): BubbleCallAnchorPoint {
+    return this.bubbleCallAnchorOf(bubble, null, towardX);
+  }
+
+  /**
+   * Click-to-open, the other half of the tracing loop (phase B2).
+   *
+   * The callee lands to the RIGHT of its caller, level with the call site, so a
+   * traced chain reads left to right the way the calls do. A callee that is
+   * already open is not duplicated — it is raised and its thread flashes, which
+   * answers "where did that go" without adding a second copy of the same code
+   * to the workspace. A callee with no source (external, unresolved) is a
+   * no-op: the marker's own title says why, and nothing errors.
+   */
+  private openCallee(callerId: string, line: number, calleeId: string): void {
+    const caller = this.bubbleById(callerId);
+    const model = this.model;
+    if (!caller || !model || !model.get(calleeId)) return;
+
+    const existing = this.bubbleForNode(calleeId);
+    if (existing) {
+      this.raiseBubble(existing.id);
+      existing.flashUntil = performance.now() + CALL_FLASH_MS;
+      this.requestDraw();
+      return;
+    }
+    if (!this.bubbleable(calleeId)) return;
+
+    const scale = this.scale();
+    const origin = this.origin();
+    const rect = this.bubbleScreenRect(caller);
+    const anchor = this.bubbleCallAnchorOf(caller, line, Number.POSITIVE_INFINITY);
+    const presentation = bubblePresentation(scale);
+    // Screen px back into world units: the box is scaled by the hybrid rule,
+    // the workspace by the camera, so the gap crosses both.
+    const x = (rect.x + rect.w + CALL_OPEN_GAP_PX - origin.x) / scale;
+    const y = (anchor.y - origin.y) / scale - (caller.metrics.headerHeight * presentation.scale) / scale;
+
+    this.createBubble({
+      nodeId: calleeId,
+      x,
+      y,
+      w: caller.w,
+      h: caller.h,
+      scrollTop: 0,
+      expanded: false,
+      sourceDiskId: null,
+      origin: { kind: 'bubble', callerNodeId: caller.nodeId, line },
+    });
+    this.notifyWorkspace();
+  }
+
+  /**
+   * Call threads, in SCREEN space, in the chrome pass — the phase's picture.
+   *
+   * Chrome for exactly the reasons B1's origin tether is: drawn after
+   * `captureSnapshot`, recomputed from the live camera, so it can never be
+   * baked into a blitted frame and it follows a pan, a zoom, a bubble drag and
+   * a bubble SCROLL live. Two passes, and the order is the subordination: the
+   * fainter bubble→wedge threads go down first, the bubble→bubble ones on top.
+   */
+  private drawBubbleCallTethers(ctx: CanvasRenderingContext2D): void {
+    if (this.bubbles.length === 0) return;
+    const byNode = new Map<string, BubbleState[]>();
+    for (const bubble of this.bubbles) {
+      const list = byNode.get(bubble.nodeId);
+      if (list) list.push(bubble);
+      else byNode.set(bubble.nodeId, [bubble]);
+    }
+    this.drawBubbleDiskTethers(ctx, byNode);
+    this.drawBubbleToBubbleTethers(ctx, byNode);
+  }
+
+  /** Threads whose callee is another open bubble. */
+  private drawBubbleToBubbleTethers(
+    ctx: CanvasRenderingContext2D,
+    byNode: Map<string, BubbleState[]>
+  ): void {
+    const now = performance.now();
+    const drawn = new Set<string>();
+    for (const bubble of this.bubbles) {
+      for (const call of bubble.calls) {
+        if (!this.enabledKinds.has(call.kind)) continue;
+        const targets = byNode.get(call.targetId);
+        if (!targets) continue;
+        for (const target of targets) {
+          if (target === bubble) continue;
+          // Exact duplicates collapse; two call sites on different lines do not.
+          const key = `${bubble.id}|${target.id}|${call.kind}|${call.line ?? ''}`;
+          if (drawn.has(key)) continue;
+          drawn.add(key);
+
+          const targetRect = this.bubbleScreenRect(target);
+          const sourceRect = this.bubbleScreenRect(bubble);
+          const from = this.bubbleCallAnchorOf(bubble, call.line, targetRect.x + targetRect.w / 2);
+          const to = this.bubbleHeaderAnchor(target, sourceRect.x + sourceRect.w / 2);
+          const hot = target.flashUntil > now || bubble.flashUntil > now;
+          this.strokeCallTether(ctx, from, to, {
+            color: hot ? CALL_TETHER_COLOR_HOT : CALL_TETHER_COLOR,
+            width: hot ? CALL_TETHER_WIDTH_PX * 1.8 : CALL_TETHER_WIDTH_PX,
+            dashed: call.heuristic,
+            label: call.heuristic ? (call.synthesizedBy ?? 'synthesized') : null,
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Threads whose callee is not open as a bubble but IS on screen as a wedge.
+   *
+   * Capped at {@link CALL_DISK_TETHER_MAX}, nearest first, from at most
+   * {@link CALL_DISK_TETHER_SCAN} candidates per bubble: a file bubble with
+   * eight hundred calls must not be able to wallpaper the canvas, and the
+   * nearest threads are the ones whose geometry the eye can actually follow.
+   * Visibility is the legend-aware one ⌘P uses — a wedge a filter switched off
+   * is not on screen, so nothing is drawn to where it would have been.
+   */
+  private drawBubbleDiskTethers(
+    ctx: CanvasRenderingContext2D,
+    byNode: Map<string, BubbleState[]>
+  ): void {
+    type Candidate = {
+      from: BubbleCallAnchorPoint;
+      to: Point;
+      out: Point;
+      distance: number;
+      call: BubbleCall;
+    };
+    const candidates: Candidate[] = [];
+    for (const bubble of this.bubbles) {
+      let scanned = 0;
+      const rect = this.bubbleScreenRect(bubble);
+      const centre = { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
+      for (const call of bubble.calls) {
+        if (scanned >= CALL_DISK_TETHER_SCAN) break;
+        scanned += 1;
+        if (!this.enabledKinds.has(call.kind)) continue;
+        if (byNode.has(call.targetId)) continue; // A bubble owns it — see above.
+        const wedge = this.nearestVisibleWedge(call.targetId, centre);
+        if (!wedge) continue;
+        candidates.push({
+          from: this.bubbleCallAnchorOf(bubble, call.line, wedge.point.x),
+          to: wedge.point,
+          out: wedge.out,
+          distance: wedge.distance,
+          call,
+        });
+      }
+    }
+    if (candidates.length === 0) return;
+    candidates.sort((a, b) => a.distance - b.distance);
+    for (const candidate of candidates.slice(0, CALL_DISK_TETHER_MAX)) {
+      this.strokeCallTether(
+        ctx,
+        candidate.from,
+        { x: candidate.to.x, y: candidate.to.y, side: 'right', clamped: false, mode: 'header' },
+        {
+          color: CALL_DISK_TETHER_COLOR,
+          width: CALL_DISK_TETHER_WIDTH_PX,
+          dashed: candidate.call.heuristic,
+          label: null,
+          endOut: candidate.out,
+        }
+      );
+    }
+  }
+
+  /**
+   * The nearest disk that renders `nodeId` as a visible wedge, and how far its
+   * centroid is from `from` on screen.
+   *
+   * "Renders" is `diskShowing`'s notion — a wedge of its own, not hidden by the
+   * legend — because a thread to a `+N` fold or to an ancestor would point at
+   * something that is not the callee.
+   */
+  private nearestVisibleWedge(
+    nodeId: string,
+    from: Point
+  ): { point: Point; out: Point; distance: number } | null {
+    const origin = this.origin();
+    const scale = this.scale();
+    let best: { point: Point; out: Point; distance: number } | null = null;
+    for (const disk of this.disks) {
+      const arc = disk.layout?.byNode.get(nodeId);
+      if (!arc || this.isHiddenArc(arc)) continue;
+      const centroid = arcCentroid(arc);
+      const point = {
+        x: origin.x + (disk.x + centroid.x) * scale,
+        y: origin.y + (disk.y + centroid.y) * scale,
+      };
+      const distance = Math.hypot(point.x - from.x, point.y - from.y);
+      if (best && best.distance <= distance) continue;
+      const mid = (arc.a0 + arc.a1) / 2;
+      best = { point, out: { x: Math.cos(mid), y: Math.sin(mid) }, distance };
+    }
+    return best;
+  }
+
+  /**
+   * One thread: a cubic that leaves the caller sideways and arrives at the
+   * callee sideways, with the direction dot at the CALLEE end.
+   *
+   * Horizontal arms rather than the wedge tether's radial ones — two boxes are
+   * side by side, so a thread that leaves and arrives horizontally reads as a
+   * flow across the workspace instead of a lasso around it.
+   */
+  private strokeCallTether(
+    ctx: CanvasRenderingContext2D,
+    from: BubbleCallAnchorPoint,
+    to: BubbleCallAnchorPoint,
+    style: {
+      color: string;
+      width: number;
+      dashed: boolean;
+      label: string | null;
+      endOut?: Point;
+    }
+  ): void {
+    if (!Number.isFinite(from.x) || !Number.isFinite(from.y)) return;
+    if (!Number.isFinite(to.x) || !Number.isFinite(to.y)) return;
+    const gap = Math.hypot(to.x - from.x, to.y - from.y);
+    if (!(gap > 1e-6)) return;
+    const arm = Math.min(Math.max(CALL_TETHER_MIN_ARM, gap * CALL_TETHER_ARM_SHARE), gap / 2);
+    const outX = from.side === 'right' ? arm : -arm;
+    const endArm = style.endOut
+      ? { x: style.endOut.x * arm, y: style.endOut.y * arm }
+      : { x: to.side === 'right' ? arm : -arm, y: 0 };
+
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = style.color;
+    ctx.lineWidth = style.width;
+    ctx.setLineDash(style.dashed ? [5, 4] : []);
+    ctx.beginPath();
+    ctx.moveTo(from.x, from.y);
+    ctx.bezierCurveTo(
+      from.x + outX,
+      from.y,
+      to.x + endArm.x,
+      to.y + endArm.y,
+      to.x,
+      to.y
+    );
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // The direction dot, at the end that is the CALLEE: without it a thread
+    // between two boxes is undirected, and "which of these two calls the
+    // other" is the one thing it exists to say.
+    ctx.beginPath();
+    ctx.arc(to.x, to.y, CALL_TETHER_DOT_PX, 0, Math.PI * 2);
+    ctx.fillStyle = BACKGROUND;
+    ctx.fill();
+    ctx.stroke();
+
+    if (style.label) {
+      // A synthesized hop is dashed like every other heuristic relation, and
+      // says WHO wired it — the one fact a dashed line cannot carry on its own.
+      ctx.font = '500 9px ui-sans-serif, system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = style.color;
+      ctx.fillText(style.label, (from.x + to.x) / 2, (from.y + to.y) / 2 - 6);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+    }
+  }
+
+  /** Is any bubble's thread still flashing? Keeps the frame loop alive if so. */
+  private bubblesFlashing(): boolean {
+    if (this.bubbles.length === 0) return false;
+    const now = performance.now();
+    return this.bubbles.some((bubble) => bubble.flashUntil > now);
   }
 
   /** Drop every bubble — a different project has different nodes. */
@@ -2496,11 +3122,14 @@ export class CanvasController {
     ctx.globalAlpha = 1;
     this.drawDiskChrome(ctx);
     this.drawBubbleTethers(ctx);
+    this.drawBubbleCallTethers(ctx);
     this.drawGhost(ctx);
 
     // Two things keep the frame loop alive on their own: the ⌘P pulse, and the
     // camera-settle window that owes the labels one more (full) pass.
-    if (this.pulseNodeId !== null || this.cameraSettling()) this.scheduleFrame();
+    if (this.pulseNodeId !== null || this.cameraSettling() || this.bubblesFlashing()) {
+      this.scheduleFrame();
+    }
 
     // The edge count is part of the summary, and it only ever changes here.
     if (this.drawnEdges.length !== this.emittedEdges) this.emitSummary();
@@ -2590,9 +3219,12 @@ export class CanvasController {
     ctx.globalAlpha = 1;
     this.drawDiskChrome(ctx);
     this.drawBubbleTethers(ctx);
+    this.drawBubbleCallTethers(ctx);
     this.drawGhost(ctx);
 
-    if (this.pulseNodeId !== null || this.cameraSettling()) this.scheduleFrame();
+    if (this.pulseNodeId !== null || this.cameraSettling() || this.bubblesFlashing()) {
+      this.scheduleFrame();
+    }
     return true;
   }
 
@@ -4717,6 +5349,238 @@ export function bubbleTetherAnchor(
     control2: { x: wedge.x + ox * arm, y: wedge.y + oy * arm },
     end: { x: wedge.x, y: wedge.y },
   };
+}
+
+// --------------------------------------------- code bubbles: call tracing ---
+
+/** A finite number, or the fallback — every input below one of these comes from the DOM. */
+function finiteOr(value: number | undefined | null, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * A bubble body's geometry in UNSCALED CSS px, as the anchor maths needs it.
+ *
+ * Measured from the DOM once per content load and cached: a frame must never
+ * ask the layout where a line is, or a canvas of bubbles would pay a forced
+ * reflow per tether per frame.
+ */
+export interface BubbleBodyMetrics {
+  headerHeight: number;
+  padTop: number;
+  lineHeight: number;
+}
+
+/**
+ * What a bubble reads at before it has ever been measured — the CSS in
+ * `bubble-view.ts` (11px text at 1.55, a 4px-padded 11px/1.2 header, 6px of
+ * gutter padding). Used for the frame or two between a spawn and its content,
+ * and for a bubble that is still a chip, so an anchor is always a NUMBER.
+ */
+export const BUBBLE_METRICS_FALLBACK: BubbleBodyMetrics = {
+  headerHeight: 22,
+  padTop: 6,
+  lineHeight: 17,
+};
+
+export type BubbleAnchorMode = 'line' | 'clamped' | 'header' | 'chip';
+
+/** Everything the caller-side anchor depends on. All screen px except `metrics`/`scrollTop`. */
+export interface BubbleCallAnchorInput {
+  /** What the bubble occupies on screen this frame — box or chip. */
+  rect: BubbleRect;
+  /** Collapsed: there is no body, so there is no line to point at. */
+  chip: boolean;
+  /** The BUBBLE's scale (the hybrid-zoom rule), not the camera's. */
+  scale: number;
+  metrics: BubbleBodyMetrics;
+  /** Real file line of the first displayed row. */
+  firstLine: number;
+  /** Rows displayed — 0 while the fetch is in flight. */
+  lineCount: number;
+  /** The body's scroll offset, in unscaled CSS px. */
+  scrollTop: number;
+  /** The call-site line, or `null` when the edge does not carry one. */
+  line: number | null;
+  /** Screen x of the other end: the tether leaves by the border facing it. */
+  towardX: number;
+}
+
+export interface BubbleCallAnchorPoint {
+  x: number;
+  y: number;
+  side: 'left' | 'right';
+  /** The line is not where the anchor is: scrolled away, or outside the range. */
+  clamped: boolean;
+  mode: BubbleAnchorMode;
+}
+
+/**
+ * Where a call tether leaves its CALLER — the exact call-site line (phase B2).
+ *
+ * This is the whole of what makes a bubble-to-bubble tether say something a
+ * box-to-box line cannot: it leaves the line that makes the call, so scrolling
+ * the body walks the thread up and down the code. Four regimes, and each is a
+ * different honest answer rather than a degenerate case of the first:
+ *
+ *  - **`line`** — the row is displayed and on screen: the anchor is its middle,
+ *    on the border facing the callee.
+ *  - **`clamped`** — the row exists but is scrolled out of view, or lies
+ *    outside the displayed range altogether: the anchor slides to the content's
+ *    top or bottom edge and says so, so the caller can draw it as "up there" /
+ *    "down there" instead of pretending to point at a line that is not there.
+ *  - **`header`** — the edge carries no line at all (some resolvers do not
+ *    record one): the thread hangs off the header, which claims the BUBBLE and
+ *    not a position in it.
+ *  - **`chip`** — collapsed to a title chip: the chip is the whole affordance,
+ *    so the anchor is its edge and nothing pretends there is a body.
+ *
+ * Pure and total: every branch returns finite numbers for any input, because a
+ * NaN here would silently poison a bezier and blank a frame.
+ */
+export function bubbleCallAnchor(input: BubbleCallAnchorInput): BubbleCallAnchorPoint {
+  const x = finiteOr(input.rect.x, 0);
+  const y = finiteOr(input.rect.y, 0);
+  const w = Math.max(0, finiteOr(input.rect.w, 0));
+  const h = Math.max(0, finiteOr(input.rect.h, 0));
+  const centreX = x + w / 2;
+  const side: 'left' | 'right' = finiteOr(input.towardX, centreX) >= centreX ? 'right' : 'left';
+  const bx = side === 'right' ? x + w : x;
+
+  if (input.chip) return { x: bx, y: y + h / 2, side, clamped: false, mode: 'chip' };
+
+  const scale = Math.max(1e-6, finiteOr(input.scale, 1));
+  const headerHeight = Math.max(
+    0,
+    finiteOr(input.metrics?.headerHeight, BUBBLE_METRICS_FALLBACK.headerHeight)
+  );
+  const padTop = Math.max(0, finiteOr(input.metrics?.padTop, BUBBLE_METRICS_FALLBACK.padTop));
+  const lineHeight = Math.max(
+    1e-6,
+    finiteOr(input.metrics?.lineHeight, BUBBLE_METRICS_FALLBACK.lineHeight)
+  );
+
+  const header = Math.min(headerHeight * scale, h);
+  const top = y + header;
+  const bottom = y + h;
+  const count = Math.max(0, Math.floor(finiteOr(input.lineCount, 0)));
+  const line = input.line;
+
+  if (line === null || !Number.isFinite(line) || count === 0 || !(bottom > top)) {
+    return { x: bx, y: y + header / 2, side, clamped: false, mode: 'header' };
+  }
+
+  const first = Math.floor(finiteOr(input.firstLine, 1));
+  const last = first + count - 1;
+  if (line < first || line > last) {
+    return { x: bx, y: line < first ? top : bottom, side, clamped: true, mode: 'clamped' };
+  }
+
+  const scrollTop = Math.max(0, finiteOr(input.scrollTop, 0));
+  const offset = padTop + (line - first) * lineHeight + lineHeight / 2 - scrollTop;
+  const candidate = top + offset * scale;
+  if (candidate < top) return { x: bx, y: top, side, clamped: true, mode: 'clamped' };
+  if (candidate > bottom) return { x: bx, y: bottom, side, clamped: true, mode: 'clamped' };
+  return { x: bx, y: candidate, side, clamped: false, mode: 'line' };
+}
+
+/** The shape of a graph edge this mapping cares about. */
+export interface BubbleCallSiteEdge {
+  source: string;
+  target: string;
+  kind: string;
+  line?: number;
+}
+
+/** A node's own extent, as the containment rule reads it. */
+export interface BubbleCallSiteSpan {
+  file: string;
+  startLine: number;
+  endLine: number;
+}
+
+/** The bubble the mapping is for: its node, its file, and what it displays. */
+export interface BubbleCallSiteScope {
+  ownerId: string;
+  file: string;
+  firstLine: number;
+  lastLine: number;
+}
+
+/**
+ * Does `id`'s own source live inside what this bubble displays?
+ *
+ * The containment rule of {@link mapBubbleCallSites}, exported on its own
+ * because the call TETHERS need exactly the same answer for the same reason —
+ * the two must never disagree about which edges a bubble owns.
+ */
+export function bubbleCallSiteInScope(
+  spans: ReadonlyMap<string, BubbleCallSiteSpan>,
+  scope: BubbleCallSiteScope,
+  id: string
+): boolean {
+  if (id === scope.ownerId) return true;
+  const span = spans.get(id);
+  if (!span || span.file !== scope.file) return false;
+  const first = Math.floor(finiteOr(scope.firstLine, 1));
+  const last = Math.floor(finiteOr(scope.lastLine, 0));
+  return (
+    Number.isFinite(span.startLine) &&
+    Number.isFinite(span.endLine) &&
+    span.endLine >= span.startLine &&
+    span.startLine >= first &&
+    span.endLine <= last
+  );
+}
+
+/**
+ * Displayed line → the callees called on it (phase B2).
+ *
+ * Built ONCE per content load or expand, never per frame — it is the gutter's
+ * marker plan and it changes only when the text does.
+ *
+ * The containment rule is what makes an expanded FILE bubble work. A file
+ * bubble displays many symbols, and the outgoing calls belong to those symbols,
+ * not to the file node: an edge therefore counts when its source is the
+ * bubble's own node, **or** a node whose file is this file and whose whole span
+ * falls inside the displayed range. Partial overlap is deliberately excluded —
+ * a symbol half of which is off the top is a symbol whose call sites this
+ * bubble cannot honestly claim to be showing.
+ *
+ * Only `calls` edges: the gutter marker means "this line calls that", and a
+ * marker that sometimes meant "this line mentions that" would make the whole
+ * column untrustworthy. Callees are deduped per line, first seen first.
+ */
+export function mapBubbleCallSites(
+  edges: readonly BubbleCallSiteEdge[],
+  spans: ReadonlyMap<string, BubbleCallSiteSpan>,
+  scope: BubbleCallSiteScope
+): Map<number, string[]> {
+  const out = new Map<number, string[]>();
+  const first = Math.floor(finiteOr(scope.firstLine, 1));
+  const last = Math.floor(finiteOr(scope.lastLine, 0));
+  if (!(last >= first)) return out;
+
+  const decided = new Map<string, boolean>();
+  const inScope = (id: string): boolean => {
+    const cached = decided.get(id);
+    if (cached !== undefined) return cached;
+    const ok = bubbleCallSiteInScope(spans, scope, id);
+    decided.set(id, ok);
+    return ok;
+  };
+
+  for (const edge of edges) {
+    if (edge.kind !== 'calls') continue;
+    if (edge.line === undefined || !Number.isFinite(edge.line)) continue;
+    const at = Math.floor(edge.line);
+    if (at < first || at > last) continue;
+    if (!inScope(edge.source)) continue;
+    const list = out.get(at);
+    if (!list) out.set(at, [edge.target]);
+    else if (!list.includes(edge.target)) list.push(edge.target);
+  }
+  return out;
 }
 
 // ------------------------------------------------------------------ blit ---
