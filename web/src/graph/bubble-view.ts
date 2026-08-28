@@ -16,6 +16,8 @@
  * the source view's own theme, which is exactly the point: the two views colour
  * code identically.
  */
+import type { SpanChangeMarks } from '@/graph/changes';
+import { CHANGE_ADDED_COLOR, CHANGE_REMOVED_COLOR } from '@/graph/palette';
 import {
   escapeHtml,
   highlightWith,
@@ -144,6 +146,11 @@ function layoutPx(n: number): string {
   return `calc(${n}px * var(${LAYOUT_VAR}, 1))`;
 }
 
+/** `1 line` / `4 lines` — the change marks' tooltips count real lines. */
+function plural(count: number): string {
+  return count === 1 ? '1 line' : `${count} lines`;
+}
+
 /**
  * Type, as LONGHANDS rather than as the `font` shorthand.
  *
@@ -183,6 +190,28 @@ const MARKER_GAP_PX = 1;
 const MARKER_COLOR = `color-mix(in oklab, ${MUTED} 70%, transparent)`;
 const MARKER_COLOR_HOT = 'var(--accent)';
 const MARKER_COLOR_DEAD = `color-mix(in oklab, ${MUTED} 32%, transparent)`;
+
+/**
+ * The change decoration (B4.6), in FRAME px like every other length here.
+ *
+ * Two marks, and the difference between them is the difference between a line
+ * and a seam:
+ *
+ *  - an ADDED line is a row, so it is painted as a row — a bar down the gutter
+ *    and a wash across the code, both applied to the row's grid CELLS so a
+ *    line that wrapped over four visual rows is marked over all four (B3);
+ *  - a REMOVAL is not a row at all, so it is a hairline across the top of the
+ *    row it happened above. Deleted text is deliberately never rendered: it
+ *    would need rows the file does not have, and every line number under them
+ *    would then disagree with the file.
+ *
+ * The colours are the canvas's own change colours, imported rather than
+ * re-typed, so a bubble's gutter and the sub-wedges on the disk (B4.3) can
+ * never claim two different greens for one edit.
+ */
+const CHANGE_BAR_PX = 2;
+const CHANGE_ADDED_GUTTER = `color-mix(in oklab, ${CHANGE_ADDED_COLOR} 22%, ${SURFACE})`;
+const CHANGE_ADDED_CODE = `color-mix(in oklab, ${CHANGE_ADDED_COLOR} 10%, transparent)`;
 
 /**
  * What the body's geometry is, in FRAME px — measured from the DOM, once per
@@ -316,6 +345,17 @@ export class BubbleView {
   private selfScrollAt = 0;
   /** Gutter call markers by REAL file line (phase B2). */
   private readonly markers = new Map<number, HTMLElement>();
+  /**
+   * Row cells currently wearing a change mark, with the background they wore
+   * before it (B4.6).
+   *
+   * Kept as a list rather than recomputed: switching the changes toggle off has
+   * to put every touched cell back exactly as it was, and the two columns have
+   * different resting backgrounds — so the value to restore is remembered at
+   * the moment it is overwritten instead of being re-derived from a rule that
+   * could drift from the one that styled the row.
+   */
+  private changeMarked: Array<{ el: HTMLElement; background: string }> = [];
   /** The open callee picker, and the listener that dismisses it. */
   private picker: HTMLDivElement | null = null;
   private dismissPicker: ((event: PointerEvent) => void) | null = null;
@@ -669,6 +709,11 @@ export class BubbleView {
     this.gutterCells = [];
     this.codeCells = [];
     this.markers.clear();
+    // The rows the marks were applied to are about to be thrown away, so the
+    // record of what to restore goes with them; the controller re-applies once
+    // the new rows exist (there is no correct way to carry a mark across a
+    // body whose line numbering may have moved).
+    this.changeMarked = [];
     this.closePicker();
     this.body.replaceChildren();
 
@@ -1001,6 +1046,101 @@ export class BubbleView {
     }
     this.picker?.remove();
     this.picker = null;
+  }
+
+  // ----------------------------------------------------- change marks ---
+
+  /**
+   * Show what changed since `HEAD` on the rows this bubble is displaying
+   * (B4.6) — or, with `null`, show none of it.
+   *
+   * Governed by the same `showChanges` switch as the disk's sub-wedges and by
+   * nothing else: the controller passes `null` the moment the toggle goes off,
+   * and passes marks again the moment it comes back on, without the bubble
+   * being respawned or its source re-fetched.
+   *
+   * Applied as ONE pass over the rows a diff actually touched, whenever the
+   * content, the toggle or the index moves — never per frame. A frame's whole
+   * job for a bubble is one CSS transform ({@link place}), and a decoration
+   * that had to be re-applied per frame would put a layout write on the camera
+   * path for every bubble on screen.
+   *
+   * Lines outside the displayed span are the caller's problem, not this one's:
+   * a mark for a line the body does not show is silently dropped, which is what
+   * makes it safe to hand a bubble the whole file's diff.
+   */
+  setChangeMarks(marks: SpanChangeMarks | null): void {
+    for (const entry of this.changeMarked) {
+      entry.el.style.background = entry.background;
+      entry.el.style.boxShadow = '';
+      entry.el.removeAttribute('title');
+    }
+    this.changeMarked = [];
+    const rows = this.gutterCells.length;
+    if (!marks || rows === 0) return;
+
+    // One intent per touched row, built first so a row that is both added and
+    // preceded by a deletion is written once with both marks rather than twice
+    // with the second overwriting the first.
+    interface RowMark {
+      added: boolean;
+      removedAbove: number;
+      removedBelow: number;
+    }
+    const intents = new Map<number, RowMark>();
+    const intentAt = (index: number): RowMark | null => {
+      if (index < 0 || index >= rows) return null;
+      let intent = intents.get(index);
+      if (!intent) {
+        intent = { added: false, removedAbove: 0, removedBelow: 0 };
+        intents.set(index, intent);
+      }
+      return intent;
+    };
+
+    for (const line of marks.added) {
+      const intent = intentAt(line - this.firstLine);
+      if (intent) intent.added = true;
+    }
+    for (const seam of marks.removedBefore) {
+      const intent = intentAt(seam.line - this.firstLine);
+      if (intent) intent.removedAbove += seam.count;
+    }
+    if (marks.removedAtEnd > 0) {
+      const intent = intentAt(rows - 1);
+      if (intent) intent.removedBelow += marks.removedAtEnd;
+    }
+
+    const bar = layoutPx(CHANGE_BAR_PX);
+    for (const [index, intent] of intents) {
+      const gutter = this.gutterCells[index];
+      const code = this.codeCells[index];
+      if (!(gutter instanceof HTMLElement) || !(code instanceof HTMLElement)) continue;
+
+      const shared: string[] = [];
+      if (intent.removedAbove > 0) shared.push(`inset 0 ${bar} 0 0 ${CHANGE_REMOVED_COLOR}`);
+      if (intent.removedBelow > 0) shared.push(`inset 0 -${bar} 0 0 ${CHANGE_REMOVED_COLOR}`);
+
+      const gutterShadow = intent.added
+        ? [`inset ${bar} 0 0 0 ${CHANGE_ADDED_COLOR}`, ...shared]
+        : shared;
+      this.markCell(gutter, gutterShadow, intent.added ? CHANGE_ADDED_GUTTER : null);
+      this.markCell(code, shared, intent.added ? CHANGE_ADDED_CODE : null);
+
+      const words: string[] = [];
+      if (intent.added) words.push('added since HEAD');
+      if (intent.removedAbove > 0) words.push(`${plural(intent.removedAbove)} removed above`);
+      if (intent.removedBelow > 0) words.push(`${plural(intent.removedBelow)} removed below`);
+      if (words.length > 0) gutter.title = words.join(' · ');
+    }
+  }
+
+  /** Write one cell's mark, remembering the background it is covering up. */
+  private markCell(cell: HTMLElement, shadows: string[], background: string | null): void {
+    if (shadows.length === 0 && background === null) return;
+    this.changeMarked.push({ el: cell, background: cell.style.background });
+    if (background !== null) cell.style.background = background;
+    if (shadows.length > 0) cell.style.boxShadow = shadows.join(', ');
   }
 
   /**

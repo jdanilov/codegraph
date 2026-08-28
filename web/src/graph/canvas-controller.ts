@@ -33,10 +33,11 @@
  * ends live in the same disk, and as one bowed curve (`workspace.ts`) when they
  * do not.
  */
-import { fetchSource, openInEditor } from '@/lib/api';
+import { fetchSource, fetchSourceDiff, openInEditor, type DiffHunk } from '@/lib/api';
 import { formatNumber } from '@/lib/utils';
 
 import { BubbleView, type BubbleCallSite, type BubbleLabelGeometry } from './bubble-view';
+import { spanChangeMarks, spanChangesEmpty } from './changes';
 import {
   bundleControlPoints,
   bundleCurve,
@@ -44,6 +45,8 @@ import {
 } from './bundling';
 import { DIRECTORY_KIND, ROOT_ID, type GraphModel, type ModelEdge, type ModelNode } from './model';
 import {
+  CHANGE_ADDED_COLOR,
+  CHANGE_REMOVED_COLOR,
   DIRECTORY_LEGEND_KEY,
   colorForEdgeDirection,
   colorForNode,
@@ -422,8 +425,8 @@ const PULSE_CYCLES = 3;
  * change rather than being replaced by it, and always on the SCENE path (it is
  * part of the picture, not chrome), so a blitted gesture frame carries it.
  */
-const MARKER_ADDED = '#4ade80';
-const MARKER_REMOVED = '#f87171';
+const MARKER_ADDED = CHANGE_ADDED_COLOR;
+const MARKER_REMOVED = CHANGE_REMOVED_COLOR;
 /** Fill opacity of a sub-wedge, before the wedge's own dim/emphasis alpha. */
 const MARKER_ALPHA = 0.82;
 /**
@@ -990,6 +993,33 @@ export class CanvasController {
   private changeMarkers = new Map<string, ChangeMarker>();
 
   /**
+   * The bubbles' half of the changes toggle (B4.6): a file path → its hunks
+   * against `HEAD`, or `null` for a file whose diff could not be read.
+   *
+   * Cached PER FILE rather than per bubble, and fetched unfiltered, because
+   * several bubbles routinely show different spans of one edited file (the
+   * "expand all changes" button spawns a bubble per changed symbol) — one
+   * `git diff` then serves all of them and the span filtering is pure
+   * arithmetic ({@link spanChangeMarks}).
+   *
+   * `null` is the graceful end of every failure: a file outside git, a request
+   * that 404s, a diff that cannot be parsed. Nothing is drawn and nothing is
+   * said — a bubble that cannot show its changes is still a bubble showing its
+   * code, which is what the user asked for.
+   */
+  private readonly changeDiffs = new Map<string, DiffHunk[] | null>();
+  /** Files whose diff is in flight, so N bubbles make one request. */
+  private readonly changeDiffPending = new Set<string>();
+  /**
+   * Rises whenever the change payload itself moves (a re-index, the toggle).
+   *
+   * It is the cache's generation: a response that was already in flight when
+   * the epoch turned is dropped rather than stored, so a stale diff can never
+   * land on a bubble showing freshly re-indexed lines.
+   */
+  private changeEpoch = 0;
+
+  /**
    * Node id → how many open disks are rooted at it (phase G2).
    *
    * These are the COLLAPSED nodes: a node expanded as its own disk is drawn in
@@ -1256,6 +1286,13 @@ export class CanvasController {
     this.changeMarkers = new Map(overlay?.markers ?? []);
     this.changedNodes = known(overlay?.changed ?? []);
     this.impactedNodes = known(overlay?.impacted ?? []);
+    // The bubbles are governed by this one switch too (B4.6), so the payload
+    // that sizes the sub-wedges is also what re-decorates their gutters — a
+    // new epoch drops the diff cache, and every open bubble re-asks.
+    this.changeEpoch += 1;
+    this.changeDiffs.clear();
+    this.changeDiffPending.clear();
+    for (const bubble of this.bubbles) this.applyBubbleChanges(bubble);
     this.projectHighlight();
     this.requestDraw();
   }
@@ -1729,6 +1766,9 @@ export class CanvasController {
         // is what decides which edges are its own, and that changes exactly
         // when the text does (a load, an expand, a re-index).
         this.rebuildBubbleCalls(bubble, span.startLine, span.endLine, span.file);
+        // …and so is the change decoration, for the same reason: the rows it
+        // rides were just rebuilt, and the span they cover is only known now.
+        this.applyBubbleChanges(bubble);
         if (bubble.pendingLine !== null) {
           bubble.view.scrollToLine(bubble.pendingLine);
           bubble.pendingLine = null;
@@ -2223,6 +2263,77 @@ export class CanvasController {
     bubble.view.setCallSites(sites);
   }
 
+  // -------------------------------------------------- bubble change marks ---
+
+  /**
+   * Decorate one bubble's gutter with what changed since `HEAD` (B4.6) — the
+   * bubble half of the changes toggle.
+   *
+   * The gate is the SAME state the sub-wedges are drawn from: no change
+   * markers means the toggle is off (or there is nothing to show), and a
+   * bubble whose file is not one of the edited ones is left alone without a
+   * request ever being made. So switching the toggle off clears every bubble
+   * in the same turn as the click, and switching it on re-decorates without
+   * touching the source the bubbles are already displaying.
+   *
+   * The span is the one the body is ACTUALLY showing (`firstLine` /
+   * `lineCount`, both measured from the loaded rows), not the node's span in
+   * the index — an "expand to file" and a stale index both move one without
+   * moving the other, and a mark on the wrong row is worse than no mark.
+   */
+  private applyBubbleChanges(bubble: BubbleState): void {
+    const model = this.model;
+    if (this.changeMarkers.size === 0 || !model || bubble.lineCount <= 0) {
+      bubble.view.setChangeMarks(null);
+      return;
+    }
+    const fileId = this.fileNodeOf(bubble.nodeId);
+    const path = fileId && this.changeMarkers.has(fileId) ? model.get(fileId)?.file : null;
+    if (!path) {
+      bubble.view.setChangeMarks(null);
+      return;
+    }
+    const hunks = this.changeDiffs.get(path);
+    if (hunks === undefined) {
+      // Not fetched yet. The response re-enters here for every bubble on the
+      // file, so there is nothing to draw and nothing to clear right now.
+      this.loadChangeDiff(path);
+      return;
+    }
+    if (!hunks) {
+      bubble.view.setChangeMarks(null);
+      return;
+    }
+    const marks = spanChangeMarks(hunks, bubble.firstLine, bubble.firstLine + bubble.lineCount - 1);
+    bubble.view.setChangeMarks(spanChangesEmpty(marks) ? null : marks);
+  }
+
+  /**
+   * Fetch one edited file's hunks, once, and decorate every bubble showing it.
+   *
+   * Failure is recorded as `null` rather than retried: the same request would
+   * fail the same way for every other bubble on that file, and a bubble that
+   * cannot show its diff simply shows its code. The epoch check is what keeps
+   * a response that outlived its payload from landing.
+   */
+  private loadChangeDiff(path: string): void {
+    if (this.changeDiffPending.has(path)) return;
+    this.changeDiffPending.add(path);
+    const epoch = this.changeEpoch;
+    void fetchSourceDiff(path)
+      .then((diff) => (Array.isArray(diff.hunks) ? diff.hunks : null))
+      .catch(() => null)
+      .then((hunks) => {
+        if (epoch !== this.changeEpoch || this.disposed) return;
+        this.changeDiffPending.delete(path);
+        this.changeDiffs.set(path, hunks);
+        for (const bubble of this.bubbles) {
+          const fileId = this.fileNodeOf(bubble.nodeId);
+          if (fileId && this.model?.get(fileId)?.file === path) this.applyBubbleChanges(bubble);
+        }
+      });
+  }
+
   /** The `file` node a bubble's node belongs to — itself, or the nearest ancestor. */
   private fileNodeOf(nodeId: string): string | null {
     const model = this.model;
@@ -2606,6 +2717,13 @@ export class CanvasController {
   private refreshBubbles(): void {
     const model = this.model;
     if (!model) return;
+    // A re-index moves lines under every hunk we cached, so the diffs go with
+    // the source (B4.6). The refreshed `/api/changes` payload lands a moment
+    // later and bumps the epoch again; both paths converge on one re-fetch per
+    // file, and neither can leave a mark on a row it no longer describes.
+    this.changeEpoch += 1;
+    this.changeDiffs.clear();
+    this.changeDiffPending.clear();
     const gone = this.bubbles.filter((bubble) => !model.nodes.has(bubble.nodeId));
     for (const bubble of gone) {
       bubble.requestSeq++;

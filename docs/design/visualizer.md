@@ -2614,6 +2614,61 @@ the legend chips, the search rows, the relation lists and the tooltip, so
 nothing can drift. (B4.4 above supersedes this block's cyan for the plumbing
 family and moves it to the end of the legend order.)
 
+### Bubbles show their own changes (B4.6; completes B4.5's "bubbles included")
+
+B4.5 wrote the changes switch as the single control for "is uncommitted work
+shown, the bubbles included", and then admitted that bubbles carried no change
+colouring of their own to gate. They do now, under **that same switch** — there
+is still no second flag, and there is no per-bubble control either.
+
+**What a bubble draws.** For a bubble whose file is one of the edited ones, the
+rows it is displaying are marked from that file's hunks against `HEAD`:
+
+- an **added** line gets a bar down the left of its gutter cell and a wash of
+  the same green across its code cell — the disk's own `MARKER_ADDED` /
+  `MARKER_REMOVED` pair, now exported from `palette.ts` as
+  `CHANGE_ADDED_COLOR` / `CHANGE_REMOVED_COLOR` so the gutter and the
+  sub-wedges cannot claim two different greens for one edit;
+- a **removal** gets a red hairline across the top of the row it happened
+  above, and one under the last row when it happened off the end of the span.
+  **Deleted text is never rendered inline.** A removal has no line on the new
+  side of a diff, so drawing it as a row would mean inventing rows the file
+  does not have — and every line number under them would then disagree with the
+  file. It is a seam between two rows, so it is drawn as a seam.
+- the gutter cell's tooltip says which of the three it is, and how many lines.
+
+**It rides the row, not the line.** Both marks are written to the row's grid
+CELLS, which is what makes them correct under B3's wrapping: a line that wrapped
+over four visual rows is one cell, so it is marked over all four, and a run of
+deletions above it sits on the top edge of the first.
+
+**Zero per-frame work.** The decoration is applied on exactly three events —
+the body loaded (or reloaded, or expanded to the file), the toggle moved, the
+index moved — and never on the camera path. A frame's whole job for a bubble is
+still one CSS transform. Switching the toggle off restores every touched cell
+to the background it was covering (remembered at the moment it was overwritten,
+because the two columns rest at different backgrounds), and switching it on
+re-marks without respawning a bubble or re-fetching a line of source.
+
+**One `git diff` per file, not per bubble.** The hunks come from the existing
+`GET /api/source?mode=diff`, fetched **unfiltered** and cached per file path,
+because several bubbles routinely show different spans of one edited file (the
+button below spawns one per changed symbol). The span filtering is then pure
+arithmetic — `spanChangeMarks` in `web/src/graph/changes.ts`, which turns a
+hunk list plus `[startLine, endLine]` into added lines and deletion seams, and
+is the one piece of this that is probeable without a browser.
+
+**Nothing is fetched speculatively, and nothing fails loudly.** A bubble whose
+file is not in the change payload never makes a request at all; a file outside
+git, a request that 404s and a diff that will not parse are all recorded as
+"this file has no marks" and draw nothing. A bubble that cannot show its
+changes is still a bubble showing its code, which is what the user asked for.
+
+**Staleness has one rule: an epoch.** The cache carries a generation that rises
+whenever the change payload moves or the index does, and a response that
+outlived its generation is dropped rather than stored — so a diff computed
+against the old line numbering can never land on freshly re-indexed rows.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all

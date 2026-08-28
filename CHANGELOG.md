@@ -67,6 +67,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Imports and exports in the `codegraph ui` disk are now a quiet asphalt grey instead of cyan, and they sit at the bottom of the legend. They are the least interesting symbols a file declares — the dependency they name is already drawn as a connection — so they no longer pull your eye ahead of the code that does the work.
 
+- Code bubbles in `codegraph ui` now show your uncommitted work too, under the same "changes" toggle as the disk. Lines you added since your last commit get a green bar in the gutter and a green wash across the code, and a red hairline marks where lines were deleted, so you can read an agent's edit in place instead of switching to a diff. Long lines that wrap are marked over every row they wrap onto, turning the toggle off clears it all instantly without disturbing the bubbles you laid out, and a file that is not under version control simply shows its code as before.
+
 - "Changes" in `codegraph ui` is no longer a separate view you switch to — it is a toggle in the legend panel, on by default. With it on, your uncommitted work is shown on top of whatever you are already looking at: edited files carry their green and red sub-slices, edited symbols a hot ring, and anything depending on them a warm one, even while a question card is open. With it off, none of that is drawn and nothing is read from git. The setting is remembered per browser, and opening an edited symbol still shows its diff first. Older links that pointed at the old Changes view simply open on Project.
 
 ### Fixes

@@ -32,6 +32,19 @@ export const DIRECTORY_COLOR = '#7c8698';
 export const NO_LAYER_COLOR = '#2dd4bf';
 
 /**
+ * Uncommitted work: added, and removed (round B4).
+ *
+ * One pair for the whole app, because it is drawn in two places that a reader
+ * compares directly — the proportional sub-wedges on a changed file's wedge
+ * (B4.3) and the gutter of a code bubble showing that same file (B4.6). Two
+ * greens would read as two different claims about the same edit, so the pair
+ * lives here with every other colour the canvas paints from rather than being
+ * re-typed at each site.
+ */
+export const CHANGE_ADDED_COLOR = '#4ade80';
+export const CHANGE_REMOVED_COLOR = '#f87171';
+
+/**
  * NodeKind → colour, as SEVEN families (B3 — this supersedes the phase-F
  * table, which had grown by kind rather than by family).
  *
