@@ -2422,6 +2422,53 @@ Everything the bubble needs was already true and is left alone:
   the cursor flips between the box and the disk as the modifier is held —
   no second code path, and the release lands what the ghost promised.
 
+### Change markers are sub-wedges, not rim bars (B4.3; SUPERSEDES round 4's "two thin bars on the outer rim")
+
+Round 4 drew a changed file's edits as two thin bars **stroked** along the
+wedge's outer rim — green added outside, red removed just inside it — each
+running along the arc for the share of the file's lines it accounted for. Two
+things were wrong with that picture:
+
+1. **It sat at the END of the wedge**, on the boundary where the next ring
+   starts, so it read as decoration on the *gap* rather than as a fact about
+   the file. At any zoom where the ring gap is a couple of pixels the two bars
+   and the gap are one smear.
+2. **Its corners were round.** A stroked `ctx.arc` takes the context's line cap
+   and join; on a disk built entirely from hard-edged sectors that reads as a
+   different class of object — a progress bar someone laid on top of the disk.
+
+**The rule now: a change is drawn as SUB-WEDGES of the wedge it describes.**
+
+- **Shape.** The changed file's own angular span, its **full radial depth**
+  (`r0 → r1`), `fill`ed and never stroked, so every corner is square by
+  construction and the marker is unmistakably part of the wedge. Full depth
+  rather than an outer-edge band is the deliberate answer to complaint 1: an
+  outer band is exactly the object that was just removed, one pixel thicker.
+- **Proportion.** Green takes the leading edge of the span, red follows it, and
+  each one's width is `span × (lines added|removed ÷ the file's line count)`.
+  A half-rewritten file colours half of its wedge; a two-line typo fix colours
+  a sliver. The remaining span keeps the wedge's kind colour, which is the
+  reference the proportion is read against — so the markers are painted at
+  `MARKER_ALPHA` (0.82) times the wedge's own dim/emphasis alpha, and the kind
+  colour still shows through.
+- **Floor and cap.** `changeSubWedgeSpans(span, addedShare, removedShare)` is
+  the whole rule and is a pure function: a share of 0 draws nothing, a non-zero
+  share is never thinner than `MIN_ARC_ANGLE / 4` (itself capped at half the
+  wedge, so two floors can't overflow one wedge), and if the two together want
+  more than the span they are scaled by a common factor — the ratio between
+  them survives and green + red exactly fill the wedge, never a neighbour.
+- **Scene, not chrome.** It is painted inside `drawArcs`, on the `sceneDirty`
+  path, so a blitted gesture frame carries it like the rest of the picture. No
+  new `requestCameraDraw` site; the snapshot is still taken before the chrome.
+
+**The counts come from the server now.** `ChangedFile` grew `addedLines` /
+`removedLines`, counted over **all** of a file's hunks — including the ones
+`MAX_HUNKS_PER_FILE` / `MAX_HUNK_LINES` drop from the response. The client used
+to add up the `hunks` array itself, which under-reported exactly the edits that
+matter most: the biggest ones are the first to have their hunks dropped, so a
+6,000-line rewrite could arrive as a sliver. The denominator stays client-side
+(the file node's own LoC, which the model already holds).
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all

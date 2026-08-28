@@ -1009,35 +1009,29 @@ function impactClosure(model: GraphModel, id: string): string[] {
  * Change markers: for every changed file the index still knows, the share of
  * its own lines that were added and removed (each clamped to 1, since a file
  * can gain more lines than it currently has).
+ *
+ * The two counts come from the PAYLOAD (`addedLines` / `removedLines`), not
+ * from adding up `hunks`: the server counts every hunk of the file, including
+ * the ones its own caps dropped from the response, so a huge rewrite is
+ * reported as a huge rewrite instead of as the prefix that fitted.
  */
 function changeMarkers(
   changes: ChangesPayload | null,
   model: GraphModel | null
 ): Array<[string, ChangeMarker]> {
   if (!changes || !model) return [];
-  const counts = new Map<string, { added: number; removed: number }>();
-  for (const hunk of changes.hunks) {
-    let entry = counts.get(hunk.file);
-    if (!entry) {
-      entry = { added: 0, removed: 0 };
-      counts.set(hunk.file, entry);
-    }
-    for (const line of hunk.lines) {
-      if (line.type === 'add') entry.added++;
-      else if (line.type === 'del') entry.removed++;
-    }
-  }
-
   const markers: Array<[string, ChangeMarker]> = [];
   for (const file of changes.changedFiles) {
     if (!file.nodeId) continue;
     const node = model.get(file.nodeId);
-    const count = counts.get(file.path);
-    if (!node || !count) continue;
+    if (!node) continue;
+    const added = file.addedLines ?? 0;
+    const removed = file.removedLines ?? 0;
+    if (added === 0 && removed === 0) continue;
     const loc = Math.max(1, node.weight);
     markers.push([
       file.nodeId,
-      { added: Math.min(1, count.added / loc), removed: Math.min(1, count.removed / loc) },
+      { added: Math.min(1, added / loc), removed: Math.min(1, removed / loc) },
     ]);
   }
   return markers;

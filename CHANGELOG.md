@@ -117,6 +117,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Slices in the `codegraph ui` disk are no longer drawn deeper or shallower depending on how long their names are. Files and symbols now all get the same depth as each other — the way folders always have — so a ring of files reads as an even ring instead of a comb, and a name too long for its slice is shortened with an ellipsis rather than stretching the slice it sits in.
 
+- Uncommitted edits are now shown on the `codegraph ui` disk as green and red sub-slices of the file's own slice, sized in proportion to how much of the file changed — half a slice coloured means about half the file was rewritten. They replace the two thin rounded bars that used to sit on the slice's outer edge, where they read as part of the gap to the next ring rather than as part of the file. Very large edits are also measured correctly now: the counts come from the complete diff rather than from the part of it the page had room to download.
+
 ## [1.5.0] - 2026-07-21
 
 # ⚡ The Rust engine release — with near-instant sync

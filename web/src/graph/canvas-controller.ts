@@ -55,6 +55,7 @@ import {
   DEFAULT_SORT_MODE,
   MAX_ARCS,
   MAX_RADIUS,
+  MIN_ARC_ANGLE,
   TAU,
   arcAt,
   arcCentroid,
@@ -379,19 +380,38 @@ const PULSE_MS = 1000;
 const PULSE_CYCLES = 3;
 
 /**
- * Change markers: two thin bars on the OUTER rim of a changed file's wedge.
+ * Change markers: green/red **sub-wedges** inside a changed file's own wedge
+ * (round B4 — this replaces the two rounded bars on the outer rim).
  *
- * Stacked radially — green (added) outermost, red (removed) directly inside it
- * — rather than side by side angularly, because the angle already means "how
- * much code is here" and re-using it for "how much changed" would make a small
- * heavily-edited file read as a big one. Each bar's LENGTH along the arc is the
- * share of the file's lines it accounts for, so the pair reads as two little
- * progress bars against the wedge they sit on.
+ * The bars were wrong twice over. They sat at the wedge's outer END, which is
+ * where the ring below it starts, so they read as a hairline belonging to the
+ * gap rather than to the file; and they were STROKED arcs, so their ends were
+ * capped round, which on a disk made of hard-edged sectors reads as a different
+ * kind of object entirely.
+ *
+ * A sub-wedge is the same shape as the thing it annotates: the wedge's own
+ * angular span, its FULL radial depth (`r0 → r1`, so it is unmistakably part of
+ * the wedge and not of the gap), filled — never stroked — so every corner is
+ * square. Green takes the leading edge of the span, red follows it, and each
+ * one's angular width is its share of the FILE's line count: a file whose half
+ * was rewritten shows half its wedge coloured, a two-line typo fix a sliver.
+ * The rest of the span keeps the wedge's kind colour, which is what makes the
+ * proportion readable at all.
+ *
+ * Painted slightly translucent so the kind colour still shows through the
+ * change rather than being replaced by it, and always on the SCENE path (it is
+ * part of the picture, not chrome), so a blitted gesture frame carries it.
  */
-const MARKER_MAX_THICKNESS = 2.4;
-const MARKER_DEPTH_SHARE = 0.12;
 const MARKER_ADDED = '#4ade80';
 const MARKER_REMOVED = '#f87171';
+/** Fill opacity of a sub-wedge, before the wedge's own dim/emphasis alpha. */
+const MARKER_ALPHA = 0.82;
+/**
+ * Thinnest a sub-wedge is ever drawn, in radians — a quarter of the layout's
+ * own {@link MIN_ARC_ANGLE} sliver, so a one-line change in a 4,000-line file
+ * is still a visible tick and still visibly narrower than any real wedge.
+ */
+const MARKER_MIN_ANGLE = MIN_ARC_ANGLE / 4;
 
 /** Opacity multiplier for anything the current focus dims. */
 const DIM_ALPHA = 0.26;
@@ -633,6 +653,54 @@ interface PlannedLabel {
 export interface ChangeMarker {
   added: number;
   removed: number;
+}
+
+/** Angular width, in radians, of one changed wedge's two sub-wedges. */
+export interface ChangeSubWedgeSpans {
+  added: number;
+  removed: number;
+}
+
+/**
+ * How wide a changed wedge's green and red sub-wedges are (round B4).
+ *
+ * Pure arithmetic over three numbers, so it is probeable and byte-deterministic
+ * — the painter does nothing to these values except draw them.
+ *
+ * The rules, in the order they apply:
+ *
+ *  1. **Proportional.** A share is "lines added (or removed) ÷ the file's own
+ *     line count", so a half-rewritten file colours half its span and a file
+ *     rewritten twice over colours all of it (the share is clamped at 1).
+ *  2. **Minimum visible span.** A change that is real but tiny still gets
+ *     {@link MARKER_MIN_ANGLE} rather than a sub-pixel nothing — "there is an
+ *     edit here" is the more useful fact than "the edit is 0.3% of the file".
+ *     The floor is itself capped at half the wedge, so the two floors together
+ *     can never exceed the span they sit in. A share of exactly 0 gets nothing
+ *     at all: no change is not a small change.
+ *  3. **Capped by the wedge.** If the two together still want more than the
+ *     whole span (a file whose added AND removed both approach its length),
+ *     both are scaled by the same factor, so the ratio between them survives
+ *     and green + red exactly fills the wedge and never overruns its neighbour.
+ */
+export function changeSubWedgeSpans(
+  span: number,
+  addedShare: number,
+  removedShare: number
+): ChangeSubWedgeSpans {
+  if (!(span > 0)) return { added: 0, removed: 0 };
+  const floor = Math.min(MARKER_MIN_ANGLE, span / 2);
+  const want = (share: number): number =>
+    share > 0 ? Math.max(floor, span * Math.min(1, share)) : 0;
+  let added = want(addedShare);
+  let removed = want(removedShare);
+  const total = added + removed;
+  if (total > span) {
+    const factor = span / total;
+    added *= factor;
+    removed *= factor;
+  }
+  return { added, removed };
 }
 
 /**
@@ -3763,12 +3831,18 @@ export class CanvasController {
   }
 
   /**
-   * Uncommitted edits, on the OUTER rim of the file's own wedge.
+   * Uncommitted edits, as sub-wedges of the file's own wedge.
    *
-   * Two bars stacked radially — added green outside, removed red inside — each
-   * running along the arc for the share of the file's lines it accounts for.
-   * Deliberately thin and slightly translucent: this is a standing annotation
-   * on the normal view, not a mode, so it has to survive being always on.
+   * Green (added) takes the leading edge of the wedge's angular span, red
+   * (removed) follows it, both at the wedge's full radial depth and both
+   * FILLED, so the corners are square and the pair reads as part of the wedge.
+   * The widths come from {@link changeSubWedgeSpans} — pure arithmetic over the
+   * span and the two shares, so what is painted is exactly what that function
+   * can be probed for.
+   *
+   * Slightly translucent: this is a standing annotation on the normal view, not
+   * a mode, so it has to survive being always on — and the wedge's kind colour
+   * has to stay legible under it.
    */
   private drawChangeMarker(
     ctx: CanvasRenderingContext2D,
@@ -3780,23 +3854,27 @@ export class CanvasController {
     if (this.changeMarkers.size === 0 || !arc.nodeId) return;
     const marker = this.changeMarkers.get(arc.nodeId);
     if (!marker) return;
-    const depth = arc.r1 - arc.r0;
-    const thickness = Math.min(MARKER_MAX_THICKNESS, depth * MARKER_DEPTH_SHARE);
-    if (thickness <= 0) return;
-    const span = a1 - a0;
+    const spans = changeSubWedgeSpans(a1 - a0, marker.added, marker.removed);
+    if (spans.added <= 0 && spans.removed <= 0) return;
 
-    const bar = (share: number, color: string, outer: number): void => {
-      if (share <= 0) return;
-      const extent = Math.max(span * Math.min(1, share), span * 0.06);
+    let cursor = a0;
+    const sub = (extent: number, color: string): void => {
+      if (extent <= 0) return;
+      const end = cursor + extent;
+      // A filled annular sector: out along the leading edge, around the rim,
+      // back down the trailing edge, around the inner arc. No stroke anywhere,
+      // so nothing here can acquire a cap or a join.
       ctx.beginPath();
-      ctx.arc(0, 0, outer - thickness / 2, a0, a0 + extent);
-      ctx.strokeStyle = withAlpha(color, 0.85 * alpha);
-      ctx.lineWidth = thickness;
-      ctx.stroke();
+      ctx.arc(0, 0, arc.r1, cursor, end);
+      ctx.arc(0, 0, arc.r0, end, cursor, true);
+      ctx.closePath();
+      ctx.fillStyle = withAlpha(color, MARKER_ALPHA * alpha);
+      ctx.fill();
+      cursor = end;
     };
 
-    bar(marker.added, MARKER_ADDED, arc.r1);
-    bar(marker.removed, MARKER_REMOVED, arc.r1 - thickness);
+    sub(spans.added, MARKER_ADDED);
+    sub(spans.removed, MARKER_REMOVED);
   }
 
   /**

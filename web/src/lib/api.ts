@@ -225,6 +225,14 @@ export interface ChangedFile {
   nodeId: string | null;
   nodeCount: number;
   hunkCount: number;
+  /**
+   * Lines gained / lost against HEAD, over ALL of the file's hunks — the ones
+   * the payload's caps dropped included. This is what the canvas sizes a
+   * changed wedge's green/red sub-wedges from; counting `hunks` here instead
+   * would under-report exactly the biggest edits.
+   */
+  addedLines: number;
+  removedLines: number;
   binary: boolean;
 }
 

@@ -70,6 +70,19 @@ export interface ChangedFile {
   /** How many of this file's symbols intersect a hunk. */
   nodeCount: number;
   hunkCount: number;
+  /**
+   * Lines this file gained / lost against `HEAD`, counted over **all** of its
+   * hunks — including the ones the payload's own caps dropped.
+   *
+   * The canvas sizes a changed wedge's green/red sub-wedges from these two
+   * numbers, so they have to describe the file rather than the prefix of the
+   * file that survived {@link MAX_HUNKS_PER_FILE} / {@link MAX_HUNK_LINES}.
+   * Counting them client-side from `hunks` (which is what the client used to
+   * do) silently under-reports exactly the biggest edits — the ones whose
+   * hunks are dropped first.
+   */
+  addedLines: number;
+  removedLines: number;
   binary: boolean;
 }
 
@@ -200,12 +213,15 @@ export function collectChanges(
       });
     }
 
+    const counts = countLines(fileHunks);
     changedFiles.push({
       path: entry.path,
       status: entry.status,
       nodeId: fileNode?.id ?? null,
       nodeCount: matched,
       hunkCount: fileHunks.length,
+      addedLines: counts.added,
+      removedLines: counts.removed,
       binary,
     });
   }
@@ -218,6 +234,26 @@ export function collectChanges(
     ok: true,
     payload: { changedNodes, changedFiles, impactedNodeIds, hunks, git: true, truncated },
   };
+}
+
+/**
+ * Added / removed line counts over a file's whole hunk list.
+ *
+ * Counted BEFORE the payload's hunk caps are applied, because this is the
+ * number the canvas draws a proportion from: a 3,000-line rewrite whose hunks
+ * were dropped from `hunks` must still report 3,000 added, not the handful the
+ * response happened to carry.
+ */
+function countLines(hunks: DiffHunk[]): { added: number; removed: number } {
+  let added = 0;
+  let removed = 0;
+  for (const hunk of hunks) {
+    for (const line of hunk.lines) {
+      if (line.type === 'add') added++;
+      else if (line.type === 'del') removed++;
+    }
+  }
+  return { added, removed };
 }
 
 /**

@@ -15,6 +15,7 @@ import { execFileSync } from 'child_process';
 
 import CodeGraph from '../src/index';
 import { startUiServer, type UiServer } from '../src/ui-server';
+import { collectChanges, MAX_HUNK_LINES } from '../src/ui-server/changes';
 import { mergeSettings, settingsView } from '../src/ui-server/settings';
 import { normalizeSymbolBag } from '../src/ui-server/ask';
 
@@ -437,6 +438,41 @@ describe('GET /api/changes', () => {
     expect(body.hunks.length).toBeGreaterThan(0);
     expect(body.hunks.every((hunk: any) => typeof hunk.file === 'string')).toBe(true);
     expect(Array.isArray(body.impactedNodeIds)).toBe(true);
+  });
+
+  it.runIf(hasGit)('reports per-file added/removed line counts', async () => {
+    const { body } = await getJson(gitServer.url, '/api/changes');
+    const byPath = new Map<string, any>(body.changedFiles.map((file: any) => [file.path, file]));
+    // tracked.ts: one line rewritten (1 add + 1 del) plus one line inserted.
+    expect(byPath.get('src/tracked.ts')).toMatchObject({ addedLines: 2, removedLines: 1 });
+    // fresh.ts is untracked, so the whole two-line file is "added".
+    expect(byPath.get('src/fresh.ts')).toMatchObject({ addedLines: 2, removedLines: 0 });
+  });
+
+  it.runIf(hasGit)('counts every line even when the hunk payload is capped', () => {
+    // The canvas draws a proportion from these two numbers, so they describe
+    // the FILE, not the prefix of it that survived MAX_HUNK_LINES.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-ui-bigdiff-'));
+    try {
+      const lines = MAX_HUNK_LINES + 500;
+      execFileSync('git', ['init', '-q'], { cwd: root, stdio: 'ignore' });
+      fs.writeFileSync(
+        path.join(root, 'huge.txt'),
+        Array.from({ length: lines }, (_, i) => `line ${i}`).join('\n') + '\n'
+      );
+      const outcome = collectChanges(root, null);
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) return;
+      const file = outcome.payload.changedFiles.find((entry) => entry.path === 'huge.txt');
+      expect(file?.addedLines).toBe(lines);
+      expect(file?.removedLines).toBe(0);
+      // …and the payload itself did drop the hunk, which is what makes the
+      // count above worth asserting.
+      expect(outcome.payload.truncated).toBe(true);
+      expect(outcome.payload.hunks).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('409s with the full shape outside a git work tree', async () => {
