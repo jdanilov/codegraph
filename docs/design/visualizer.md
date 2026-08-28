@@ -2669,6 +2669,97 @@ whenever the change payload moves or the index does, and a response that
 outlived its generation is dropped rather than stored — so a diff computed
 against the old line numbering can never land on freshly re-indexed rows.
 
+### "Expand all changes" — the whole changeset in one click (B4.7; additive)
+
+The question this UI is opened with more than any other is *what did the agent
+just do*. Until now answering it was navigation: find each edited file on the
+disk, drill to it, drag its symbols out one at a time. The legend's `expand`
+button, beside the changes toggle, does all of it at once — and it **implies the
+toggle**, switching changes on if they were off, because a button that quietly
+did nothing because a neighbouring switch was off is the worst of both.
+
+**What one click does**, in this order and for these reasons:
+
+1. **Rank the changed files** by lines actually touched — reconstructed from the
+   same two shares the sub-wedges are sized from (each is a fraction of the
+   file's own length, so multiplying by that length gives the count back).
+   Ranking by file SIZE would put a 4,000-line file with a typo above a 40-line
+   file that was rewritten, which is the opposite of what a reviewer wants
+   first. Every cap below spends its budget in this order.
+2. **Make every changed file visible.** A file already drawn in some disk needs
+   nothing at all. The rest are covered by **as few new disks as possible** — a
+   greedy set cover over the files' own ancestor directories — rather than one
+   disk per file, because eight disks of one file each is not a picture of a
+   changeset. The coverage test is not a heuristic about parent directories: it
+   is the **real layout**. A candidate covers a file when `computeSunburst`
+   rooted there actually renders that file's arc and the legend has not switched
+   it off, so a directory of 900 files that would fold the edited one into a
+   `+N` scores zero for it and is not chosen. Ties go to the shallower candidate
+   (more room to absorb the files still uncovered), then to the lower id, so the
+   answer is stable. A file that no ancestor can surface gets a disk rooted at
+   ITSELF — a disk always draws its own root as the centre circle, so that is
+   the one root guaranteed to show it.
+3. **Open the code.** One bubble per changed symbol, allocated **breadth first**
+   across the files: every changed file is offered its first bubble before any
+   file is offered its second (the same rule the disk's own arc budget follows),
+   so one heavily-edited file cannot spend the whole budget and hide the other
+   nineteen files you touched. Within a file, declaration order. A file whose
+   changes intersect no symbol — top-level code, or a brand-new file the index
+   has no symbols for yet — gets one bubble of the file itself, because "there
+   is a change here and nothing on screen says so" is the one outcome this
+   button must not produce.
+4. **Frame it**, with the existing `fit` — which now includes **bubbles** in its
+   bounds (`contentBounds`). Bubbles were outside the fit while a bubble was
+   something you had just dragged out and were looking at; one click now opens
+   two dozen, and a fit that framed only the disks would leave most of what it
+   just created off screen. A single disk at the origin with no bubbles still
+   fits to exactly `zoom 1, pan 0`, unchanged.
+
+**Nothing overlaps, and the layout is a pure function.** `placeSpawnedDisk`
+answers the one-at-a-time question — the user dropped a disk here, where does it
+go — and it deliberately ignores bubbles, because a user watching their own drop
+point can see a collision. A bulk expansion nobody aimed cannot leave anything
+overlapping anything, so `workspace.ts` gained a second, plural placer:
+`planExpansion(existing disks, existing bubbles, {disks, bubbles})` →
+`{disks, bubbles}`, pure, deterministic, no time and no randomness.
+
+- **Everything packs as its bounding BOX.** Disks are circles and bubbles are
+  rectangles, and a circle-vs-rectangle test that is correct at the corners is
+  more code than the extra clearance is worth. Boxes are conservative in exactly
+  one direction — no overlap the test can miss, at the cost of a little unused
+  space at four corners — and a box that clears another box by `DISK_GAP` also
+  clears it as a circle, which is why a disk placed here needs no second nudge
+  from `placeSpawnedDisk`.
+- **Disks first, then bubbles**, because a bubble's preferred spot is expressed
+  relative to the disk that shows its wedge and that disk may be one of the new
+  ones. The anchor is `(disk id, the wedge's own mid angle in that disk's
+  layout)` — an angle is independent of where the disk ends up, so both can be
+  planned in one pass. The bubble then lands just outside that disk's rim on
+  that bearing, which is where its tether will attach, so tethers stay short.
+- **`placeRect` is the wanted spot, then an outward ring scan, then a
+  guarantee.** The scan is the same shape as `placeSpawnedDisk`'s fallback and
+  for the same reason — it keeps the result NEAR what was asked for. The last
+  resort is not a search at all: the box is parked immediately to the right of
+  everything already placed, which cannot overlap by construction. That makes
+  the placer total (no input fails to place, no unbounded search) and grows the
+  picture linearly with what is in it rather than drifting.
+- Probed rather than argued: a randomized sweep over 12,000 plans / 192,691
+  placements / 3.7M pairwise checks found zero overlaps (box AND circle), zero
+  non-determinism (byte-identical repeats) and zero out-of-bounds drift, and two
+  mutants of the clearance test were both caught.
+
+**Idempotent, and everything it makes is ordinary.** A symbol that already has a
+bubble is skipped and a file already on screen spawns nothing, so a second click
+with nothing new changed spawns nothing and simply re-fits. What it creates are
+plain disks and bubbles — movable, closable, persisted with the workspace —
+because a special kind of disk would be a second thing to learn and a second
+thing to maintain.
+
+**The caps are silent, and stated up front.** Eight disks, twenty-four bubbles.
+There is no toast surface in this UI, and an error would be worse than a
+workspace showing the twenty-four largest changes, so hitting a cap is not
+announced — the button's own tooltip carries the number instead.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all

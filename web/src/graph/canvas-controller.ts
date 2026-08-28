@@ -71,16 +71,22 @@ import {
   type SunburstLayout,
 } from './sunburst';
 import {
+  DISK_GAP,
   closeAnchor,
+  contentBounds,
   crossDiskCurve,
   diskAt,
   fitCamera,
   placeSpawnedDisk,
+  planExpansion,
   tetherCurve,
   tetherPolyline,
   toDiskLocal,
-  workspaceBounds,
+  type BubbleAnchor,
+  type BubbleSpawnRequest,
   type DiskPlacement,
+  type DiskSpawnRequest,
+  type Rect,
   type TetherCurve,
 } from './workspace';
 
@@ -435,6 +441,34 @@ const MARKER_ALPHA = 0.82;
  * is still a visible tick and still visibly narrower than any real wedge.
  */
 const MARKER_MIN_ANGLE = MIN_ARC_ANGLE / 4;
+
+/**
+ * Caps on ONE "expand all changes" click (B4.7).
+ *
+ * The button's promise is "every change at a glance", and a glance has a size:
+ * a workspace of 200 bubbles is not a picture of a changeset, it is a wall.
+ * So the expansion is bounded on both axes, and the bounds are chosen to keep
+ * the RESULT usable rather than to keep the work small:
+ *
+ *  - {@link MAX_CHANGE_DISKS} disks, because the cover below is already trying
+ *    to answer with as few as possible — hitting this bound means the changes
+ *    are scattered across more of the tree than one screen can hold anyway;
+ *  - {@link MAX_CHANGE_BUBBLES} bubbles, allocated **breadth first**: every
+ *    changed file is offered its first bubble before any file is offered its
+ *    second (the same rule the disk's own arc budget follows), so a single
+ *    heavily-edited file cannot spend the whole budget and hide the other
+ *    nineteen files you touched.
+ *
+ * Hitting either cap is silent — there is no toast surface in this UI, and the
+ * alternative (an error) is worse than a workspace that shows the twenty-four
+ * largest changes. The button's tooltip states the number up front.
+ */
+const MAX_CHANGE_DISKS = 8;
+const MAX_CHANGE_BUBBLES = 24;
+/** Ancestor levels of a hidden changed file offered to the disk cover. */
+const CHANGE_COVER_LEVELS = 4;
+/** Distinct roots the cover will lay out and score. */
+const MAX_COVER_CANDIDATES = 48;
 
 /** Opacity multiplier for anything the current focus dims. */
 const DIM_ALPHA = 0.26;
@@ -3134,7 +3168,11 @@ export class CanvasController {
    * returns for it.
    */
   fitView(): void {
-    const bounds = workspaceBounds(this.placements());
+    // Bubbles are in the frame too since B4.7. They were left out while a
+    // bubble was something the user had just dragged out and was looking at;
+    // one click can now open two dozen of them, and a fit that framed only the
+    // disks would leave most of what it just created off screen.
+    const bounds = contentBounds(this.placements(), this.bubbleRects());
     const camera = fitCamera(bounds, {
       width: this.availableWidth(),
       height: this.height,
@@ -3149,6 +3187,348 @@ export class CanvasController {
     this.cameraMoved();
     this.requestDraw();
     this.emitSummary();
+  }
+
+  // ------------------------------------------------- expand all changes ---
+
+  /**
+   * Open the WHOLE changeset at once (B4.7) — the legend's `expand` button.
+   *
+   * One click, and the workspace becomes a picture of everything uncommitted:
+   * every changed file has a wedge you can actually see, and every changed
+   * symbol has its code on the canvas. It is the one question this UI is asked
+   * more than any other ("what did the agent just do") answered without a
+   * single navigation.
+   *
+   * Four steps, in this order and for these reasons:
+   *
+   *  1. **Which files.** The change payload's own files, ordered by how much of
+   *     each actually changed (lines touched, not file size), so every cap
+   *     below spends its budget on the biggest edits.
+   *  2. **Make them visible.** A changed file already drawn in some disk needs
+   *     nothing. The rest are covered by as FEW new disks as possible —
+   *     {@link coverChangedFiles} — rather than one disk per file: eight disks
+   *     of one file each is not a picture of a changeset.
+   *  3. **Open the code.** A bubble per changed symbol, breadth first across
+   *     the files; a file whose changes hit no symbol at all (top-level code, a
+   *     brand-new file the index has no symbols for) gets one bubble of its
+   *     own, so no change is silently unrepresented.
+   *  4. **Frame it.** The existing fit, which now includes bubbles.
+   *
+   * **Idempotent.** A symbol that already has a bubble is skipped and a file
+   * already on screen spawns nothing, so clicking twice with nothing new
+   * changed spawns nothing and simply re-fits. Everything it creates is an
+   * ORDINARY disk or bubble — movable, closable, persisted — because a special
+   * kind of disk would be a second thing to learn and a second thing to
+   * maintain.
+   */
+  expandAllChanges(): void {
+    const model = this.model;
+    if (!model || this.changeMarkers.size === 0) {
+      this.fitView();
+      return;
+    }
+
+    const files = this.changedFilesByWeight();
+    const roots = this.coverChangedFiles(files.filter((id) => !this.diskShowing(id)));
+    const targets = this.changeBubbleTargets(files);
+    if (roots.length === 0 && targets.length === 0) {
+      this.fitView();
+      return;
+    }
+
+    // ---- plan: one pure pass over what is here and what was asked for ----
+    const planIds = new Map<string, string>();
+    const layouts = new Map<string, SunburstLayout>();
+    const diskRequests: DiskSpawnRequest[] = roots.map((rootId, index) => {
+      const id = `plan:${index}`;
+      const layout = this.layoutFor(rootId);
+      planIds.set(id, rootId);
+      layouts.set(id, layout);
+      return { id, radius: layout.maxRadius, near: this.changeSpawnNear(rootId, layout.maxRadius) };
+    });
+
+    const fallback = this.changeSpawnFallback();
+    const bubbleRequests: BubbleSpawnRequest[] = targets.map((target) => {
+      const size = bubbleDefaultSize(this.bubbleLoc(target.nodeId));
+      return {
+        id: target.nodeId,
+        w: size.w,
+        h: size.h,
+        anchor: this.changeBubbleAnchor(target, layouts),
+        near: fallback,
+      };
+    });
+
+    const plan = planExpansion(this.placements(), this.bubbleRects(), {
+      disks: diskRequests,
+      bubbles: bubbleRequests,
+    });
+
+    // ---- apply -----------------------------------------------------------
+    const spawned = new Map<string, string>();
+    for (const placed of plan.disks) {
+      const rootId = planIds.get(placed.id);
+      if (!rootId) continue;
+      const source = this.diskShowing(rootId)?.id ?? PRIMARY_DISK_ID;
+      // The planned point already clears every disk by the gap `placeSpawnedDisk`
+      // enforces, so the spawn's own nudge is a no-op and the disk lands exactly
+      // where the plan (which also knew about the bubbles) put it.
+      const disk = this.spawnDisk(
+        rootId,
+        { x: placed.x, y: placed.y },
+        source,
+        layouts.get(placed.id) ?? null
+      );
+      if (disk) spawned.set(placed.id, disk.id);
+    }
+
+    for (const placed of plan.bubbles) {
+      const anchor = bubbleRequests.find((request) => request.id === placed.id)?.anchor ?? null;
+      const anchorDisk = anchor ? (spawned.get(anchor.diskId) ?? anchor.diskId) : null;
+      this.createBubble({
+        nodeId: placed.id,
+        x: placed.x,
+        y: placed.y,
+        w: placed.w,
+        h: placed.h,
+        scrollTop: 0,
+        expanded: false,
+        sourceDiskId: this.diskById(anchorDisk)?.id ?? null,
+        origin: { kind: 'wedge' },
+      });
+    }
+
+    this.notifyWorkspace();
+    this.fitView();
+  }
+
+  /** Bubble footprints in WORLD units — a bubble's frame px are its size there. */
+  private bubbleRects(): Rect[] {
+    return this.bubbles.map((bubble) => ({ x: bubble.x, y: bubble.y, w: bubble.w, h: bubble.h }));
+  }
+
+  /**
+   * Changed files, biggest edit first.
+   *
+   * "Biggest" is LINES TOUCHED, reconstructed from the same two shares the disk
+   * sizes its sub-wedges from (each is a fraction of the file's own length, so
+   * multiplying by that length gives the count back). Ranking by file size
+   * instead would put a 4,000-line file with a typo above a 40-line file that
+   * was rewritten, which is the opposite of what a reviewer wants first.
+   */
+  private changedFilesByWeight(): string[] {
+    const model = this.model;
+    if (!model) return [];
+    const entries: Array<{ id: string; score: number; path: string }> = [];
+    for (const [fileId, marker] of this.changeMarkers) {
+      const node = model.get(fileId);
+      if (!node) continue;
+      const loc = Math.max(1, node.weight);
+      entries.push({
+        id: fileId,
+        score: (marker.added + marker.removed) * loc,
+        path: node.file || node.name,
+      });
+    }
+    entries.sort(
+      (a, b) => b.score - a.score || a.path.localeCompare(b.path) || a.id.localeCompare(b.id)
+    );
+    return entries.map((entry) => entry.id);
+  }
+
+  /**
+   * The fewest disk roots that make every hidden changed file visible.
+   *
+   * A greedy set cover over the files' own ancestor directories, and the
+   * coverage test is not a guess — it is the REAL layout: a candidate covers a
+   * file when `computeSunburst` rooted there actually renders that file's arc
+   * and the legend has not switched it off. So a directory of 900 files that
+   * would fold the one you edited into a `+N` scores zero for it and is not
+   * chosen, which is exactly the case a "just root at the parent" heuristic
+   * gets wrong.
+   *
+   * Ties go to the SHALLOWER candidate (it has more room to absorb the files
+   * still uncovered), then to the lower id, so the answer is stable for a given
+   * workspace and changeset. Candidates are capped per file and in total — the
+   * cover is a click's worth of work, not a search.
+   *
+   * A file no ancestor can surface gets a disk rooted at ITSELF: a disk always
+   * draws its own root as the centre circle, so that is the one root guaranteed
+   * to show it.
+   */
+  private coverChangedFiles(needy: readonly string[]): string[] {
+    const model = this.model;
+    if (!model || needy.length === 0) return [];
+
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+    for (const file of needy) {
+      let levels = 0;
+      for (const ancestor of model.ancestors(file)) {
+        if (levels++ >= CHANGE_COVER_LEVELS) break;
+        if (seen.has(ancestor)) continue;
+        seen.add(ancestor);
+        candidates.push(ancestor);
+        if (candidates.length >= MAX_COVER_CANDIDATES) break;
+      }
+      if (candidates.length >= MAX_COVER_CANDIDATES) break;
+    }
+
+    const coverage = new Map<string, Set<string>>();
+    for (const candidate of candidates) {
+      const layout = this.layoutFor(candidate);
+      const covered = new Set<string>();
+      for (const file of needy) {
+        if (layout.rootId === file) {
+          covered.add(file);
+          continue;
+        }
+        const arc = layout.byNode.get(file);
+        if (arc && !this.isHiddenArc(arc)) covered.add(file);
+      }
+      if (covered.size > 0) coverage.set(candidate, covered);
+    }
+
+    const remaining = new Set(needy);
+    const roots: string[] = [];
+    while (remaining.size > 0 && roots.length < MAX_CHANGE_DISKS) {
+      let best: string | null = null;
+      let bestCount = 0;
+      let bestDepth = 0;
+      for (const [candidate, covered] of coverage) {
+        let count = 0;
+        for (const file of covered) if (remaining.has(file)) count++;
+        if (count === 0) continue;
+        const depth = model.get(candidate)?.depth ?? 0;
+        const better =
+          best === null ||
+          count > bestCount ||
+          (count === bestCount && (depth < bestDepth || (depth === bestDepth && candidate < best)));
+        if (!better) continue;
+        best = candidate;
+        bestCount = count;
+        bestDepth = depth;
+      }
+      if (!best) break;
+      roots.push(best);
+      for (const file of coverage.get(best) ?? []) remaining.delete(file);
+    }
+
+    for (const file of needy) {
+      if (roots.length >= MAX_CHANGE_DISKS) break;
+      if (!remaining.has(file)) continue;
+      remaining.delete(file);
+      roots.push(file);
+    }
+    return roots;
+  }
+
+  /**
+   * Which nodes get a bubble, BREADTH FIRST across the changed files.
+   *
+   * Round-robin rather than file-by-file: every changed file is offered its
+   * first bubble before any file is offered its second, so a single file with
+   * forty edited methods cannot spend the whole budget. Within a file the
+   * symbols come in declaration order, which is the order the reviewer reads
+   * them in.
+   *
+   * A file whose changes intersect no symbol falls back to a bubble of the file
+   * itself — an untracked file the index has no symbols for, or an edit to
+   * top-level code — because "there is a change here and nothing on screen says
+   * so" is the one outcome this button must not produce.
+   */
+  private changeBubbleTargets(
+    files: readonly string[]
+  ): Array<{ nodeId: string; fileId: string }> {
+    const model = this.model;
+    if (!model) return [];
+
+    const perFile = new Map<string, string[]>();
+    for (const id of this.changedNodes) {
+      const node = model.get(id);
+      if (!node || node.kind === 'file' || node.kind === DIRECTORY_KIND) continue;
+      if (!this.bubbleable(id)) continue;
+      const fileId = this.fileNodeOf(id);
+      if (!fileId) continue;
+      const list = perFile.get(fileId);
+      if (list) list.push(id);
+      else perFile.set(fileId, [id]);
+    }
+    for (const [fileId, list] of perFile) {
+      list.sort((a, b) => {
+        const first = model.get(a);
+        const second = model.get(b);
+        return (first?.startLine ?? 0) - (second?.startLine ?? 0) || a.localeCompare(b);
+      });
+      if (list.length === 0) perFile.delete(fileId);
+    }
+
+    const picksOf = (fileId: string): string[] => {
+      const symbols = perFile.get(fileId);
+      if (symbols && symbols.length > 0) return symbols;
+      return this.bubbleable(fileId) ? [fileId] : [];
+    };
+
+    const targets: Array<{ nodeId: string; fileId: string }> = [];
+    for (let round = 0; targets.length < MAX_CHANGE_BUBBLES; round++) {
+      let offered = false;
+      for (const fileId of files) {
+        const nodeId = picksOf(fileId)[round];
+        if (nodeId === undefined) continue;
+        offered = true;
+        // Already open — the whole reason a second click spawns nothing.
+        if (this.bubbleForNode(nodeId)) continue;
+        if (targets.length >= MAX_CHANGE_BUBBLES) break;
+        targets.push({ nodeId, fileId });
+      }
+      if (!offered) break;
+    }
+    return targets;
+  }
+
+  /**
+   * Which disk a change bubble should sit beside, and on what bearing.
+   *
+   * Its own wedge if any disk (existing or about to exist) draws it, otherwise
+   * its file's wedge — the bubble then lands just outside that disk's rim on
+   * the wedge's own mid angle, which is where its tether will attach, so the
+   * tether stays short and readable instead of crossing the workspace.
+   */
+  private changeBubbleAnchor(
+    target: { nodeId: string; fileId: string },
+    planned: ReadonlyMap<string, SunburstLayout>
+  ): BubbleAnchor | null {
+    const find = (id: string): BubbleAnchor | null => {
+      for (const disk of this.disks) {
+        const arc = disk.layout?.byNode.get(id);
+        if (arc && !this.isHiddenArc(arc)) return { diskId: disk.id, angle: (arc.a0 + arc.a1) / 2 };
+      }
+      for (const [planId, layout] of planned) {
+        const arc = layout.byNode.get(id);
+        if (arc) return { diskId: planId, angle: (arc.a0 + arc.a1) / 2 };
+      }
+      return null;
+    };
+    return find(target.nodeId) ?? find(target.fileId);
+  }
+
+  /** Where a change disk would like to open: beside the wedge it expands. */
+  private changeSpawnNear(rootId: string, radius: number): Point {
+    for (const disk of this.disks) {
+      const arc = disk.layout?.byNode.get(rootId);
+      if (!arc || this.isHiddenArc(arc)) continue;
+      const angle = (arc.a0 + arc.a1) / 2;
+      const reach = (disk.layout?.maxRadius ?? MAX_RADIUS) + DISK_GAP + radius;
+      return { x: disk.x + Math.cos(angle) * reach, y: disk.y + Math.sin(angle) * reach };
+    }
+    return this.changeSpawnFallback();
+  }
+
+  /** Off the right-hand edge of everything on the canvas — the last resort. */
+  private changeSpawnFallback(): Point {
+    const bounds = contentBounds(this.placements(), this.bubbleRects());
+    return { x: bounds.maxX + DISK_GAP, y: bounds.cy };
   }
 
   destroy(): void {

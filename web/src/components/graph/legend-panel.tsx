@@ -23,8 +23,9 @@
  *
  * Its header is also where the disk's own switches live — the colour mode,
  * `fit`, and (round B4) the **changes** toggle that replaced the standing
- * Changes card. They are all the same kind of control: how the disk in front of
- * you is drawn, as opposed to where you are standing in it.
+ * Changes card, with `expand` beside it for opening the whole changeset at
+ * once. They are all the same kind of control: how the disk in front of you is
+ * drawn, as opposed to where you are standing in it.
  *
  * What is NOT here: the wedge/budget count, the ring count and the
  * edges-rendered readout — that was renderer telemetry, no question a developer
@@ -37,7 +38,7 @@
  * Like the two right-hand panels, the legend COLLAPSES to its title bar rather
  * than closing (round 2) — the same affordance, in the same place.
  */
-import { ChevronDown, ChevronRight, Crosshair, FileDiff, Palette } from 'lucide-react';
+import { ChevronDown, ChevronRight, Crosshair, Expand, FileDiff, Palette } from 'lucide-react';
 
 import { PanelButton } from '@/components/graph/side-panel';
 import { Card } from '@/components/ui/card';
@@ -68,6 +69,17 @@ export interface LegendPanelProps {
    */
   changesShown: boolean;
   onToggleChanges(): void;
+  /**
+   * Open every change at once (round B4): a disk for each edited file that is
+   * not already on screen, a bubble for each edited symbol, laid out clear of
+   * each other, and then a fit.
+   *
+   * It sits beside the toggle because it is the same subject, and it IMPLIES
+   * the toggle: clicking it with changes switched off switches them on. A
+   * button that quietly did nothing because a neighbouring switch was off
+   * would be the worst of both.
+   */
+  onExpandChanges(): void;
   /** Why changes are unavailable (not a git tree, read failed) — a tooltip. */
   changesHint?: string | null;
   collapsed: boolean;
@@ -84,6 +96,7 @@ export function LegendPanel({
   onFit,
   changesShown,
   onToggleChanges,
+  onExpandChanges,
   changesHint,
   collapsed,
   onToggleCollapsed,
@@ -137,6 +150,18 @@ export function LegendPanel({
             )}
           >
             <FileDiff className="h-3 w-3" /> changes
+          </button>
+          <button
+            type="button"
+            onClick={onExpandChanges}
+            data-testid="expand-changes"
+            title={
+              changesHint ??
+              'Open every change at a glance: a disk for each edited file that is not on screen, a bubble for each edited symbol (up to 24), then fit'
+            }
+            className="flex items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted hover:border-accent/60 hover:text-foreground"
+          >
+            <Expand className="h-3 w-3" /> expand
           </button>
           <button
             type="button"

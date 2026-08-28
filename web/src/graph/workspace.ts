@@ -131,6 +131,64 @@ export function workspaceBounds(disks: readonly DiskPlacement[]): WorkspaceBound
   };
 }
 
+/**
+ * An axis-aligned box in workspace units, by its TOP-LEFT corner — a bubble's
+ * footprint (B2.3: a bubble's frame px ARE its size in the world).
+ */
+export interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** A disk's own footprint, as the square its circle is inscribed in. */
+export function diskRect(disk: DiskPlacement): Rect {
+  return {
+    x: disk.x - disk.radius,
+    y: disk.y - disk.radius,
+    w: disk.radius * 2,
+    h: disk.radius * 2,
+  };
+}
+
+/**
+ * Bounding box of everything ON the canvas — disks and bubbles together.
+ *
+ * {@link workspaceBounds} is the disks-only answer and stays exactly that, so a
+ * caller that genuinely only wants the disks keeps the number it always got.
+ * `fit` wants this one: a workspace whose bubbles were framed out of the
+ * picture is not fitted, and "expand all changes" spawns far more bubbles than
+ * disks.
+ */
+export function contentBounds(
+  disks: readonly DiskPlacement[],
+  rects: readonly Rect[]
+): WorkspaceBounds {
+  if (rects.length === 0) return workspaceBounds(disks);
+  const boxes = [...disks.map(diskRect), ...rects];
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (const box of boxes) {
+    if (box.x < minX) minX = box.x;
+    if (box.y < minY) minY = box.y;
+    if (box.x + box.w > maxX) maxX = box.x + box.w;
+    if (box.y + box.h > maxY) maxY = box.y + box.h;
+  }
+  return {
+    minX,
+    minY,
+    maxX,
+    maxY,
+    cx: (minX + maxX) / 2,
+    cy: (minY + maxY) / 2,
+    width: maxX - minX,
+    height: maxY - minY,
+  };
+}
+
 // ------------------------------------------------------------------ camera ---
 
 export interface FitViewport {
@@ -382,6 +440,217 @@ export function placeSpawnedDisk(
     }
   }
   return point;
+}
+
+// ------------------------------------------------------------ bulk packing ---
+
+/**
+ * Placing MANY things at once — "expand all changes" (B4.7).
+ *
+ * {@link placeSpawnedDisk} answers the one-at-a-time question: the user dropped
+ * a disk here, where does it actually go. One click that opens eight disks and
+ * two dozen bubbles is a different question, and it has two parts the drop
+ * gesture never had:
+ *
+ *  1. **Bubbles are in the picture.** A drag-away places a disk clear of the
+ *     other DISKS and lets bubbles fall where they may (the user is looking at
+ *     the drop point, so they see the collision). A bulk expansion the user did
+ *     not aim has to leave nothing overlapping anything.
+ *  2. **Every shape is a box.** Disks are circles, bubbles are rectangles, and
+ *     a circle-vs-rectangle test that is right at the corners is more code than
+ *     the extra clearance is worth. Everything is packed as its bounding BOX,
+ *     which is conservative in exactly one direction: no overlap the test would
+ *     miss, at the cost of a little unused space at four corners. A box that
+ *     clears another box by {@link DISK_GAP} also clears it as a circle, so a
+ *     disk placed here needs no second nudge from {@link placeSpawnedDisk}.
+ *
+ * Determinism is the property everything else rests on: the plan is a pure
+ * function of (what is already on the canvas, what was asked for), placed in
+ * the order it was asked for, with no randomness and no time. The same
+ * workspace and the same changeset always lay out identically, which is what
+ * makes the button idempotent rather than a shuffle.
+ */
+
+/** Rings, and candidates per ring, of the outward scan around a wanted spot. */
+const PACK_RINGS = 32;
+const PACK_ANGLES = 16;
+/** First angle of that scan (up and right) — the same growth bias as the drop. */
+const PACK_START_ANGLE = -Math.PI / 4;
+
+/** Do two boxes touch, once `a` is grown by `gap` on every side? */
+export function rectsOverlap(a: Rect, b: Rect, gap = 0): boolean {
+  return (
+    a.x - gap < b.x + b.w &&
+    a.x + a.w + gap > b.x &&
+    a.y - gap < b.y + b.h &&
+    a.y + a.h + gap > b.y
+  );
+}
+
+/** Does `candidate` clear every occupied box by `gap`? */
+export function rectIsClear(
+  occupied: readonly Rect[],
+  candidate: Rect,
+  gap = DISK_GAP
+): boolean {
+  for (const box of occupied) if (rectsOverlap(candidate, box, gap)) return false;
+  return true;
+}
+
+/**
+ * Where a box of `w × h` goes when it would like to be centred on `near`.
+ *
+ * The wanted spot when it is free; otherwise the nearest ring of the outward
+ * scan that is. The scan is the same shape as {@link placeSpawnedDisk}'s
+ * fallback and for the same reason — it keeps the result NEAR what was asked
+ * for, which is what makes a bubble land beside the disk that shows its wedge
+ * and its tether stay short.
+ *
+ * The last resort is not a scan at all: the box is parked immediately to the
+ * RIGHT of everything already placed, which cannot overlap anything by
+ * construction (its left edge is a full gap past every occupied right edge).
+ * That is what makes this total — there is no input for which it fails to
+ * place, and no unbounded search — and it grows the picture linearly with the
+ * number of things in it rather than drifting.
+ */
+export function placeRect(
+  occupied: readonly Rect[],
+  w: number,
+  h: number,
+  near: Point,
+  gap = DISK_GAP
+): Rect {
+  const at = (cx: number, cy: number): Rect => ({ x: cx - w / 2, y: cy - h / 2, w, h });
+  const wanted = at(near.x, near.y);
+  if (rectIsClear(occupied, wanted, gap)) return wanted;
+
+  const step = (Math.max(w, h) + gap) / 2;
+  for (let ring = 1; ring <= PACK_RINGS; ring++) {
+    for (let slot = 0; slot < PACK_ANGLES; slot++) {
+      const angle = PACK_START_ANGLE + (slot * Math.PI * 2) / PACK_ANGLES;
+      const candidate = at(
+        near.x + Math.cos(angle) * step * ring,
+        near.y + Math.sin(angle) * step * ring
+      );
+      if (rectIsClear(occupied, candidate, gap)) return candidate;
+    }
+  }
+
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  for (const box of occupied) {
+    if (box.x + box.w > maxX) maxX = box.x + box.w;
+    if (box.y < minY) minY = box.y;
+  }
+  if (!Number.isFinite(maxX)) return wanted;
+  return { x: maxX + gap, y: Number.isFinite(minY) ? minY : near.y - h / 2, w, h };
+}
+
+/** A disk to open: how big it will be, and where it would like to be. */
+export interface DiskSpawnRequest {
+  id: string;
+  radius: number;
+  near: Point;
+}
+
+/**
+ * Which disk a bubble belongs beside, and at what angle around it.
+ *
+ * The angle is the wedge's own mid angle in that disk's LAYOUT, which is
+ * independent of where the disk ends up — so a bubble can be planned in the
+ * same pass as the disk it hangs off, before either has a position.
+ */
+export interface BubbleAnchor {
+  diskId: string;
+  angle: number;
+}
+
+/** A bubble to open. `near` is the fallback when the anchor disk is unknown. */
+export interface BubbleSpawnRequest {
+  id: string;
+  w: number;
+  h: number;
+  anchor: BubbleAnchor | null;
+  near: Point;
+}
+
+export interface ExpansionRequest {
+  disks: readonly DiskSpawnRequest[];
+  bubbles: readonly BubbleSpawnRequest[];
+}
+
+export interface PlannedBubble extends Rect {
+  id: string;
+}
+
+export interface ExpansionPlan {
+  /** Disk CENTRES, ready for a spawn. */
+  disks: DiskPlacement[];
+  /** Bubble TOP-LEFT corners, the unit a bubble's own position is in. */
+  bubbles: PlannedBubble[];
+}
+
+/**
+ * Lay out one whole expansion: every new disk and every new bubble, clear of
+ * each other and of everything already on the canvas.
+ *
+ * Disks are placed FIRST, because a bubble's preferred spot is expressed
+ * relative to the disk that shows its wedge and that disk may be one of the new
+ * ones. A bubble whose anchor disk cannot be resolved falls back to its own
+ * `near`, which is always a real point — an unresolvable anchor is a layout
+ * detail, never a reason to skip the bubble the user asked for.
+ */
+export function planExpansion(
+  disks: readonly DiskPlacement[],
+  bubbles: readonly Rect[],
+  request: ExpansionRequest,
+  gap = DISK_GAP
+): ExpansionPlan {
+  const occupied: Rect[] = [...disks.map(diskRect), ...bubbles.map((rect) => ({ ...rect }))];
+  const byId = new Map<string, DiskPlacement>();
+  for (const disk of disks) byId.set(disk.id, disk);
+
+  const plannedDisks: DiskPlacement[] = [];
+  for (const spawn of request.disks) {
+    const radius = Math.max(1, spawn.radius);
+    const rect = placeRect(occupied, radius * 2, radius * 2, spawn.near, gap);
+    const placed: DiskPlacement = {
+      id: spawn.id,
+      x: rect.x + radius,
+      y: rect.y + radius,
+      radius,
+    };
+    plannedDisks.push(placed);
+    byId.set(spawn.id, placed);
+    occupied.push(rect);
+  }
+
+  const plannedBubbles: PlannedBubble[] = [];
+  for (const spawn of request.bubbles) {
+    const w = Math.max(1, spawn.w);
+    const h = Math.max(1, spawn.h);
+    const rect = placeRect(occupied, w, h, bubbleAnchorPoint(spawn, byId, gap), gap);
+    plannedBubbles.push({ id: spawn.id, ...rect });
+    occupied.push(rect);
+  }
+
+  return { disks: plannedDisks, bubbles: plannedBubbles };
+}
+
+/** Just outside the anchor disk's rim, on the wedge's own bearing. */
+function bubbleAnchorPoint(
+  spawn: BubbleSpawnRequest,
+  disks: ReadonlyMap<string, DiskPlacement>,
+  gap: number
+): Point {
+  const anchor = spawn.anchor;
+  const disk = anchor ? disks.get(anchor.diskId) : undefined;
+  if (!anchor || !disk) return spawn.near;
+  const reach = disk.radius + gap + Math.hypot(spawn.w, spawn.h) / 2;
+  return {
+    x: disk.x + Math.cos(anchor.angle) * reach,
+    y: disk.y + Math.sin(anchor.angle) * reach,
+  };
 }
 
 // --------------------------------------------------------- cross-disk edges ---

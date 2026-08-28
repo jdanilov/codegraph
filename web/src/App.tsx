@@ -18,8 +18,13 @@
  *    `GET /api/changes` is refreshed whenever `dataVersion` moves and the
  *    payload is handed to the canvas as a standing overlay — proportional
  *    green/red sub-wedges on each edited file, a hot rim on each edited
- *    symbol, a warm one on what depends on them — over whatever view is
- *    active. While it is off nothing is drawn and nothing is fetched.
+ *    symbol, a warm one on what depends on them, and the change marks in every
+ *    bubble's gutter — over whatever view is active. While it is off nothing
+ *    is drawn and nothing is fetched. Beside it, **expand** opens the whole
+ *    changeset at once (a disk for every edited file not already on screen, a
+ *    bubble for every edited symbol, then a fit) and switches the toggle on if
+ *    it was off — the shell holds that click until the payload the canvas
+ *    needs has actually reached it.
  *  - **Feedback export.** The active view plus the current selection, rendered
  *    as markdown to paste into an agent prompt.
  *  - **URL = state.** Current root, SELECTION, active card, colour mode and
@@ -159,6 +164,8 @@ export default function App() {
   const urlTimer = useRef<number | null>(null);
   /** What the hash currently says — every write is diffed against it. */
   const lastHashRef = useRef<HashState | null>(null);
+  /** An `expand` click waiting for the change payload it needs. */
+  const expandPending = useRef(false);
   /** Project whose stored workspace has already been put back on the canvas. */
   const workspaceRestored = useRef<string | null>(null);
   const workspaceTimer = useRef<number | null>(null);
@@ -217,7 +224,32 @@ export default function App() {
       changed: changes.changedNodes.map((node) => node.id),
       impacted: changes.impactedNodeIds,
     });
+    // `expand` implies the toggle, and the toggle is what fetches — so a click
+    // made with changes switched off (or before the first payload landed) is
+    // held here and runs on the overlay that answers it. One click, one
+    // expansion, whichever order the two arrive in.
+    if (expandPending.current) {
+      expandPending.current = false;
+      controller.expandAllChanges();
+    }
   }, [showChanges, changes, model]);
+
+  /**
+   * "Expand all changes" — a disk for every edited file that is not already on
+   * screen, a bubble for every edited symbol, then a fit.
+   *
+   * The canvas owns the whole algorithm (it is the thing that knows which
+   * wedges are actually drawn); the shell's only job is to make sure the change
+   * payload has reached it first, which is what the flag above is for.
+   */
+  const expandChanges = useCallback(() => {
+    if (showChanges && changes && model) {
+      controllerRef.current?.expandAllChanges();
+      return;
+    }
+    expandPending.current = true;
+    if (!showChanges) setShowChanges(true);
+  }, [showChanges, changes, model, setShowChanges]);
 
   useEffect(() => {
     controllerRef.current?.setHiddenColorKeys(hiddenColorKeys);
@@ -815,6 +847,7 @@ export default function App() {
             onFit={() => controllerRef.current?.fitView()}
             changesShown={showChanges}
             onToggleChanges={() => setShowChanges((value) => !value)}
+            onExpandChanges={expandChanges}
             changesHint={changesHint}
             collapsed={legendPanelCollapsed}
             onToggleCollapsed={() => setLegendPanelCollapsed((value) => !value)}
