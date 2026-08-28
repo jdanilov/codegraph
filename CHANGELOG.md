@@ -63,6 +63,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Your workspace in `codegraph ui` now survives a refresh. The disks you pulled out and where you arranged them are remembered per project and come back when you reopen the page — a disk whose code no longer exists after a re-index is quietly dropped, and closing a disk forgets it. A shared link still decides where the main disk is rooted and what is selected, exactly as before. A disk you pulled out of a slice also stays where it belongs now: it can be drilled into and stepped back out as far as the slice it came from, and no further, so it can never quietly turn into a second copy of the whole project.
 
+- Dragging a file out of the disk in `codegraph ui` now opens it as a code bubble showing the whole file, instead of a disk of its symbols — holding Alt (Option) while you drag still gives you the disk. Folders and individual symbols behave exactly as before, and the preview under your cursor switches between the two as you hold and release the key.
+
 ### Fixes
 
 - Object-literal members declared through a project's `object-literal-members` plugin are now attached to the object that declares them. A component or module defined as an object of methods produced the members as free-standing symbols with nothing joining them to their owner, so "what does this contain" came back empty and anything reading the containment structure — including the graph view — showed the file flat instead of nested. Existing projects pick this up on the next index.

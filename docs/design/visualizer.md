@@ -2393,6 +2393,35 @@ Consequences, all of them intended:
   stands in for. With one constant per kind that max is now simply "the deepest
   kind in the fold".
 
+### A file drags out as a bubble (B4.2; SUPERSEDES phase G2's "leaf → bubble, branch → disk")
+
+`spawnKindFor` decided a drag-away's result **structurally**: no children → a
+bubble of the node's code, children → a disk of the subtree, ⌥ flips it. By
+that rule a file is a branch — it contains its symbols — so dragging a file out
+opened a disk, and the code the reader was reaching for was nowhere on screen.
+
+**A `file` node now defaults to a BUBBLE; ⌥ gives the disk.** Leaves and
+directories are untouched, and ⌥ still flips both of them exactly as before.
+The reasoning is that "show me this file" means "show me its code" far more
+often than it means "show me a ring of its symbols" — and the ring is one ⌥
+away, whereas the code, under the old default, was a spawn, a drill and a
+second drag away.
+
+Everything the bubble needs was already true and is left alone:
+
+- **The bubble is the WHOLE file.** A file node's span *is* the file's line
+  range (`start_line` 1 → `end_line` = LoC), so the existing collapsed fetch
+  `fetchSource(file, startLine, endLine)` returns the entire file with no new
+  request shape. The header's "expand to file" stays hidden for a file
+  (`canExpand: kind !== 'file'`) because there is nothing further to expand to,
+  and `/api/source`'s 512 KB cap still flags an over-long read as truncated.
+- **The box is B3's LoC-derived default**, clamped to ~3–30 rows, so a
+  4,000-line file lands as a 30-row scrollable box rather than a wall.
+- **The ghost tells the truth.** The drag ghost already recomputes
+  `spawnKindFor` on every move and on every ⌥ transition, so the preview under
+  the cursor flips between the box and the disk as the modifier is held —
+  no second code path, and the release lands what the ghost promised.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all

@@ -1429,15 +1429,25 @@ export class CanvasController {
    * The default is the node's own shape: a **leaf** has no subtree, so a disk
    * of it is a lone centre circle while a bubble of it is the thing the user
    * was actually reaching for — its code. Anything with children keeps phase
-   * G's disk. ⌥ flips it in both directions (⌥-drag a file for its source,
-   * ⌥-drag a leaf for a one-node disk), because the default is a good guess
-   * and a good guess needs an override, not an argument.
+   * G's disk. ⌥ flips it in both directions, because the default is a good
+   * guess and a good guess needs an override, not an argument.
+   *
+   * **A FILE is a bubble by default too (round B4)**, even though it has
+   * children. Structurally it is a branch — it contains its symbols — but that
+   * is not what dragging one out means to a reader: "show me this file" is
+   * "show me its code", and a disk of a file is a ring of its symbols with the
+   * code nowhere on screen. The file bubble is the WHOLE file (a file node's
+   * span is the file's own line range, and the header offers no "expand to
+   * file" because there is nothing further to expand to), sized by the same
+   * LoC clamp every other bubble uses. ⌥-drag still gives the disk, which is
+   * where the ring of symbols lives.
    */
   private spawnKindFor(nodeId: string, alt: boolean): 'disk' | 'bubble' {
     const model = this.model;
     if (!model) return 'disk';
     const leaf = model.childrenOf(nodeId).length === 0;
-    const wantsBubble = leaf !== alt;
+    const prefersBubble = leaf || model.get(nodeId)?.kind === 'file';
+    const wantsBubble = prefersBubble !== alt;
     return wantsBubble && this.bubbleable(nodeId) ? 'bubble' : 'disk';
   }
 
