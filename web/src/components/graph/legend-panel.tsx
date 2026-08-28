@@ -38,7 +38,7 @@
  * Like the two right-hand panels, the legend COLLAPSES to its title bar rather
  * than closing (round 2) — the same affordance, in the same place.
  */
-import { ChevronDown, ChevronRight, FileDiff, Palette } from 'lucide-react';
+import { ChevronDown, ChevronRight, Crosshair, Expand, FileDiff, Palette } from 'lucide-react';
 
 import { PanelButton } from '@/components/graph/side-panel';
 import { Card } from '@/components/ui/card';
@@ -155,22 +155,24 @@ export function LegendPanel({
             type="button"
             onClick={onExpandChanges}
             data-testid="expand-changes"
+            aria-label="Expand all changes"
             title={
               changesHint ??
               'Open every change at a glance: a disk for each edited file that is not on screen, a bubble for each edited symbol (up to 24), then fit'
             }
             className="flex items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted hover:border-accent/60 hover:text-foreground"
           >
-            expand
+            <Expand className="h-3 w-3" />
           </button>
           <button
             type="button"
             onClick={onFit}
             data-testid="fit-view"
+            aria-label="Fit view"
             title="Reset zoom and centre the disk"
             className="flex items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted hover:border-accent/60 hover:text-foreground"
           >
-            fit
+            <Crosshair className="h-3 w-3" />
           </button>
           <PanelButton
             onClick={onToggleCollapsed}
