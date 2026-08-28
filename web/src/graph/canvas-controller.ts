@@ -271,8 +271,10 @@ const LABEL_MIN_CHARS = 5;
  *
  * (Round 1 drew this fallback screen-horizontally through the centroid, which
  * scattered text across the disk at every angle and collided with neighbours.
- * Radial text is why files and symbols now get the deeper wedge — see
- * `depthFactor` — the depth IS the label's room.)
+ * Radial text is why files and symbols get the deeper wedge — see
+ * `depthFactor` — the depth IS the label's room. That room is a CONSTANT per
+ * kind as of round B4: a name too long for it is ellipsised here rather than
+ * pushing its own wedge outward past its siblings'.)
  */
 const RLABEL_MIN_LENGTH_PX = 18;
 const RLABEL_MIN_HEIGHT_PX = 8;

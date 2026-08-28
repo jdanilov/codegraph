@@ -12,17 +12,19 @@
  * largest-first (the DaisyDisk convention) so the project reads as "where is
  * the mass". Either way the wedge itself is the LoC share.
  *
- * Radial DEPTH encodes what an arc is AND what its label needs: a directory is
- * one ring thick, a file or a symbol between a third and two thirds more,
- * scaled by the length of the name it has to carry ({@link labelDepthFactor}).
+ * Radial DEPTH encodes what an arc IS, and nothing else (round B4): a directory
+ * is one ring thick, a file or a symbol a third more — one fixed number per
+ * kind, exactly the way a directory has always been sized. It used to be scaled
+ * by the LENGTH OF THE NAME the wedge carried, which made a run of siblings a
+ * ragged staircase driven by spelling rather than by structure; the label now
+ * truncates into the fixed depth ({@link depthFactor}) the way a directory's
+ * always did.
  * Radii are **per branch, not per ring** (round 3): a wedge's children begin at
  * THAT wedge's own outer radius plus one {@link RING_GAP}, so a directory sits
  * directly against the children it contains with only a hairline between them.
  * The band-per-ring model this replaced sized every band by its tallest wedge,
  * which left a ring of whitespace between a shallow directory and its own
  * children — the wedges of one branch now form one continuous radial run.
- * Depth is also LABEL room: a name that cannot follow its arc is drawn
- * radially, and the long names are the files' and the symbols'.
  *
  * Three properties are load-bearing and worth stating outright:
  *
@@ -134,32 +136,15 @@ function ringThickness(ring: number): number {
  */
 export const RING_GAP = 2;
 
-/** Floor depth of a file/symbol wedge, as a multiple of the ring thickness. */
+/** Depth of a file/symbol wedge, as a multiple of the ring thickness. */
 export const FILE_DEPTH_FACTOR = 4 / 3;
-/** Same floor for symbols — kept as its own name for the call sites. */
+/** Same depth for symbols — kept as its own name for the call sites. */
 export const SYMBOL_DEPTH_FACTOR = FILE_DEPTH_FACTOR;
-/** Ceiling for a file/symbol wedge that has a long name to carry. */
-export const MAX_LABEL_DEPTH_FACTOR = 5 / 3;
-
-/**
- * Average glyph advance of the label font, in LAYOUT units.
- *
- * The layout must stay a pure function of (model, rootId, options) — no canvas,
- * no `measureText`, nothing that depends on a device, a font stack or a zoom
- * level. A fixed average advance is the honest approximation: it is only ever
- * used to rank names by how much radial room they want, and a label that ends
- * up a few units short is truncated by the painter exactly as before.
- */
-export const LABEL_CHAR_WIDTH = 5.5;
-
-/** A name needing this many units or fewer is happy at the floor depth. */
-const LABEL_FLOOR_UNITS = 22;
-/** A name needing this many units or more gets the ceiling depth. */
-const LABEL_FULL_UNITS = 132;
 
 /**
  * How deep (radially) a wedge of this kind is drawn, as a multiple of its
- * ring's base thickness. This is the FLOOR — see {@link labelDepthFactor}.
+ * ring's base thickness. **One number per kind — the wedge's NAME is not an
+ * input** (round B4).
  *
  * Directory 1 · file 4/3 · symbol 4/3 — **flipped in the round-2 review**. It
  * was directory 1 · file ¾ · symbol ½, on the theory that the busiest outer
@@ -168,6 +153,14 @@ const LABEL_FULL_UNITS = 132;
  * radial depth is exactly the room a label has — and file and symbol names are
  * the long ones (`canvas-controller.ts` vs `graph`). Directories keep the base
  * thickness; everything that carries a long name gets a third more room.
+ *
+ * Round 4 then made that third a RANGE, interpolated by the label's character
+ * count, so `a.js` and `use-graph-data.ts` sat at visibly different depths.
+ * Round B4 takes it back out: sibling wedges of the same kind now share one
+ * radius, a name too long for it is ellipsised by the painter's `fitLabel`
+ * exactly as a long directory name always was, and a ring of files reads as a
+ * ring instead of a comb. This is what "same approach as directories" means —
+ * a constant, decided by the kind.
  */
 export function depthFactor(kind: string): number {
   if (kind === DIRECTORY_KIND) return 1;
@@ -175,29 +168,8 @@ export function depthFactor(kind: string): number {
   return SYMBOL_DEPTH_FACTOR;
 }
 
-/**
- * Depth of a wedge that has to carry `label`, as a multiple of its ring's base
- * thickness — **the label's room, sized by the label** (round 4).
- *
- * A directory is always exactly 1: it is scaffolding, its names are short, and
- * a uniform inner ring is what makes the structure readable. Everything else
- * interpolates between {@link FILE_DEPTH_FACTOR} and
- * {@link MAX_LABEL_DEPTH_FACTOR} by how many units the name wants
- * (`length × {@link LABEL_CHAR_WIDTH}`), so a run of siblings reads as a
- * staircase: `a.js` sits at the floor, `a2.js` a hair deeper, and the longest
- * name in the ring reaches the ceiling. Clamped at both ends — an 80-character
- * generated name must not be allowed to push the disk past its budget.
- */
-export function labelDepthFactor(kind: string, label: string): number {
-  if (kind === DIRECTORY_KIND) return 1;
-  const wanted = label.length * LABEL_CHAR_WIDTH;
-  const t = (wanted - LABEL_FLOOR_UNITS) / (LABEL_FULL_UNITS - LABEL_FLOOR_UNITS);
-  const clamped = t < 0 ? 0 : t > 1 ? 1 : t;
-  return FILE_DEPTH_FACTOR + (MAX_LABEL_DEPTH_FACTOR - FILE_DEPTH_FACTOR) * clamped;
-}
-
 /** Deepest a wedge is ever drawn, relative to its ring's base thickness. */
-const MAX_DEPTH_FACTOR = MAX_LABEL_DEPTH_FACTOR;
+const MAX_DEPTH_FACTOR = FILE_DEPTH_FACTOR;
 
 /**
  * Outer radius of the deepest possible disk (every ring at its deepest kind,
@@ -778,8 +750,9 @@ export function computeSunburst(
         const a1 = index === slots.length - 1 ? item.a1 : cursor + slot.angle;
         cursor = a1;
         const node = slot.id ? model.get(slot.id) : undefined;
-        // Radial depth is the KIND's floor plus whatever the LABEL wants
-        // (round 4). An aggregate takes the deepest of what it folded, so a
+        // Radial depth is the KIND's, and only the KIND's (round B4) — every
+        // file wedge in a ring is the same depth as every other, whatever it is
+        // called. An aggregate takes the deepest of what it folded, so a
         // `+N` arc never looks shallower than the siblings it stands in for.
         // A wedge expanded as its own disk keeps its NATURAL depth here and is
         // stretched out to the rim by the post-pass below (phase G3) — natural
@@ -787,12 +760,10 @@ export function computeSunburst(
         // than the same wedge uncollapsed would.
         const isCollapsed = node !== undefined && collapsedNodes.has(node.id);
         const factor = node
-          ? labelDepthFactor(node.kind, node.name)
+          ? depthFactor(node.kind)
           : slot.ids.reduce((deepest, id) => {
               const child = model.get(id);
-              return child
-                ? Math.max(deepest, labelDepthFactor(child.kind, child.name))
-                : deepest;
+              return child ? Math.max(deepest, depthFactor(child.kind)) : deepest;
             }, 1);
         const depth = thickness * factor;
         const arc: SunburstArc = {

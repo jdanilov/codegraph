@@ -2354,6 +2354,45 @@ bubblePaintedRect(frame, face) = frame                       // nothing else pai
   tether ARRIVES: the wedge end keeps its radial convention and its dot.
 
 
+### Wedge depth is the KIND's, not the NAME's (B4.1; SUPERSEDES round 4's label-driven depth)
+
+Round 4 made a file/symbol wedge's radial depth a function of its **label
+length** — `labelDepthFactor` interpolated between 4/3 and 5/3 ring thicknesses
+by `name.length × LABEL_CHAR_WIDTH`, so "a run of siblings reads as a
+staircase". It does, and that is the problem: the staircase is driven by
+*spelling*. A ring of files came out as a comb, `a.js` short and
+`use-graph-data.ts` long, with the outer edge of the ring stepping in and out
+for a reason that means nothing about the code. Adjacent wedges of the same kind
+looked like different kinds.
+
+**The rule now: one constant per kind, exactly the way a directory has always
+been sized.** `depthFactor(kind)` is the only depth input — directory 1, file
+4/3, symbol 4/3 — and it is a pure function of the kind alone.
+`labelDepthFactor`, `MAX_LABEL_DEPTH_FACTOR`, `LABEL_CHAR_WIDTH` and the two
+`LABEL_*_UNITS` thresholds are gone; `MAX_DEPTH_FACTOR` (which sets the disk's
+radius ceiling, and through it `MAX_RADIUS`) is now `FILE_DEPTH_FACTOR`, so the
+deepest possible disk is ~20% shallower than round 4's and every ring below it
+starts correspondingly closer in.
+
+Consequences, all of them intended:
+
+- **Labels truncate instead of pushing.** A radial label already fits itself to
+  `geom.radial * 0.92` through `fitLabel`, which ellipsises the longest prefix
+  that fits. That path is unchanged — it simply gets a fixed length to fit
+  into now, which is what a directory label has always been given. A name too
+  long for its wedge is shortened; it no longer widens the wedge.
+- **The kind encoding survives.** Depth still says "directory vs code", which
+  is what a reader decodes before they read a single glyph. What it stopped
+  saying is anything about the name.
+- **Still pure and deterministic.** Depth was already a pure function of
+  (model, root, options); it is now a pure function of strictly less than that.
+  Two disks rooted at equally-shaped subtrees are byte-identical whatever their
+  entries happen to be called.
+- **Aggregate arcs are unaffected in principle**: a `+N` arc still takes the max
+  depth of what it folded, so it can never look shallower than the siblings it
+  stands in for. With one constant per kind that max is now simply "the deepest
+  kind in the fold".
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all

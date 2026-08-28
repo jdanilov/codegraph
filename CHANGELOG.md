@@ -113,6 +113,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - C/C++ function-pointer analysis now bounds its compiled-pattern caches, so very large repositories can no longer exhaust the JavaScript engine's regular-expression code space during indexing. (#1559)
 - JSX rendering analysis now runs only on JavaScript-family files, so JSX-looking strings in C/C++ (or any other language) no longer create impossible call edges — in pure-C projects and in mixed-language monorepos alike. (#1560)
 
+- Slices in the `codegraph ui` disk are no longer drawn deeper or shallower depending on how long their names are. Files and symbols now all get the same depth as each other — the way folders always have — so a ring of files reads as an even ring instead of a comb, and a name too long for its slice is shortened with an ellipsis rather than stretching the slice it sits in.
+
 ## [1.5.0] - 2026-07-21
 
 # ⚡ The Rust engine release — with near-instant sync
