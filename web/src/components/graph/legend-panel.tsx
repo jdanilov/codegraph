@@ -38,7 +38,7 @@
  * Like the two right-hand panels, the legend COLLAPSES to its title bar rather
  * than closing (round 2) — the same affordance, in the same place.
  */
-import { ChevronDown, ChevronRight, Crosshair, Expand, FileDiff, Palette } from 'lucide-react';
+import { ChevronDown, ChevronRight, FileDiff, Palette } from 'lucide-react';
 
 import { PanelButton } from '@/components/graph/side-panel';
 import { Card } from '@/components/ui/card';
@@ -161,7 +161,7 @@ export function LegendPanel({
             }
             className="flex items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted hover:border-accent/60 hover:text-foreground"
           >
-            <Expand className="h-3 w-3" /> expand
+            expand
           </button>
           <button
             type="button"
@@ -170,7 +170,7 @@ export function LegendPanel({
             title="Reset zoom and centre the disk"
             className="flex items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted hover:border-accent/60 hover:text-foreground"
           >
-            <Crosshair className="h-3 w-3" /> fit
+            fit
           </button>
           <PanelButton
             onClick={onToggleCollapsed}
