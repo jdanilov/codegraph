@@ -160,7 +160,7 @@ export function LegendPanel({
               changesHint ??
               'Open every change at a glance: a disk for each edited file that is not on screen, a bubble for each edited symbol (up to 24), then fit'
             }
-            className="flex items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted hover:border-accent/60 hover:text-foreground"
+            className="shrink-0 rounded p-1 text-muted hover:bg-accent/10 hover:text-foreground"
           >
             <Expand className="h-3 w-3" />
           </button>
@@ -170,7 +170,7 @@ export function LegendPanel({
             data-testid="fit-view"
             aria-label="Fit view"
             title="Reset zoom and centre the disk"
-            className="flex items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted hover:border-accent/60 hover:text-foreground"
+            className="shrink-0 rounded p-1 text-muted hover:bg-accent/10 hover:text-foreground"
           >
             <Crosshair className="h-3 w-3" />
           </button>
