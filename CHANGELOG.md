@@ -65,6 +65,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Dragging a file out of the disk in `codegraph ui` now opens it as a code bubble showing the whole file, instead of a disk of its symbols — holding Alt (Option) while you drag still gives you the disk. Folders and individual symbols behave exactly as before, and the preview under your cursor switches between the two as you hold and release the key.
 
+- Imports and exports in the `codegraph ui` disk are now a quiet asphalt grey instead of cyan, and they sit at the bottom of the legend. They are the least interesting symbols a file declares — the dependency they name is already drawn as a connection — so they no longer pull your eye ahead of the code that does the work.
+
 ### Fixes
 
 - Object-literal members declared through a project's `object-literal-members` plugin are now attached to the object that declares them. A component or module defined as an object of methods produced the members as free-standing symbols with nothing joining them to their owner, so "what does this contain" came back empty and anything reading the containment structure — including the graph view — showed the file flat instead of nested. Existing projects pick this up on the next index.

@@ -55,10 +55,20 @@ export const NO_LAYER_COLOR = '#2dd4bf';
  *    something, so it sits between the callables and the free-standing data.
  *  - **data** — `variable`, `constant`, `parameter` — blue, with `parameter`
  *    the lightest of the three (it is the most incidental).
- *  - **plumbing** — `import`, `export` — cyan. They were grey, which said
- *    "ignore me" about the edges that carry a project's whole shape.
  *  - **framework** — `route`, `component` — rose and pink, deliberately the
  *    loudest thing on the disk: they are the entry points.
+ *  - **plumbing** — `import`, `export` — **asphalt** (B4). B3 gave them cyan
+ *    on the argument that "they were grey, which said 'ignore me' about the
+ *    edges that carry a project's whole shape". On a real disk that was
+ *    backwards: an import is the least interesting symbol a file declares —
+ *    it is a restatement of a dependency the graph already draws as an EDGE —
+ *    and cyan is a loud, cold hue that pulled the eye to a ring of `import`
+ *    slivers before anything that the file actually does. Asphalt is a
+ *    deliberately dull, desaturated dark grey: present, nameable in the
+ *    legend, and quiet. `export` keeps the pair legible as a pair by being a
+ *    lighter tint of the same asphalt rather than a second hue — the two are
+ *    one family and read as one. Neither is the DIRECTORY grey ({@link
+ *    DIRECTORY_COLOR}, which is blue-cast and lighter than both).
  */
 const KIND_COLORS: Record<string, string> = {
   [DIRECTORY_KIND]: DIRECTORY_COLOR,
@@ -86,12 +96,12 @@ const KIND_COLORS: Record<string, string> = {
   variable: '#639cf8',
   constant: '#5184f0',
   parameter: '#9bc7fd',
-  // plumbing
-  import: '#4bdbf1',
-  export: '#94d9f9',
   // framework
   route: '#fb7185',
   component: '#f472b6',
+  // plumbing
+  import: '#5b6168',
+  export: '#6f767d',
 };
 
 /**
@@ -105,6 +115,10 @@ const KIND_COLORS: Record<string, string> = {
  * the tail. Anything not named here is still appended (a language could always
  * produce a kind this list has not heard of), and the legend still shows only
  * the kinds actually on the disk.
+ *
+ * Within that, the families run most- to least-worth-your-attention, which is
+ * why **plumbing now comes last** (B4): `import` / `export` are the least
+ * interesting symbols a file declares, and their asphalt says the same thing.
  */
 const LEGEND_KIND_ORDER = [
   DIRECTORY_KIND,
@@ -132,12 +146,13 @@ const LEGEND_KIND_ORDER = [
   'variable',
   'constant',
   'parameter',
-  // plumbing
-  'import',
-  'export',
   // framework
   'route',
   'component',
+  // plumbing LAST (B4): the legend reads top-to-bottom as most-to-least worth
+  // your attention, and an import is the least of them.
+  'import',
+  'export',
 ];
 
 /** Hue ramp for layers — generated, so any project vocabulary is covered. */

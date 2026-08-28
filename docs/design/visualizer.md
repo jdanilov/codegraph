@@ -2469,6 +2469,33 @@ matter most: the biggest ones are the first to have their hunks dropped, so a
 6,000-line rewrite could arrive as a sliver. The denominator stays client-side
 (the file node's own LoC, which the model already holds).
 
+### `import` / `export` are asphalt, and last in the legend (B4.4; SUPERSEDES B3's cyan plumbing family)
+
+B3 moved `import` and `export` off grey and onto cyan, reasoning that grey
+*"said 'ignore me' about the edges that carry a project's whole shape"*. On a
+real disk that is exactly backwards. The shape a project's imports carry is
+already drawn — as `imports` EDGES, which have their own direction colours. The
+`import` NODE is the least interesting symbol a file declares: a restatement of
+a dependency, one per line, dozens per file. Cyan is loud and cold and owned by
+nothing else, so a ring of import slivers was the first thing the eye found on
+a file that had just been drilled into.
+
+- **`import` is `#5b6168`, `export` is `#6f767d`** — asphalt: desaturated, dark,
+  deliberately dull. Nameable in the legend, invisible from across the room.
+- **The pair stays a pair.** `export` is a lighter tint of the same asphalt
+  rather than a second hue, so the family still reads as one family — the same
+  device the type-declaration family uses to separate `enum` from
+  `enum_member`.
+- **Neither is the directory grey.** {@link DIRECTORY_COLOR} `#7c8698` is
+  blue-cast and lighter than both, and directories live on the inner rings
+  anyway.
+- **Plumbing moves to the END of `LEGEND_KIND_ORDER`**, after the framework
+  family. The legend reads top-to-bottom as most- to least-worth-your-attention
+  and the colour now says the same thing the position does.
+- **Single source of colour is intact.** `palette.ts` is still the only place a
+  kind's colour is written down; the canvas and the legend both read this table,
+  so they cannot drift.
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all
