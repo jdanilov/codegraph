@@ -21,6 +21,11 @@
  * Every value is imported from `@/graph/palette`, never re-typed here: the
  * canvas paints from the same tables, so the legend cannot drift from the disk.
  *
+ * Its header is also where the disk's own switches live — the colour mode,
+ * `fit`, and (round B4) the **changes** toggle that replaced the standing
+ * Changes card. They are all the same kind of control: how the disk in front of
+ * you is drawn, as opposed to where you are standing in it.
+ *
  * What is NOT here: the wedge/budget count, the ring count and the
  * edges-rendered readout — that was renderer telemetry, no question a developer
  * reading a codebase actually asks (phase F, "no renderer telemetry on screen")
@@ -32,7 +37,7 @@
  * Like the two right-hand panels, the legend COLLAPSES to its title bar rather
  * than closing (round 2) — the same affordance, in the same place.
  */
-import { ChevronDown, ChevronRight, Crosshair, Palette } from 'lucide-react';
+import { ChevronDown, ChevronRight, Crosshair, FileDiff, Palette } from 'lucide-react';
 
 import { PanelButton } from '@/components/graph/side-panel';
 import { Card } from '@/components/ui/card';
@@ -52,6 +57,19 @@ export interface LegendPanelProps {
   onToggleKey(key: string): void;
   /** Reset zoom and centre the disk. */
   onFit(): void;
+  /**
+   * Uncommitted work shown on the disk and in the bubbles, or not (round B4).
+   *
+   * This replaced the standing "Changes" CARD: what a reader wanted from it was
+   * never a place to go — it was an overlay to have on or off while they read
+   * whatever they were already reading. It lives here rather than in the
+   * questions panel because that is what this panel is: the switches for how
+   * the disk is drawn, beside the colour mode and `fit`.
+   */
+  changesShown: boolean;
+  onToggleChanges(): void;
+  /** Why changes are unavailable (not a git tree, read failed) — a tooltip. */
+  changesHint?: string | null;
   collapsed: boolean;
   onToggleCollapsed(): void;
 }
@@ -64,6 +82,9 @@ export function LegendPanel({
   hidden,
   onToggleKey,
   onFit,
+  changesShown,
+  onToggleChanges,
+  changesHint,
   collapsed,
   onToggleCollapsed,
 }: LegendPanelProps) {
@@ -97,6 +118,26 @@ export function LegendPanel({
               ))}
             </div>
           ) : null}
+          <button
+            type="button"
+            onClick={onToggleChanges}
+            data-testid="toggle-changes"
+            aria-pressed={changesShown}
+            title={
+              changesHint ??
+              (changesShown
+                ? 'Hide uncommitted changes on the disk'
+                : 'Show uncommitted changes on the disk')
+            }
+            className={cn(
+              'flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px]',
+              changesShown
+                ? 'border-accent/60 bg-accent/15 text-accent'
+                : 'border-border text-muted hover:border-accent/60 hover:text-foreground'
+            )}
+          >
+            <FileDiff className="h-3 w-3" /> changes
+          </button>
           <button
             type="button"
             onClick={onFit}

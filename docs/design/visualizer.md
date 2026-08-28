@@ -2496,6 +2496,124 @@ a file that had just been drilled into.
   kind's colour is written down; the canvas and the legend both read this table,
   so they cannot drift.
 
+### Changes are a toggle, not a view (B4.5; SUPERSEDES phase D's standing "Changes" card)
+
+Phase D gave changes a **card**: a standing view beside Project that you
+activated, which lit every edited symbol and everything the edit reached. Round
+4 then started reading `/api/changes` for *every* view anyway, so the disk could
+carry a permanent marker on each edited file — at which point the card was two
+things at once, and neither of them well:
+
+- as a **place**, it competed with the question cards for the one "active view"
+  slot, so looking at what you had edited meant leaving whatever question you
+  were reading; and
+- as an **annotation**, it was already always-on, but its rims (`changed`,
+  `impacted`) rode inside the CARD highlight — so activating any question card
+  silently wiped them.
+
+**Changes is now one switch in the legend panel's header**, beside the colour
+mode and `fit`, which is where the other "how is this disk drawn" controls live.
+
+- **On** (the default, and persisted per browser in `localStorage` like the
+  panel widths): the payload is handed to the canvas as a standing
+  {@link ChangeOverlay} — proportional green/red sub-wedges on each edited file
+  (B4.3), a hot rim on each edited symbol, a warm rim on what depends on them —
+  **over whatever view is active**. It dims nothing, so it composes with a
+  question card instead of replacing it.
+- **Off**: none of it is drawn, and none of it is fetched.
+- **Fetching follows the toggle.** `/api/changes` is polled on `dataVersion`
+  only while the switch is on. It is a cheap call but not a free one (a `git
+  status` plus a `git diff HEAD` per index tick), and nobody should pay for a
+  picture they switched off. Switching it back on re-fetches immediately,
+  because the flag is one of the effect's inputs; the last payload is still in
+  state, so the overlay reappears in the same frame as the click.
+- **One channel, one lifetime.** `CanvasHighlight` lost `changed` / `impacted`
+  and is now purely "the answer to this question"; `setChangeOverlay` owns all
+  three parts of the annotation (markers, changed, impacted) and is the only way
+  to set or clear them. That is what makes "a card can no longer wipe the
+  changes" structural rather than a rule somebody has to remember.
+- **Old links degrade silently.** A hash (or a history entry) naming
+  `view:changes` restores as Project without a word — the id is kept only to be
+  recognised. The browser's own toggle already says whether changes are shown,
+  which is a better answer than resurrecting a view that no longer exists.
+- **The code panel keeps "diff first", better scoped.** It used to open on the
+  diff for every node whenever the Changes view was active. It now does so when
+  the toggle is on **and the selected node is actually one of the edited ones**
+  — the useful half of the old behaviour, without opening an empty diff on every
+  unchanged file.
+- **What went with the view:** the changed-file list in the questions panel, and
+  the Changes-specific feedback export context. The list was a second
+  presentation of what the disk now says in colour, and it cost the panel the
+  room the questions need.
+- **Bubbles.** The toggle is written as the single switch for "is uncommitted
+  work shown", the bubbles included. As of this round bubbles carry no
+  change colouring of their own to gate — the gutter is line numbers and call
+  markers — so today the switch governs the wedges. A bubble-side treatment
+  reads `showChanges` when it lands; there is deliberately no second flag.
+
+### Code bubbles & workspace (B3, tasks 1–4) — catch-up record (additive; written after the fact)
+
+B3 landed in four commits (`d73624c`, `4a16f51`, `8642ec2`, plus B3.1's tether
+fix which has its own block above) and never got a design block of its own. This
+is that record, written from the commits.
+
+**1. A project's state cannot leak into another project (`d73624c`).** Stopping
+`codegraph ui` in one folder and starting it in another redrew the PREVIOUS
+project: `/api/graph` is the one cacheable route, and its ETag named only
+`dataVersion` — a per-process counter that starts at 1 for every root. Same
+loopback origin, same URL, same validator, so the browser revalidated the old
+payload against the new server, took the 304, and drew disks, bubbles and file
+paths that do not exist here. Three parts to the fix, and they are layered
+deliberately:
+
+- the graph's **ETag now names the project as well as the version**, so one
+  project's cached graph can never validate against another's — a browser
+  already holding the stale entry heals on its next load;
+- the client **cross-checks the two**: `/api/status` is never cached, so a graph
+  whose root disagrees with it is a replayed copy and is re-fetched past the
+  cache rather than drawn;
+- the stored **workspace was already keyed per project root** (an FNV hash of
+  the absolute path — short, opaque, collision-free between projects) and
+  restore already drops disks and bubbles naming nodes this project does not
+  have. What B3 added there was the reasoning, written down at the key.
+
+**2. A bubble is born the size of its code (`4a16f51`).** Every bubble used to
+be one fixed box whatever it held. The default now comes from the node's own
+line count, clamped to **3 rows at the floor and 30 at the ceiling**, from one
+pure helper that the drag GHOST and the release share — so the box that appears
+is the box the drag drew. The height floor came down with it (96 → 56 px): a
+three-line function is allowed to be a three-line box.
+
+**3. Long lines wrap, and the row is the unit (`4a16f51`).** The body was a
+gutter column beside a single `<pre>`, so a line longer than the box ran off the
+side of it. It is now a **grid with one row per logical line**: the default
+width doubled, and a line still too long for it wraps inside its own row, so
+horizontal scrolling is gone because there is nothing left to scroll to.
+Highlighted HTML is split per line with the open span stack carried across each
+break (a comment or template literal spanning lines keeps its colour in every
+row); a split that does not come back one-row-per-line is simply not applied.
+The consequence that mattered most: with wrapping, a line is no longer at
+`index × lineHeight`. The view **measures every row's top once per load** (and
+after a resize or a re-layout, which is what changes where lines wrap) and hands
+that table to the anchor arithmetic as data — so call threads, gutter markers,
+scroll-to-line and the centre-line rule all follow a wrapped line while the
+arithmetic itself stays pure. With no measurements yet, or a frame showing its
+label, it falls back to exactly the pre-B3 formula.
+
+**4. The palette is families, not kinds (`8642ec2`).** The kind table had grown
+one kind at a time and said nothing as a whole — `file` cyan while `import` was
+grey, `enum` orange while `type_alias` was violet, `variable` sharing a yellow
+with `property`. It was regrouped into **seven families a reader actually groups
+by** — containers, type declarations, callables, members, data, plumbing,
+framework — each owning a hue range nobody else uses, with shades separated
+inside a family by lightness and saturation rather than by hue. The legend lists
+them in that order, one family finishing before the next begins, and it names
+**every** kind rather than a hand-picked dozen with the rest alphabetised into
+the tail (which split every family in two). One table still feeds the wedges,
+the legend chips, the search rows, the relation lists and the tooltip, so
+nothing can drift. (B4.4 above supersedes this block's cyan for the plumbing
+family and moves it to the end of the legend order.)
+
 ## Phases (agent train, sequential)
 
 1. **A — server + scaffold**: `codegraph ui` command, `src/ui-server/`, all

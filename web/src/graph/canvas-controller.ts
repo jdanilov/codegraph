@@ -24,8 +24,8 @@
  *  - hit testing (workspace → disk → angle-first ring search, per disk);
  *  - navigation: click a directory to re-root, click the centre to go up,
  *    double-click anything to drill into it, `reveal(id)` for ⌘P;
- *  - the persistent highlight a card / the Changes view drives, applied
- *    uniformly to every disk.
+ *  - the persistent highlight a card drives and the standing change overlay,
+ *    both applied uniformly to every disk.
  *
  * Edges are **hidden at rest**. They appear for the hovered arc's subtree, the
  * current selection, or the active card's `edgeRefs` — bundled along the
@@ -123,21 +123,41 @@ export interface ArcTooltip {
 }
 
 /**
- * What a card (or the Changes view) asks the canvas to light up.
+ * What a card asks the canvas to light up.
  *
- * Three independent channels because they answer different questions and are
- * shown at once: `nodes`/`edges` are "the answer to this question", `changed`
- * is "you edited this", `impacted` is "this depends on what you edited".
+ * Just the ONE channel since round B4: "the answer to this question". Changes
+ * used to ride in here too (`changed` / `impacted`), because they were a card —
+ * a standing view you switched TO. They are now a standing ANNOTATION with a
+ * toggle of their own ({@link ChangeOverlay}), which is a different lifetime:
+ * a card's highlight is replaced whenever another card is activated, and the
+ * changes must survive that.
  */
 export interface CanvasHighlight {
   /** Result nodes of a card — glowed, everything else dimmed. */
   nodes?: Iterable<string>;
   /** Result edges, matched to model edges by (source, target, kind). */
   edges?: Iterable<{ source: string; target: string; kind: string }>;
+}
+
+/**
+ * Uncommitted work, as a standing annotation on every disk (round B4).
+ *
+ * One object rather than three setters because the three parts are one fact
+ * and are switched on and off together by one toggle: `markers` sizes the
+ * green/red sub-wedges, `changed` gives an edited node its hot rim, `impacted`
+ * gives a node that depends on one a warm rim. `null` means the toggle is off
+ * (or there is nothing uncommitted) and nothing at all is drawn.
+ *
+ * Deliberately NOT a focus channel: unlike a card's result it dims nothing, so
+ * it can be on while you read anything else.
+ */
+export interface ChangeOverlay {
+  /** File node id → the share of its lines added / removed. */
+  markers: Iterable<[string, ChangeMarker]>;
   /** Nodes with uncommitted edits — hot rim. */
-  changed?: Iterable<string>;
+  changed: Iterable<string>;
   /** Nodes within the impact radius of a change — warm rim. */
-  impacted?: Iterable<string>;
+  impacted: Iterable<string>;
 }
 
 /**
@@ -966,7 +986,7 @@ export class CanvasController {
    */
   private aggregateCounts = new Map<SunburstArc, number>();
 
-  /** File node id → what changed in it, for the outer-rim change markers. */
+  /** File node id → what changed in it, sizing its change sub-wedges. */
   private changeMarkers = new Map<string, ChangeMarker>();
 
   /**
@@ -1213,14 +1233,30 @@ export class CanvasController {
   }
 
   /**
-   * Uncommitted-change markers, keyed by FILE node id (round 4).
+   * Show (or hide) uncommitted work — the "changes" toggle's one entry point.
    *
-   * Always on in the normal view — it costs two thin bars on the handful of
-   * wedges that actually changed, and "what have I touched" is the question a
-   * developer opens this UI with more often than any other.
+   * Round B4 folded the three parts of it into one call. They used to arrive
+   * separately, and from two different places: the markers through a setter of
+   * their own, the changed/impacted rims as two fields of the CARD highlight,
+   * which meant activating any question card silently wiped the change rims
+   * because a card's highlight replaces the whole highlight. Changes are not a
+   * card and never were — they are a standing annotation, on whatever you are
+   * looking at, so they get a lifetime of their own and one switch.
+   *
+   * `null` draws none of it. Ids the model doesn't know are dropped silently
+   * (a payload can name a file the index has not caught up with yet).
    */
-  setChangeMarkers(markers: Iterable<[string, ChangeMarker]>): void {
-    this.changeMarkers = new Map(markers);
+  setChangeOverlay(overlay: ChangeOverlay | null): void {
+    const model = this.model;
+    const known = (ids: Iterable<string>): Set<string> => {
+      const out = new Set<string>();
+      for (const id of ids) if (!model || model.nodes.has(id)) out.add(id);
+      return out;
+    };
+    this.changeMarkers = new Map(overlay?.markers ?? []);
+    this.changedNodes = known(overlay?.changed ?? []);
+    this.impactedNodes = known(overlay?.impacted ?? []);
+    this.projectHighlight();
     this.requestDraw();
   }
 
@@ -2682,7 +2718,7 @@ export class CanvasController {
   }
 
   /**
-   * Re-root onto a result set — what a card (or the Changes view) does.
+   * Re-root onto a result set — what a card does.
    *
    * The disk lands on the deepest node that contains every result, so a card
    * answering inside one file opens that file's symbol ring and a card spread
@@ -2955,8 +2991,6 @@ export class CanvasController {
       return out;
     };
     this.resultNodes = known(highlight?.nodes);
-    this.changedNodes = known(highlight?.changed);
-    this.impactedNodes = known(highlight?.impacted);
 
     this.resultEdges = new Set<string>();
     if (model) {
@@ -4651,8 +4685,8 @@ export class CanvasController {
         hoveredArc.nodeId ? [hoveredArc.nodeId] : this.visibleAggregated(hoveredArc),
         hoverEdges,
         directions,
-        // A card with an edge set scopes the hover to that set; a view with no
-        // edges of its own (Changes, Project) leaves the hover unfiltered.
+        // A card with an edge set scopes the hover to that set; the Project
+        // view, which has no edges of its own, leaves the hover unfiltered.
         this.resultEdges.size > 0 ? this.resultEdges : null
       );
       for (const [key, edge] of hoverEdges) {

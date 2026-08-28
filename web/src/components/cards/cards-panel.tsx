@@ -1,11 +1,16 @@
 /**
  * The cards panel — the question surface of the visualizer.
  *
- * Three kinds of entry live in one list, in a deliberate order:
+ * Two kinds of entry live in one list, in a deliberate order:
  *
  *  1. **Project** — the whole graph from its root, always first;
- *  2. **Changes** — everything uncommitted, plus what it impacts;
- *  3. saved **question cards**, newest first.
+ *  2. saved **question cards**, newest first.
+ *
+ * There used to be a third — a standing **Changes** view that lit up
+ * everything uncommitted. It is gone (round B4): what a reader wanted from it
+ * was not a place to go but an overlay to have on, so it became a toggle in the
+ * legend panel's header and the change annotation is now drawn on whatever view
+ * you are already in.
  *
  * The ask box has a floor and a ceiling (contract): pressing Enter always runs
  * the deterministic explore — it needs no key and always answers — and, when an
@@ -18,7 +23,6 @@ import {
   Braces,
   ChevronDown,
   ChevronRight,
-  FileDiff,
   Files,
   FolderTree,
   Loader2,
@@ -33,14 +37,13 @@ import { PanelButton } from '@/components/graph/side-panel';
 import { Card as Surface } from '@/components/ui/card';
 import { DIRECTORY_KIND, type GraphModel } from '@/graph/model';
 import { colorForKind } from '@/graph/palette';
-import type { Card, ChangesPayload, ExploreResult } from '@/lib/api';
+import type { Card, ExploreResult } from '@/lib/api';
 import { iconForNode } from '@/lib/file-icons';
 import { distinctFiles, qualifiedLabel } from '@/lib/qualify';
 import { cn } from '@/lib/utils';
 
-/** Ids of the two standing views. They are client-side and never persisted. */
+/** Id of the standing view. Client-side, and never persisted. */
 export const PROJECT_VIEW_ID = 'view:project';
-export const CHANGES_VIEW_ID = 'view:changes';
 
 /** Rows shown before a list collapses behind "+N more". */
 const LIST_PREVIEW = 8;
@@ -49,8 +52,6 @@ export interface CardsPanelProps {
   cards: Card[];
   activeId: string;
   model: GraphModel | null;
-  changes: ChangesPayload | null;
-  changesError: string | null;
   /** True while a question is being answered. */
   busy: boolean;
   /** True when an API key is configured — gates the "refine with AI" action. */
@@ -71,8 +72,6 @@ export function CardsPanel({
   cards,
   activeId,
   model,
-  changes,
-  changesError,
   busy,
   askAvailable,
   error,
@@ -154,15 +153,6 @@ export function CardsPanel({
           >
             <FolderTree className="h-3 w-3" />
           </StandingRow>
-          <StandingRow
-            id={CHANGES_VIEW_ID}
-            label="Changes"
-            hint={changesSummary(changes, changesError)}
-            active={activeId === CHANGES_VIEW_ID}
-            onClick={() => onActivate(CHANGES_VIEW_ID)}
-          >
-            <FileDiff className="h-3 w-3" />
-          </StandingRow>
 
           {cards.map((card) => (
             <QuestionRow
@@ -176,23 +166,14 @@ export function CardsPanel({
           ))}
         </div>
 
-        {activeId === CHANGES_VIEW_ID || activeCard ? (
+        {activeCard ? (
           <div className="mt-2 border-t border-border/60 pt-2">
-            {activeId === CHANGES_VIEW_ID ? (
-              <ChangesBody
-                changes={changes}
-                error={changesError}
-                model={model}
-                onNavigate={onNavigate}
-              />
-            ) : activeCard ? (
-              <ResultBody
-                result={activeCard.result}
-                model={model}
-                onNavigate={onNavigate}
-                onRefine={askAvailable && !busy ? () => onRefine(activeCard) : null}
-              />
-            ) : null}
+            <ResultBody
+              result={activeCard.result}
+              model={model}
+              onNavigate={onNavigate}
+              onRefine={askAvailable && !busy ? () => onRefine(activeCard) : null}
+            />
           </div>
         ) : null}
       </div>
@@ -234,15 +215,6 @@ function PanelHeader({
       </PanelButton>
     </div>
   );
-}
-
-function changesSummary(changes: ChangesPayload | null, error: string | null): string {
-  if (error) return 'unavailable';
-  if (!changes) return 'vs HEAD';
-  if (!changes.git) return 'not a git repo';
-  const files = changes.changedFiles.length;
-  if (files === 0) return 'nothing uncommitted';
-  return `${files} file${files === 1 ? '' : 's'} · ${changes.impactedNodeIds.length} impacted`;
 }
 
 function StandingRow({
@@ -459,116 +431,6 @@ function ResultBody({
   );
 }
 
-/** The Changes view body: files with their status, then the impacted count. */
-function ChangesBody({
-  changes,
-  error,
-  model,
-  onNavigate,
-}: {
-  changes: ChangesPayload | null;
-  error: string | null;
-  model: GraphModel | null;
-  onNavigate(id: string): void;
-}) {
-  const [all, setAll] = useState(false);
-  if (error) return <p className="px-1 text-[10px] text-red-400">{error}</p>;
-  if (!changes) {
-    return (
-      <p className="flex items-center gap-2 px-1 text-[10px] text-muted">
-        <Loader2 className="h-3 w-3 animate-spin" /> reading git…
-      </p>
-    );
-  }
-  if (!changes.git) {
-    return (
-      <p className="px-1 text-[10px] leading-relaxed text-muted">
-        This project is not inside a git work tree, so there is nothing to compare against.
-      </p>
-    );
-  }
-  if (changes.changedFiles.length === 0) {
-    return <p className="px-1 text-[10px] text-muted">Nothing uncommitted — the tree matches HEAD.</p>;
-  }
-
-  const nodesByFile = new Map<string, ChangesPayload['changedNodes']>();
-  for (const node of changes.changedNodes) {
-    if (node.kind === 'file') continue;
-    const list = nodesByFile.get(node.file);
-    if (list) list.push(node);
-    else nodesByFile.set(node.file, [node]);
-  }
-
-  const files = all ? changes.changedFiles : changes.changedFiles.slice(0, LIST_PREVIEW);
-
-  return (
-    <div className="flex flex-col gap-1.5">
-      <p className="px-1 text-[10px] text-muted">
-        {changes.changedNodes.length} changed · {changes.impactedNodeIds.length} impacted
-        {changes.truncated ? ' · truncated' : ''}
-      </p>
-      {files.map((file) => (
-        <div key={file.path}>
-          <button
-            type="button"
-            onClick={() => file.nodeId && onNavigate(file.nodeId)}
-            disabled={!file.nodeId}
-            title={file.path}
-            data-testid="changed-file"
-            data-status={file.status}
-            className={cn(
-              'flex w-full items-center gap-1.5 rounded px-1.5 py-[3px] text-left',
-              file.nodeId ? 'hover:bg-accent/10' : 'cursor-default opacity-70'
-            )}
-          >
-            <span className={cn('w-3 shrink-0 text-center text-[9px] font-bold', statusColor(file.status))}>
-              {statusLetter(file.status)}
-            </span>
-            <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-foreground/90">
-              {file.path}
-            </span>
-            <span className="shrink-0 text-[9px] text-muted/70">{file.hunkCount}h</span>
-          </button>
-          <div className="flex flex-col pl-4">
-            {(nodesByFile.get(file.path) ?? []).map((node) => (
-              <button
-                key={node.id}
-                type="button"
-                onClick={() => onNavigate(node.id)}
-                data-testid="changed-node"
-                className="flex items-center gap-1.5 rounded px-1.5 py-[2px] text-left hover:bg-accent/10"
-              >
-                <span
-                  className="h-1.5 w-1.5 shrink-0 rounded-full"
-                  style={{ backgroundColor: colorForKind(node.kind) }}
-                />
-                <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-foreground/85">
-                  {node.name}
-                </span>
-                <span className="shrink-0 text-[9px] text-muted/70">
-                  {node.startLine}–{node.endLine}
-                </span>
-              </button>
-            ))}
-          </div>
-        </div>
-      ))}
-      {!all && changes.changedFiles.length > files.length ? (
-        <button
-          type="button"
-          onClick={() => setAll(true)}
-          className="px-1.5 text-left text-[10px] text-accent/80 hover:text-accent"
-        >
-          +{changes.changedFiles.length - files.length} more files
-        </button>
-      ) : null}
-      {model === null ? (
-        <p className="px-1 text-[10px] text-muted">Index this project to see impact on the graph.</p>
-      ) : null}
-    </div>
-  );
-}
-
 /**
  * One symbol of an answer.
  *
@@ -621,12 +483,3 @@ export function flowChain(flow: ExploreResult['flow']): Array<{ id: string; via:
   return chain;
 }
 
-function statusLetter(status: string): string {
-  return status === 'deleted' ? 'D' : status === 'added' ? 'A' : status === 'untracked' ? '?' : 'M';
-}
-
-function statusColor(status: string): string {
-  if (status === 'deleted') return 'text-rose-400';
-  if (status === 'added' || status === 'untracked') return 'text-emerald-400';
-  return 'text-amber-400';
-}

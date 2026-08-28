@@ -9,14 +9,17 @@
  * swapped the representation underneath it for a sunburst, which changes what
  * "apply a card to the canvas" means:
  *
- *  - **Cards.** Two standing views (Project, Changes) plus saved question
- *    cards. Activating one selects nothing, glows the result (dimming the rest)
+ *  - **Cards.** One standing view (Project) plus saved question cards.
+ *    Activating one selects nothing, glows the result (dimming the rest)
  *    and bundles the result's edges. **A view is a highlighter and never moves
  *    the camera** (phase G3): no fit, no pan, no zoom, no re-root — switching
  *    views changes what is lit, never where you are standing.
- *  - **Changes.** `GET /api/changes` refreshed whenever `dataVersion` moves
- *    while the view is active — changed arcs wear a hot rim, impacted ones a
- *    warm one, and a node opened from here shows its diff first.
+ *  - **Changes.** A TOGGLE, not a view (round B4). While it is on,
+ *    `GET /api/changes` is refreshed whenever `dataVersion` moves and the
+ *    payload is handed to the canvas as a standing overlay — proportional
+ *    green/red sub-wedges on each edited file, a hot rim on each edited
+ *    symbol, a warm one on what depends on them — over whatever view is
+ *    active. While it is off nothing is drawn and nothing is fetched.
  *  - **Feedback export.** The active view plus the current selection, rendered
  *    as markdown to paste into an agent prompt.
  *  - **URL = state.** Current root, SELECTION, active card, colour mode and
@@ -34,11 +37,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CommandPalette } from '@/components/command-palette';
 import { HelpOverlay } from '@/components/help-overlay';
 import { SettingsDialog } from '@/components/settings-dialog';
-import {
-  CardsPanel,
-  CHANGES_VIEW_ID,
-  PROJECT_VIEW_ID,
-} from '@/components/cards/cards-panel';
+import { CardsPanel, PROJECT_VIEW_ID } from '@/components/cards/cards-panel';
 import { FeedbackDialog, type FeedbackNode } from '@/components/feedback-dialog';
 import { CodePanel } from '@/components/graph/code-panel';
 import { GraphCanvas } from '@/components/graph/graph-canvas';
@@ -130,13 +129,22 @@ export default function App() {
 
   const [changes, setChanges] = useState<ChangesPayload | null>(null);
   const [changesError, setChangesError] = useState<string | null>(null);
+  /**
+   * Show uncommitted work on the disk and in the bubbles — the round-B4 toggle
+   * that replaced the standing Changes VIEW.
+   *
+   * `localStorage`, like the panel widths, and for the same reason: it is how
+   * this person has this browser set up, not part of the view a link shares.
+   * Default ON — "what have I touched" is the question a developer opens this
+   * UI with more often than any other, and the annotation costs a git call and
+   * a fill per changed wedge.
+   */
+  const [showChanges, setShowChanges] = useStoredState('showChanges', true);
 
   // Refs the imperative canvas work reads: the apply/restore paths run outside
   // React's render, so they must not close over stale state.
   const cardsRef = useRef(cards);
   cardsRef.current = cards;
-  const changesRef = useRef(changes);
-  changesRef.current = changes;
   const activeRef = useRef(activeId);
   activeRef.current = activeId;
   const modelRef = useRef(model);
@@ -190,10 +198,26 @@ export default function App() {
     }
   }, []);
 
-  /** The markers themselves: file node id → share of its lines added/removed. */
+  /**
+   * The change overlay: sub-wedge sizes, the edited nodes and what they impact,
+   * as ONE hand-off — or nothing at all while the toggle is off.
+   *
+   * It is not a card highlight (it dims nothing and survives switching cards)
+   * and it is not tied to a view, so it applies over whatever is on screen.
+   */
   useEffect(() => {
-    controllerRef.current?.setChangeMarkers(changeMarkers(changes, model));
-  }, [changes, model]);
+    const controller = controllerRef.current;
+    if (!controller) return;
+    if (!showChanges || !changes || !model) {
+      controller.setChangeOverlay(null);
+      return;
+    }
+    controller.setChangeOverlay({
+      markers: changeMarkers(changes, model),
+      changed: changes.changedNodes.map((node) => node.id),
+      impacted: changes.impactedNodeIds,
+    });
+  }, [showChanges, changes, model]);
 
   useEffect(() => {
     controllerRef.current?.setHiddenColorKeys(hiddenColorKeys);
@@ -252,18 +276,6 @@ export default function App() {
     [model]
   );
 
-  const applyChanges = useCallback(
-    (payload: ChangesPayload) => {
-      const controller = controllerRef.current;
-      if (!controller || !model) return;
-      const changed = payload.changedNodes.map((node) => node.id);
-      controller.setHighlight({ changed, impacted: payload.impactedNodeIds });
-      controller.setSelected(null);
-      setSelectedNode(null);
-    },
-    [model]
-  );
-
   const activate = useCallback(
     (id: string) => {
       setActiveId(id);
@@ -278,30 +290,27 @@ export default function App() {
         setSelectedNode(null);
         return;
       }
-      if (id === CHANGES_VIEW_ID) {
-        const payload = changesRef.current;
-        if (payload) applyChanges(payload);
-        else void loadChanges().then((next) => next && applyChanges(next));
-        return;
-      }
       applyResult(cardsRef.current.find((card) => card.id === id)?.result);
     },
-    [model, applyChanges, applyResult, loadChanges]
+    [model, applyResult]
   );
 
   /**
-   * Changes are read for EVERY view now, not just the Changes card (round 4):
-   * the disk carries a permanent added/removed marker on each changed file, so
-   * the payload is part of the normal picture rather than a mode. It is one git
-   * call against the working tree, refreshed on the contract's `dataVersion`
-   * signal, and it only ever touches files that actually changed.
+   * Changes are read WHILE THE TOGGLE IS ON, for whatever view is active
+   * (round B4) — the annotation is part of the normal picture rather than a
+   * mode you switch to. It is one git call against the working tree, refreshed
+   * on the contract's `dataVersion` signal, and it only ever touches files that
+   * actually changed.
+   *
+   * Fetching is gated on the toggle rather than left running: it is cheap, but
+   * it is not free (a `git status` plus a `git diff HEAD` per index tick), and
+   * nobody should pay for a picture they switched off. Switching it back on
+   * re-runs this immediately, because `showChanges` is one of its inputs.
    */
   useEffect(() => {
-    if (!status?.indexed) return;
-    void loadChanges().then((payload) => {
-      if (payload && activeRef.current === CHANGES_VIEW_ID) applyChanges(payload);
-    });
-  }, [status?.indexed, status?.dataVersion, loadChanges, applyChanges]);
+    if (!status?.indexed || !showChanges) return;
+    void loadChanges();
+  }, [status?.indexed, status?.dataVersion, showChanges, loadChanges]);
 
   /**
    * Ask a question. The deterministic explore is what lands the card — the
@@ -421,21 +430,17 @@ export default function App() {
       setColorMode(state.colorMode);
       if (state.edgeKinds && state.edgeKinds.length > 0) controller.setEdgeKinds(state.edgeKinds);
 
-      const cardId = state.cardId ?? PROJECT_VIEW_ID;
+      // A link written before round B4 can name the Changes VIEW, which no
+      // longer exists. It degrades to Project, silently: changes are a toggle
+      // now, and the toggle's own state (this browser's) already decides
+      // whether they are on screen.
+      const stored = state.cardId ?? PROJECT_VIEW_ID;
+      const cardId = stored === LEGACY_CHANGES_VIEW_ID ? PROJECT_VIEW_ID : stored;
       setActiveId(cardId);
       // The card's highlight is restored, but NOT its root: the URL's own root
       // is where the user actually was, which may be deeper or shallower than
       // where the card would land.
-      if (cardId === CHANGES_VIEW_ID) {
-        void loadChanges().then((payload) => {
-          if (payload) {
-            controller.setHighlight({
-              changed: payload.changedNodes.map((node) => node.id),
-              impacted: payload.impactedNodeIds,
-            });
-          }
-        });
-      } else if (cardId !== PROJECT_VIEW_ID) {
+      if (cardId !== PROJECT_VIEW_ID) {
         const result = cardsRef.current.find((card) => card.id === cardId)?.result;
         controller.setHighlight(result ? { nodes: result.nodeIds, edges: result.edgeRefs } : null);
       } else {
@@ -459,7 +464,7 @@ export default function App() {
         edgeKinds: controller.enabledEdgeKinds(),
       };
     },
-    [loadChanges]
+    []
   );
 
   /** Restore once, as soon as there is a model to restore INTO. */
@@ -718,20 +723,30 @@ export default function App() {
 
   // ------------------------------------------------------------ feedback ---
 
+  /**
+   * Ids the change overlay is lighting right now — the code panel reads it to
+   * decide whether to open on the diff. Empty while the toggle is off, so the
+   * panel's default follows the toggle for free.
+   */
+  const changedNodeIds = useMemo(() => {
+    if (!showChanges || !changes) return new Set<string>();
+    return new Set(changes.changedNodes.map((node) => node.id));
+  }, [showChanges, changes]);
+
+  /** What the changes toggle says when there is nothing it can show. */
+  const changesHint = changesError
+    ? `Changes unavailable: ${changesError}`
+    : changes && !changes.git
+      ? 'Not a git work tree — there is nothing to compare against'
+      : null;
+
   const activeCard = cards.find((card) => card.id === activeId) ?? null;
-  const feedbackContext = activeCard
-    ? activeCard.question
-    : activeId === CHANGES_VIEW_ID
-      ? 'Uncommitted changes vs HEAD'
-      : 'Project overview';
-  const feedbackSummary = activeCard?.result?.summary ?? changesSummaryText(activeId, changes);
+  const feedbackContext = activeCard ? activeCard.question : 'Project overview';
+  const feedbackSummary = activeCard?.result?.summary;
   const feedbackResultNodes = useMemo<FeedbackNode[]>(() => {
-    const ids =
-      activeId === CHANGES_VIEW_ID
-        ? (changes?.changedNodes.map((node) => node.id) ?? [])
-        : (activeCard?.result?.nodeIds ?? []);
+    const ids = activeCard?.result?.nodeIds ?? [];
     return ids.map((id) => describeForFeedback(model, id)).filter((node): node is FeedbackNode => Boolean(node));
-  }, [activeId, activeCard, changes, model]);
+  }, [activeCard, model]);
   const feedbackSelected = useMemo<FeedbackNode[]>(() => {
     const node = selectedNode ? describeForFeedback(model, selectedNode.id) : null;
     return node ? [node] : [];
@@ -773,8 +788,6 @@ export default function App() {
             cards={cards}
             activeId={activeId}
             model={model}
-            changes={changes}
-            changesError={changesError}
             busy={busy}
             askAvailable={askAvailable}
             error={askError}
@@ -800,6 +813,9 @@ export default function App() {
               )
             }
             onFit={() => controllerRef.current?.fitView()}
+            changesShown={showChanges}
+            onToggleChanges={() => setShowChanges((value) => !value)}
+            changesHint={changesHint}
             collapsed={legendPanelCollapsed}
             onToggleCollapsed={() => setLegendPanelCollapsed((value) => !value)}
           />
@@ -851,7 +867,10 @@ export default function App() {
               node={selectedNode}
               detail={detailState.detail}
               loading={detailState.loading}
-              initialMode={activeId === CHANGES_VIEW_ID ? 'diff' : 'full'}
+              // Diff-first only when this very node is one of the edited ones
+              // and the annotation is on — which is what the Changes VIEW used
+              // to mean, minus opening every unchanged file on an empty diff.
+              initialMode={showChanges && changedNodeIds.has(selectedNode.id) ? 'diff' : 'full'}
               collapsed={codePanelCollapsed}
               onToggleCollapsed={() => setCodePanelCollapsed((value) => !value)}
             />
@@ -912,6 +931,17 @@ function sameHashState(a: HashState, b: HashState): boolean {
     a.edgeKinds.every((kind, index) => kind === b.edgeKinds[index])
   );
 }
+
+/**
+ * The id the removed Changes VIEW had, kept only to be RECOGNISED.
+ *
+ * A link (or a browser history entry) written before round B4 can still name
+ * it. Restoring it must not throw and must not leave the shell pointing at a
+ * view that no longer exists, so it degrades to Project without a word — the
+ * changes themselves are now a toggle, and the toggle is already saying
+ * whatever this browser last set it to.
+ */
+const LEGACY_CHANGES_VIEW_ID = 'view:changes';
 
 /** How long the workspace has to sit still before it is written down. */
 const WORKSPACE_WRITE_MS = 300;
@@ -1051,7 +1081,3 @@ function describeForFeedback(model: GraphModel | null, id: string): FeedbackNode
   };
 }
 
-function changesSummaryText(activeId: string, changes: ChangesPayload | null): string | undefined {
-  if (activeId !== CHANGES_VIEW_ID || !changes) return undefined;
-  return `${changes.changedFiles.length} changed file(s), ${changes.changedNodes.length} changed symbol(s), ${changes.impactedNodeIds.length} impacted.`;
-}
